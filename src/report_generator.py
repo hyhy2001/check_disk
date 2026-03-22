@@ -180,9 +180,13 @@ class ReportGenerator:
         Each chunk is sorted descending (written that way by _flush_thread_paths).
         Using ``heapq.merge(..., reverse=True)`` over these iterators gives a
         globally sorted descending stream with O(num_chunks) RAM.
+
+        Opens files with ``errors='surrogateescape'`` to handle paths that
+        contain non-UTF-8 byte sequences (common on Linux filesystems).
         """
         def _read_chunk(fpath: str):
-            with open(fpath, encoding='utf-8') as fh:
+            # surrogateescape: non-UTF-8 bytes were stored as surrogates; read them back
+            with open(fpath, encoding='utf-8', errors='surrogateescape') as fh:
                 for line in fh:
                     line = line.rstrip('\n')
                     if not line:
@@ -212,11 +216,17 @@ class ReportGenerator:
           - Pass 1: count total_files and sum total_used  (O(1) RAM)
           - Pass 2: k-way merge of sorted chunks → write JSON  (O(1) RAM)
 
-        The output JSON lists all files sorted by size descending, with no cap.
+        Paths with non-UTF-8 bytes (surrogate-escaped) are sanitised with
+        ``errors='replace'`` before JSON serialisation so the output file
+        is always valid UTF-8 JSON.
 
         Returns:
             The output path that was written.
         """
+        def _safe_path(p: str) -> str:
+            """Replace surrogate chars with U+FFFD so json.dumps never raises."""
+            return p.encode('utf-8', errors='replace').decode('utf-8')
+
         # ── Pass 1: totals ────────────────────────────────────────────────
         total_files = 0
         total_used  = 0
@@ -231,7 +241,7 @@ class ReportGenerator:
             # Header with known totals
             out.write('{\n')
             out.write(f'  "date": {timestamp},\n')
-            out.write(f'  "user": {json.dumps(username)},\n')
+            out.write(f'  "user": {json.dumps(_safe_path(username))},\n')
             out.write(f'  "total_files": {total_files},\n')
             out.write(f'  "total_used": {total_used},\n')
             out.write('  "files": [')
@@ -239,7 +249,7 @@ class ReportGenerator:
             first = True
             for size, path in self._iter_uid_tsv(tmpdir, uid):
                 sep = '' if first else ','
-                out.write(f'{sep}\n    {{"path": {json.dumps(path)}, "size": {size}}}')
+                out.write(f'{sep}\n    {{"path": {json.dumps(_safe_path(path))}, "size": {size}}}')
                 first = False
 
             out.write('\n  ]\n}\n')

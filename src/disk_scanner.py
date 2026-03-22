@@ -304,7 +304,7 @@ class DiskScanner:
             # Sort descending so heapq.merge(reverse=True) works correctly
             files.sort(key=lambda x: x[1], reverse=True)
             tmpfile = os.path.join(self._tmpdir, f"uid_{uid}_t{thread_id}.tsv")
-            with open(tmpfile, 'a', encoding='utf-8') as fh:
+            with open(tmpfile, 'a', encoding='utf-8', errors='surrogateescape') as fh:
                 for path, size in files:
                     fh.write(f"{size}\t{path}\n")
             files.clear()
