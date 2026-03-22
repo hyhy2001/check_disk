@@ -6,6 +6,11 @@ import stat as stat_module
 import time
 import threading
 import psutil
+import heapq
+import glob as glob_module
+import shutil
+import atexit
+import tempfile
 from os import scandir
 from collections import defaultdict, deque
 from typing import Dict, List, Any, Set, Optional, Tuple
@@ -41,14 +46,17 @@ class ThreadStats:
     uid_sizes: Dict[int, int] = field(default_factory=lambda: defaultdict(int))
     dir_sizes: Dict[str, Dict[int, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
     permission_issues: Dict[str, List[Dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
-    # uid -> [(path, size), ...] -- populated only for files that pass dedup
+    # In-memory buffer flushed periodically to tmpdir (never holds full 36M entries)
     file_paths: Dict[int, List[Tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    file_path_count: int = 0  # total unflushed entries across all uids
 
 
 class DiskScanner:
-    """Optimized disk scanner with per-thread queues."""
+    """Optimized disk scanner with per-thread queues and streaming file-path flush."""
 
-    BATCH_SIZE = 5000  # Dirs to take at once
+    BATCH_SIZE            = 5000   # dirs to steal from global queue at once
+    DETAIL_FLUSH_THRESHOLD = 30_000 # flush to disk when a thread accumulates this many file entries
+    DETAIL_TOP_N           = 200    # top-N files kept per user in the final report
 
     def __init__(self, config: Dict[str, Any], max_workers: int = None, debug: bool = False):
         """
@@ -77,14 +85,18 @@ class DiskScanner:
         self.team_usage_results = {}
         self.other_usage_results = {}
         self.dir_usage_results = {}
-        self.file_paths_results: Dict[str, List[Tuple[str, int]]] = {}  # username -> sorted file list
+        self.file_paths_results: Dict[str, List[Tuple[str, int]]] = {}  # username -> sorted top-N
         self.permission_issues = {}
-        # Hard-link dedup: only files with st_nlink > 1 need to be tracked.
-        # Regular files (st_nlink == 1) skip this set entirely -- zero lock contention.
+
+        # Hard-link dedup
         self.hardlink_inodes: Set[Tuple[int, int]] = set()
-        self.inode_lock = threading.Lock()  # Acquired only for hard-linked files (rare)
-        # Device ID of root scan dir; dirs on a different device are cross-mount (snapshot/NFS)
+        self.inode_lock = threading.Lock()
         self.root_dev: int = 0
+
+        # Temp directory for streaming file-path flush (auto-cleaned on exit)
+        self._tmpdir = tempfile.mkdtemp(prefix='diskscanner_detail_')
+        atexit.register(shutil.rmtree, self._tmpdir, ignore_errors=True)
+        self.detail_top_n: int = config.get('detail_top_n', self.DETAIL_TOP_N)
 
         # Progress reporting
         self.progress_interval = 10.0  # Report progress every 10 seconds
@@ -238,6 +250,10 @@ class DiskScanner:
                                         my_stats.total_size += size
                                         my_stats.files += 1
                                         my_stats.file_paths[uid].append((entry.path, size))
+                                        my_stats.file_path_count += 1
+                                        # Flush to disk when buffer is full to keep RAM bounded
+                                        if my_stats.file_path_count >= self.DETAIL_FLUSH_THRESHOLD:
+                                            self._flush_thread_paths(my_stats, thread_id)
 
                         except OSError as e:
                             username = get_owner_from_path(entry.path, self.uid_to_username)
@@ -268,13 +284,77 @@ class DiskScanner:
                 # Signal that new work is available
                 work_event.set()
     
+    # ── Streaming file-path helpers ──────────────────────────────────────────
+
+    def _flush_thread_paths(self, stats: ThreadStats, thread_id: int) -> None:
+        """Append buffered file paths to per-uid temp TSV files, then free RAM.
+
+        TSV format: ``<size_bytes>\t<absolute_path>\n``
+        Each file is *not* globally sorted — the merge step handles that.
+        """
+        for uid, files in stats.file_paths.items():
+            if not files:
+                continue
+            tmpfile = os.path.join(self._tmpdir, f"uid_{uid}_t{thread_id}.tsv")
+            with open(tmpfile, 'a', encoding='utf-8') as fh:
+                for path, size in files:
+                    fh.write(f"{size}\t{path}\n")
+            files.clear()
+        stats.file_path_count = 0
+
+    def _get_top_n_for_uid(self, uid: int) -> List[Tuple[str, int]]:
+        """Stream all temp files for *uid* through an O(top_n) min-heap.
+
+        Returns a list of (path, size) sorted by size descending, capped at
+        ``self.detail_top_n`` entries.  Peak RAM: O(top_n) regardless of the
+        total number of files owned by this UID.
+        """
+        n = self.detail_top_n
+        heap: List[Tuple[int, str]] = []  # (size, path) — min-heap
+
+        for fpath in glob_module.glob(os.path.join(self._tmpdir, f"uid_{uid}_t*.tsv")):
+            with open(fpath, encoding='utf-8') as fh:
+                for line in fh:
+                    line = line.rstrip('\n')
+                    if not line:
+                        continue
+                    tab = line.index('\t')
+                    size = int(line[:tab])
+                    path = line[tab + 1:]
+                    if len(heap) < n:
+                        heapq.heappush(heap, (size, path))
+                    elif size > heap[0][0]:
+                        heapq.heapreplace(heap, (size, path))
+
+        # Sort descending and drop the heap internals
+        return [(p, s) for s, p in sorted(heap, key=lambda x: x[0], reverse=True)]
+
+    def _stream_merge_to_results(self) -> None:
+        """Populate file_paths_results from temp files using O(top_n) peak RAM."""
+        uid_set: Set[int] = set()
+        for fpath in glob_module.glob(os.path.join(self._tmpdir, 'uid_*_t*.tsv')):
+            fname = os.path.basename(fpath)
+            try:
+                uid = int(fname.split('_')[1])
+                uid_set.add(uid)
+            except (IndexError, ValueError):
+                pass
+
+        print(f"  Streaming top-{self.detail_top_n} merge for {len(uid_set)} UIDs...")
+        for uid in uid_set:
+            username = get_username_from_uid(uid, self.uid_to_username)
+            self.file_paths_results[username] = self._get_top_n_for_uid(uid)
+
+        print(f"  Detail merge complete: {len(uid_set)} users, "
+              f"up to {self.detail_top_n} files each")
+
     def get_tree_size(self, path: str) -> int:
         """
         Calculate the total size of a directory tree.
-        
+
         Args:
             path: Root directory path
-            
+
         Returns:
             Total size in bytes
         """
@@ -458,14 +538,11 @@ class DiskScanner:
         for team in self.config.get("teams", []):
             self.team_usage_results[team["name"]] = 0
 
-        # Merge UID sizes and file paths from all threads
+        # Merge UID sizes from all threads
         merged_uid_sizes: Dict[int, int] = defaultdict(int)
-        merged_file_paths: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
         for stats in thread_stats:
             for uid, size in stats.uid_sizes.items():
                 merged_uid_sizes[uid] += size
-            for uid, files in stats.file_paths.items():
-                merged_file_paths[uid].extend(files)
 
             # Merge permission issues
             for username, issues in stats.permission_issues.items():
@@ -478,14 +555,22 @@ class DiskScanner:
             ScanHelper.process_user_data(merged_uid_sizes, self.uid_to_username, self.user_map)
         )
 
-        # Convert uid-keyed file paths to username-keyed and sort by size desc
-        self._merge_file_paths(merged_file_paths)
+        # Flush any remaining in-memory file-path buffers to tmpdir, then
+        # stream-merge the temp files to produce top-N results per user.
+        # This is the key memory optimization: peak RAM for file paths is
+        # O(threads x FLUSH_THRESHOLD) during scan, and O(top_n) during merge.
+        print("  Flushing remaining file-path buffers to disk...")
+        for i, stats in enumerate(thread_stats):
+            self._flush_thread_paths(stats, i)
+
+        self._stream_merge_to_results()
 
         # Process directory data
         self._process_directory_data(thread_stats)
     
+    # Kept for API compatibility; streaming version replaces the in-memory sort.
     def _merge_file_paths(self, merged: Dict[int, List[Tuple[str, int]]]) -> None:
-        """Convert uid-keyed merged file lists to username-keyed, sorted by size desc."""
+        """Deprecated: use _stream_merge_to_results() instead."""
         for uid, files in merged.items():
             username = get_username_from_uid(uid, self.uid_to_username)
             files.sort(key=lambda x: x[1], reverse=True)
