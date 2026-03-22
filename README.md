@@ -33,6 +33,7 @@ with parallel scanning, JSON reporting, plain-text export, and multi-report comp
 - **Permission issue tracking** — records inaccessible files/dirs per user
 - **Per-user detail reports** — per-user JSON files listing top dirs and files by size
 - **Plain-text export** — `scripts/export_user_reports.py` converts JSON detail reports to sorted plain-text files
+- **Team ID backfill** — `scripts/backfill_team_ids.py` patches existing reports without `team_id` using config mapping
 - **Multi-report comparison** — compare N reports side-by-side with growth/usage ranking
 - **Stall detection** — automatically aborts if scan stops making progress for 5 minutes
 - **Memory monitoring** — terminates if RSS exceeds configured limit
@@ -126,6 +127,7 @@ src/
 
 scripts/
   export_user_reports.py <- standalone: JSON detail reports -> plain-text
+  backfill_team_ids.py   <- standalone: inject team_id into existing reports
 ```
 
 ---
@@ -359,11 +361,11 @@ Users are always sorted alphabetically when saved.
     "available":  2748779069440
   },
   "team_usage": [
-    { "name": "JP",    "used": 3298534883328 },
+    { "name": "JP",    "used": 3298534883328, "team_id": 1 },
     { "name": "Other", "used":  549755813888 }
   ],
   "user_usage": [
-    { "name": "Binh", "used": 2748779069440 }
+    { "name": "Binh", "used": 2748779069440, "team_id": 2 }
   ],
   "other_usage": [
     { "name": "uid-1234", "used": 549755813888 }
@@ -459,6 +461,43 @@ Type  User                          Size  Path
 ------------------------------------------------------------------------------------------
 dir   Binh                      1.96 MB  /data/users/Binh/projects
 file  Binh                     96.00 KB  /data/users/Binh/notes.txt
+```
+
+---
+
+### `scripts/backfill_team_ids.py`
+
+Patches an existing `disk_usage_report.json` by injecting `team_id` fields into
+`team_usage` and `user_usage` entries, using the mappings defined in `disk_checker_config.json`.
+Useful for reports generated before `team_id` support was added.
+
+The script is **idempotent** — running it multiple times will not duplicate or overwrite
+existing `team_id` values.
+
+```bash
+# Basic — auto-detect config next to report, overwrite in-place
+python scripts/backfill_team_ids.py --report disk_usage_report.json
+
+# Explicit config path
+python scripts/backfill_team_ids.py \
+    --config disk_checker_config.json \
+    --report /reports/disk_usage_report.json
+
+# Preview without writing
+python scripts/backfill_team_ids.py --report report.json --dry-run
+
+# Write to a new file, keep original untouched
+python scripts/backfill_team_ids.py --report report.json --output patched.json
+```
+
+**What it patches** (only entries missing `team_id`):
+
+```json
+// Before
+{ "name": "JP", "used": 3298534883328 }
+
+// After
+{ "name": "JP", "used": 3298534883328, "team_id": 1 }
 ```
 
 ---
