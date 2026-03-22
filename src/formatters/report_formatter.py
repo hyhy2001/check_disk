@@ -88,10 +88,13 @@ class ReportFormatter(BaseFormatter):
         total_capacity = report.get('general_system', {}).get('total', 1)
         
         # Display top users
+        top_n   = report.get('top_user', 10)
+        min_use = report.get('min_usage', '')
+        title   = f'Top {top_n} Users' + (f' (min usage: {min_use})' if min_use else '')
         self._display_user_usage_table(
             report.get('user_usage', []),
             total_capacity,
-            f"Top {report.get('top_user', 10)} Users (min usage: {report.get('min_usage', '2.00 TB')})",
+            title,
             filter_users
         )
         
