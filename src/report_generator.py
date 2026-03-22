@@ -75,20 +75,26 @@ class ReportGenerator:
         except ValueError:
             return False
     
+    def _build_team_id_maps(self):
+        """Build team_name -> team_id and username -> team_id lookup dicts from config."""
+        team_id_map = {t["name"]: t["team_ID"] for t in self.config.get("teams", [])}
+        user_team_id_map = {}
+        for user in self.config.get("users", []):
+            user_team_id_map[user["name"]] = user["team_ID"]
+        return team_id_map, user_team_id_map
+
     def generate_report(self, scan_result: Optional[ScanResult] = None) -> Dict[str, Any]:
         """
         Generate a report from scan results.
-        
+
         Args:
             scan_result: ScanResult object with disk usage data, or None
-            
+
         Returns:
             Dictionary containing the report data
         """
-        # Handle case where scan_result is None
         if scan_result is None:
             print("Warning: No scan results provided. Generating empty report.")
-            # Create an empty report with current timestamp
             report = {
                 "date": int(time.time()),
                 "directory": self.config.get("directory", ""),
@@ -98,24 +104,41 @@ class ReportGenerator:
                 "other_usage": []
             }
         else:
-            # Create report structure from scan results
+            team_id_map, user_team_id_map = self._build_team_id_maps()
+
+            # Inject team_id into each team entry
+            team_usage = []
+            for t in scan_result.team_usage:
+                entry = dict(t)
+                tid = team_id_map.get(t["name"])
+                if tid is not None:
+                    entry["team_id"] = tid
+                team_usage.append(entry)
+
+            # Inject team_id into each user entry
+            user_usage = []
+            for u in scan_result.user_usage:
+                entry = dict(u)
+                tid = user_team_id_map.get(u["name"])
+                if tid is not None:
+                    entry["team_id"] = tid
+                user_usage.append(entry)
+
             report = {
                 "date": scan_result.timestamp,
                 "directory": self.config.get("directory", ""),
                 "general_system": scan_result.general_system,
-                "team_usage": scan_result.team_usage,
-                "user_usage": scan_result.user_usage,
+                "team_usage": team_usage,
+                "user_usage": user_usage,
                 "other_usage": scan_result.other_usage
             }
-            
-            # Generate permission issues report if there are any issues
+
             if hasattr(scan_result, 'permission_issues') and scan_result.permission_issues:
                 self.generate_permission_issues_report(scan_result)
-        
-        # Save report to file
+
         save_json_report(report, self.output_file)
-        
         return report
+
     
     def generate_permission_issues_report(self, scan_result: ScanResult) -> Dict[str, Any]:
         """
