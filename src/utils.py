@@ -337,20 +337,6 @@ class ScanHelper:
         return user_list
     
     @staticmethod
-    def filter_users_by_min_usage(user_list: List[Dict[str, Any]], min_usage: int) -> List[Dict[str, Any]]:
-        """
-        Filter users by minimum usage.
-        
-        Args:
-            user_list: List of user dictionaries
-            min_usage: Minimum usage threshold in bytes
-            
-        Returns:
-            Filtered list of user dictionaries
-        """
-        return [user for user in user_list if user["used"] >= min_usage]
-    
-    @staticmethod
     def filter_users_by_names(user_list: List[Dict[str, Any]], usernames: Set[str]) -> List[Dict[str, Any]]:
         """
         Filter users by username.

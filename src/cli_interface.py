@@ -8,7 +8,6 @@ import argparse
 import os
 import sys
 import glob
-import datetime
 from typing import Dict, Any, List
 
 from src.utils import parse_size, load_json_report

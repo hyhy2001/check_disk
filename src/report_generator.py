@@ -6,8 +6,7 @@ Handles generating and saving disk usage reports.
 
 import os
 import time
-import datetime
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List
 from src.disk_scanner import ScanResult
 from src.utils import format_size, save_json_report, ScanHelper
 
@@ -143,69 +142,6 @@ class ReportGenerator:
         print(f"Permission issues report saved to: {output_path}")
         
         return report
-    
-    def generate_check_user_report(self, scan_result: ScanResult, check_users: List[str]) -> Dict[str, Any]:
-        """
-        Generate a report for specific users.
-        
-        Args:
-            scan_result: ScanResult object with disk usage data
-            check_users: List of usernames to include in the report
-            
-        Returns:
-            Dictionary containing the report data
-        """
-        report = {
-            "date": scan_result.timestamp,
-            "directory": self.config.get("directory", ""),
-            "check_users": check_users,
-            "user_usage": [],
-            "detail_dir": []  # Changed from top_dir to detail_dir
-        }
-        
-        # Filter user usage data
-        user_set = set(check_users)
-        
-        # Filter users from user_usage and other_usage
-        user_data = ScanHelper.filter_users_by_names(scan_result.user_usage, user_set)
-        other_users = ScanHelper.filter_users_by_names(scan_result.other_usage, user_set)
-        
-        # Combine the filtered users
-        report["user_usage"] = user_data + other_users
-        
-        # If no users were found in the scan results, add them with zero usage
-        found_users = {user["name"] for user in report["user_usage"]}
-        for username in user_set:
-            if username not in found_users:
-                report["user_usage"].append({"name": username, "used": 0})
-        
-        # Include all directories for specified users, sorted by usage
-        if hasattr(scan_result, 'top_dir') and scan_result.top_dir:
-            # Filter directories by specified users
-            filtered_dirs = [
-                dir_entry for dir_entry in scan_result.top_dir
-                if dir_entry["user"] in user_set
-            ]
-            
-            # Sort by usage (highest to lowest)
-            filtered_dirs.sort(key=lambda x: x["user_usage"], reverse=True)
-            report["detail_dir"] = filtered_dirs  # Include all entries without limit
-        
-        # Include permission issues for these users if available
-        if hasattr(scan_result, 'permission_issues') and scan_result.permission_issues:
-            user_permission_issues = {
-                "users": [
-                    user for user in scan_result.permission_issues.get("users", [])
-                    if user["name"] in user_set
-                ]
-            }
-            if user_permission_issues["users"]:
-                report["permission_issues"] = user_permission_issues
-        
-        # Generate output filename with the same pattern as the main output
-        output_path = self._get_output_filename("check_user")
-        save_json_report(report, output_path)
-        return report
 
     def generate_detail_reports(self, scan_result: ScanResult) -> List[str]:
         """
@@ -257,12 +193,3 @@ class ReportGenerator:
         output_dir = os.path.dirname(created[0]) if created else '.'
         print(f"Generated {len(users)} user detail report(s) -> {output_dir}")
         return created
-    
-    def get_report_path(self) -> str:
-        """
-        Get the path to the generated report.
-        
-        Returns:
-            Path to the report file
-        """
-        return self.output_file
