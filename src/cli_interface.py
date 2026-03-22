@@ -225,14 +225,16 @@ class CLIInterface:
     ) -> None:
         """Display per-user detail reports (dir + file breakdown).
 
-        Auto-locates files using naming convention:
-            {output_dir}/{prefix}_detail_report_dir_{user}.json
-            {output_dir}/{prefix}_detail_report_file_{user}.json
+        Locates JSON files inside the detail_users/ subdirectory:
+            {output_dir}/detail_users/{prefix}_detail_report_dir_{user}.json
+            {output_dir}/detail_users/{prefix}_detail_report_file_{user}.json
         """
+        detail_dir = os.path.join(output_dir, "detail_users")
+
         def _build_path(base: str, user: str) -> str:
             parts = [p for p in [prefix, base, user] if p]
             fname = "_".join(parts) + ".json"
-            return os.path.join(output_dir, fname)
+            return os.path.join(detail_dir, fname)
 
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}

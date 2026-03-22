@@ -45,20 +45,22 @@ class ReportGenerator:
 
     def _get_user_detail_filename(self, base: str, user: str) -> str:
         """
-        Build path for a per-user detail report. Never includes a date.
+        Build path for a per-user detail report inside the detail_users/ subdir.
+        Never includes a date suffix.
 
         Args:
             base: Middle segment, e.g. 'detail_report_dir' or 'detail_report_file'
             user: Username
 
         Returns:
-            Full output path (e.g. 'sda1_detail_report_dir_Binh.json')
+            Full output path, e.g. '/reports/detail_users/sda1_detail_report_dir_Binh.json'
         """
         dir_part = os.path.dirname(self.output_file)
-        prefix = self.config.get('output_prefix', '')
+        detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
+        prefix = self.config.get("output_prefix", "")
         parts = [p for p in [prefix, base, user] if p]
-        fname = '_'.join(parts) + '.json'
-        return os.path.join(dir_part, fname) if dir_part else fname
+        fname = "_".join(parts) + ".json"
+        return os.path.join(detail_dir, fname)
 
     # ------------------------------------------------------------------ #
     # Legacy helpers kept for backward compatibility                       #

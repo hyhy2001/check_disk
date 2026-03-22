@@ -49,13 +49,13 @@ class ConfigManager:
     
     def _save_config(self) -> None:
         """Save the current configuration to the config file."""
+        from src.utils import _compact_json
         try:
-            # Sort users alphabetically by name before saving
             if "users" in self._config:
-                self._config["users"] = sorted(self._config["users"], key=lambda user: user["name"])
-                
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self._config, f, indent=2)
+                self._config["users"] = sorted(self._config["users"], key=lambda u: u["name"])
+
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                f.write(_compact_json(self._config))
         except IOError as e:
             print(f"Error saving configuration: {e}")
     

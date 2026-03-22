@@ -2,19 +2,10 @@
   "directory": "/www/wwwroot",
   "output_file": "disk_usage_report.json",
   "teams": [
-    {
-      "name": "Test",
-      "team_ID": 1
-    }
+    { "name": "Test", "team_ID": 1 }
   ],
   "users": [
-    {
-      "name": "root",
-      "team_ID": 1
-    },
-    {
-      "name": "www",
-      "team_ID": 1
-    }
+    { "name": "root", "team_ID": 1 },
+    { "name": "www", "team_ID": 1 }
   ]
 }

@@ -44,14 +44,16 @@ def load_json(path: str) -> dict:
 
 def find_users(input_dir: str, prefix: str) -> list:
     """
-    Return sorted list of usernames discovered from detail_report_dir_*.json files.
-    Filename pattern: {prefix}_detail_report_dir_{user}.json  (prefix optional)
+    Return sorted list of usernames discovered from detail_report_dir_*.json files
+    inside the detail_users/ subdirectory.
     """
+    detail_dir = os.path.join(input_dir, "detail_users")
+
     if prefix:
-        pattern = os.path.join(input_dir, f"{prefix}_detail_report_dir_*.json")
+        pattern = os.path.join(detail_dir, f"{prefix}_detail_report_dir_*.json")
         strip = f"{prefix}_detail_report_dir_"
     else:
-        pattern = os.path.join(input_dir, "detail_report_dir_*.json")
+        pattern = os.path.join(detail_dir, "detail_report_dir_*.json")
         strip = "detail_report_dir_"
 
     users = []
@@ -64,10 +66,11 @@ def find_users(input_dir: str, prefix: str) -> list:
 
 
 def build_path(input_dir: str, prefix: str, segment: str, user: str) -> str:
-    """Construct full path for a detail report file."""
+    """Construct full path for a detail report file inside detail_users/ subdir."""
+    detail_dir = os.path.join(input_dir, "detail_users")
     parts = [p for p in [prefix, segment, user] if p]
     fname = "_".join(parts) + ".json"
-    return os.path.join(input_dir, fname)
+    return os.path.join(detail_dir, fname)
 
 
 # ---------------------------------------------------------------------------

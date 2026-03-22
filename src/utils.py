@@ -217,25 +217,50 @@ def format_timestamp(timestamp: int) -> str:
     """
     return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
 
+def _compact_json(obj, indent: int = 2) -> str:
+    """
+    Serialize obj to JSON where list items that are plain dicts
+    are written on a single line (horizontal), everything else
+    uses normal indentation.
+    """
+    import re
+
+    raw = json.dumps(obj, indent=indent)
+
+    # Find every indented block that is a plain dict: {  "k": v, ... }
+    # and collapse it to a single line.
+    def collapse(m: "re.Match") -> str:
+        inner = m.group(0)
+        # Only collapse if it contains no nested arrays/objects
+        if "{" not in inner[1:] and "[" not in inner:
+            flat = re.sub(r"\s+", " ", inner).strip()
+            return flat
+        return inner
+
+    # Match a { ... } that spans multiple lines but has no nested braces
+    pattern = re.compile(
+        r"\{[^{}\[\]]*\}",
+        re.DOTALL,
+    )
+    return pattern.sub(collapse, raw)
+
+
 def save_json_report(report: Dict[str, Any], filepath: str) -> None:
     """
     Save a report to a JSON file.
-    
+    List items that are plain dicts are written compact (one line each).
+
     Args:
         report: Report data dictionary
         filepath: Path to save the report
     """
     try:
-        # Ensure output directory exists
         output_dir = os.path.dirname(filepath)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
-        
-        # Write report to file
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2)
-            
-        # Removed the print statement from here to avoid duplication
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(_compact_json(report))
     except IOError as e:
         print(f"Error saving report to {filepath}: {e}")
 
