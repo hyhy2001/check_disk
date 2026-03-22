@@ -64,7 +64,7 @@ def _walk(node, lines: list, level: int, indent: int):
 # ── Core mapping logic ────────────────────────────────────────────────────────
 
 def build_maps(config: dict):
-    """Return (team_name→team_id, username→team_id) from config."""
+    """Return (team_name->team_id, username->team_id) from config."""
     team_id_map = {
         t["name"]: t["team_ID"]
         for t in config.get("teams", [])
@@ -200,7 +200,7 @@ def main():
             print(f"ERROR: {err}", file=sys.stderr)
             sys.exit(1)
         if not args.dry_run:
-            print(f"✅  {added} team_id field(s) added  →  {out_path}")
+            print(f"[OK] {added} team_id field(s) added -> {out_path}")
         else:
             print(f"\n[dry-run] {added} team_id field(s) would be added.", file=sys.stderr)
         return
@@ -216,16 +216,16 @@ def main():
     total_errors = 0
     col = max(len(os.path.basename(p)) for p in files)
 
-    print(f"Backfilling {total_files} file(s) using {os.path.basename(config_path)} …\n")
+    print(f"Backfilling {total_files} file(s) using {os.path.basename(config_path)} ...\n")
     for path in files:
         added, err = process_one(path, config, path, args.dry_run)
         name = os.path.basename(path)
         if err:
-            print(f"  ✗  {name:<{col}}  ERROR: {err}")
+            print(f"  [ERR] {name:<{col}}  ERROR: {err}")
             total_errors += 1
         else:
             verb = "would add" if args.dry_run else "added"
-            print(f"  ✓  {name:<{col}}  {added:>3} field(s) {verb}")
+            print(f"  [OK]  {name:<{col}}  {added:>3} field(s) {verb}")
             total_added += added
 
     print(f"\n{'[dry-run] ' if args.dry_run else ''}Done: {total_files} file(s), "
