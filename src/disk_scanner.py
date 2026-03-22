@@ -33,8 +33,11 @@ class ScanResult:
     timestamp: int
     top_dir: List[Dict[str, Any]] = field(default_factory=list)
     permission_issues: Dict[str, Any] = field(default_factory=dict)
-    # username -> [(path, size), ...] sorted by size desc
+    # username -> [(path, size), ...] sorted by size desc (legacy / small scans)
     detail_files: Dict[str, List[Tuple[str, int]]] = field(default_factory=dict)
+    # Streaming mode: temp dir + uid mapping populated instead of detail_files
+    detail_tmpdir: str = ""
+    detail_uid_username: Dict[int, str] = field(default_factory=dict)  # uid -> username
 
 
 @dataclass
@@ -289,12 +292,17 @@ class DiskScanner:
     def _flush_thread_paths(self, stats: ThreadStats, thread_id: int) -> None:
         """Append buffered file paths to per-uid temp TSV files, then free RAM.
 
+        Each chunk is written **sorted descending by size** so that later
+        k-way merges with ``heapq.merge(reverse=True)`` produce a globally
+        sorted output without loading the full list into memory.
+
         TSV format: ``<size_bytes>\t<absolute_path>\n``
-        Each file is *not* globally sorted — the merge step handles that.
         """
         for uid, files in stats.file_paths.items():
             if not files:
                 continue
+            # Sort descending so heapq.merge(reverse=True) works correctly
+            files.sort(key=lambda x: x[1], reverse=True)
             tmpfile = os.path.join(self._tmpdir, f"uid_{uid}_t{thread_id}.tsv")
             with open(tmpfile, 'a', encoding='utf-8') as fh:
                 for path, size in files:
@@ -330,7 +338,11 @@ class DiskScanner:
         return [(p, s) for s, p in sorted(heap, key=lambda x: x[0], reverse=True)]
 
     def _stream_merge_to_results(self) -> None:
-        """Populate file_paths_results from temp files using O(top_n) peak RAM."""
+        """Collect uid→username mapping from temp files.
+
+        No file data is loaded into memory here.  The actual per-user detail
+        JSON reports are written by report_generator using streaming I/O.
+        """
         uid_set: Set[int] = set()
         for fpath in glob_module.glob(os.path.join(self._tmpdir, 'uid_*_t*.tsv')):
             fname = os.path.basename(fpath)
@@ -340,13 +352,12 @@ class DiskScanner:
             except (IndexError, ValueError):
                 pass
 
-        print(f"  Streaming top-{self.detail_top_n} merge for {len(uid_set)} UIDs...")
-        for uid in uid_set:
-            username = get_username_from_uid(uid, self.uid_to_username)
-            self.file_paths_results[username] = self._get_top_n_for_uid(uid)
-
-        print(f"  Detail merge complete: {len(uid_set)} users, "
-              f"up to {self.detail_top_n} files each")
+        self._detail_uid_username: Dict[int, str] = {
+            uid: get_username_from_uid(uid, self.uid_to_username)
+            for uid in uid_set
+        }
+        print(f"  {len(uid_set)} UIDs ready for streaming write "
+              f"(all files, no cap)")
 
     def get_tree_size(self, path: str) -> int:
         """
@@ -706,7 +717,10 @@ class DiskScanner:
                 timestamp=int(time.time()),
                 top_dir=top_dir_list,
                 permission_issues=permission_issues_data,
-                detail_files=self.file_paths_results,
+                # Streaming mode: file detail is written directly from tmpdir
+                detail_files={},
+                detail_tmpdir=self._tmpdir,
+                detail_uid_username=getattr(self, '_detail_uid_username', {}),
             )
         except Exception as e:
             import traceback
