@@ -488,6 +488,26 @@ python scripts/backfill_team_ids.py --report report.json --dry-run
 
 # Write to a new file, keep original untouched
 python scripts/backfill_team_ids.py --report report.json --output patched.json
+
+# Batch: patch all dated reports in a directory
+python scripts/backfill_team_ids.py --reports "reports/disk_usage_report_*.json"
+
+# Batch dry-run to preview changes across all files
+python scripts/backfill_team_ids.py --reports "reports/*.json" --dry-run
+```
+
+**Batch output example:**
+
+```
+Backfilling 5 file(s) using disk_checker_config.json ...
+
+  ✓  disk_usage_report_20250101.json   4 field(s) added
+  ✓  disk_usage_report_20250102.json   4 field(s) added
+  ✓  disk_usage_report_20250103.json   0 field(s) added   ← already patched
+  ✓  disk_usage_report_20250104.json   4 field(s) added
+  ✗  disk_usage_report_corrupt.json   ERROR: ...
+
+Done: 5 file(s), 12 team_id field(s) added, 1 error(s)
 ```
 
 **What it patches** (only entries missing `team_id`):
