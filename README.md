@@ -44,7 +44,7 @@ produces structured JSON output consumed by the companion **disk_usage** web das
 - **Team ID backfill** — `scripts/backfill_team_ids.py` patches old reports without `team_id`
 
 ### Memory Efficiency (Large Disks)
-- **Streaming flush** — file paths are flushed to temporary `.tsv` files in sorted chunks once per-thread buffer reaches `DETAIL_FLUSH_THRESHOLD` (default 200,000 entries), keeping RAM usage bounded
+- **Streaming flush** — file paths are flushed to temporary `.tsv` files in sorted chunks once per-thread buffer reaches `DETAIL_FLUSH_THRESHOLD` (default 100,000 entries), keeping RAM usage bounded
 - **K-way merge** — final detail report is assembled via a min-heap merge of sorted chunks; RAM is O(chunks), not O(total_files)
 - **Non-UTF-8 paths** — surrogate-escape encoding prevents crashes on exotic Linux filenames; replaced with `U+FFFD` (replacement character) in JSON output
 
@@ -157,7 +157,7 @@ Core parallel scanner using Python threads and `os.scandir()`.
 |-----------|---------|-------------|
 | `max_workers` | `min(cpu*2, 64)` | Worker thread count |
 | `debug` | `False` | Print per-directory and skip events |
-| `DETAIL_FLUSH_THRESHOLD` | `200_000` | Flush per-thread file-path buffer to disk at this size |
+| `DETAIL_FLUSH_THRESHOLD` | `100_000` | Flush per-thread file-path buffer to disk at this size |
 
 **Threading model:**
 
@@ -614,14 +614,14 @@ During a large scan, memory usage breaks down as:
 | Component | Approx. (36M files) |
 |-----------|---------------------|
 | `dir_sizes` dict (6.5M dirs) | ~2.5 GB |
-| `file_paths` buffers (200K threshold × 64 threads) | ~2.56 GB |
+| `file_paths` buffers (100K threshold × 64 threads) | ~1.3 GB |
 | Python runtime + OS page cache | ~0.5–1 GB |
-| **Total peak** | **~6.7 GB** |
+| **Total peak** | **~5 GB** |
 
 > `DETAIL_FLUSH_THRESHOLD` controls the trade-off between flush frequency and RAM usage:
-> - `100_000` → ~360 flushes, ~1.3 GB RAM — best for servers with 8 GB or less
-> - `200_000` → ~180 flushes, ~2.56 GB RAM — **current default**; recommended for servers with 8+ GB free
-> - `300_000+` → fewer flushes, but diminishing returns; use only with 16+ GB RAM
+> - `100_000` → ~360 flushes, ~1.3 GB RAM — **current default**
+> - `200_000` → ~180 flushes, ~2.56 GB RAM — only if you have 8+ GB free
+> - `300_000+` → fewer flushes, diminishing returns; use only with 16+ GB RAM
 
 ### Sawtooth throughput pattern
 
