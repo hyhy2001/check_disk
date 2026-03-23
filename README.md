@@ -84,8 +84,8 @@ python disk_checker.py --show-report --files disk_usage_report.json
 # 6. Check per-user detail reports in the terminal
 python disk_checker.py --check-users alice bob
 
-# 7. Export plain-text usage files (one per user)
-python scripts/export_user_reports.py --input-dir /reports/ --output-dir /reports/txt/
+# 7. Export plain-text usage files (one per user, parallel 8 workers)
+python scripts/export_user_reports.py --input-dir /reports/ --output-dir /reports/txt/ --workers 8
 ```
 
 ---
@@ -216,7 +216,7 @@ Converts a `ScanResult` to JSON files. All sibling reports share the same `prefi
 | Method | Output file | When |
 |--------|-------------|------|
 | `generate_report(scan_result)` | `disk_usage_report.json` | Always with `--run` |
-| `generate_detail_reports(scan_result)` | `detail_report_dir_{user}.json` + `detail_report_file_{user}.json` | Always with `--run` |
+| `generate_detail_reports(scan_result, max_workers=1)` | `detail_report_dir_{user}.json` + `detail_report_file_{user}.json` | Always with `--run`; uses `scanner.max_workers` for parallel per-user writes |
 
 **Streaming mode** (activated when `scan_result.detail_tmpdir` is set):
 
@@ -454,20 +454,22 @@ alphabetically; orphaned/unknown inodes use `user: "__unknown__"`.
 
 ```json
 {
-  "date": "20260322",
-  "directory": "/data/shared",
-  "permission_issues": {
-    "total": 4,
-    "items": [
-      { "user": "alice",       "path": "/data/shared/alice/private", "type": "directory", "error": "Permission denied" },
-      { "user": "alice",       "path": "/data/shared/alice/keys",    "type": "file",      "error": "Operation not permitted" },
-      { "user": "bob",         "path": "/data/shared/bob/secret",   "type": "file",      "error": "Access denied" },
-      { "user": "__unknown__", "path": "/orphan/inode",             "type": "directory", "error": "Cannot stat" }
-    ]
-  }
+    "date": 1742600000,
+    "directory": "/data/shared",
+    "general_system": { "total": 10995116277760, "used": 8246337208320, "available": 2748779069440 },
+    "permission_issues": {
+        "total": 4,
+        "items": [
+            { "user": "alice",       "path": "/data/shared/alice/private", "type": "directory", "error": "Permission denied" },
+            { "user": "alice",       "path": "/data/shared/alice/keys",    "type": "file",      "error": "Operation not permitted" },
+            { "user": "bob",         "path": "/data/shared/bob/secret",   "type": "file",      "error": "Access denied" },
+            { "user": "__unknown__", "path": "/orphan/inode",             "type": "directory", "error": "Cannot stat" }
+        ]
+    }
 }
 ```
 
+> `date` is a Unix timestamp (int). `general_system` mirrors the main report.
 > Each item is written on **one line** in the file (compact dict, 4-space outer indent).
 > This makes `grep` and streaming reads efficient on large permission reports.
 
@@ -485,7 +487,7 @@ directories and files sorted by size (largest first).
 - `--input-dir /reports/detail_users/` → looks directly in that folder (flat layout)
 
 ```bash
-# Export all users
+# Export all users (parallel, 4 workers default)
 python scripts/export_user_reports.py --input-dir /reports/
 
 # Custom output dir and filename prefix
@@ -498,6 +500,16 @@ python scripts/export_user_reports.py \
 python scripts/export_user_reports.py \
     --input-dir /reports/ \
     --users alice bob carol
+
+# Parallel export with 8 workers (useful for many users)
+python scripts/export_user_reports.py \
+    --input-dir /reports/ \
+    --workers 8
+
+# Sequential mode (legacy, workers=1)
+python scripts/export_user_reports.py \
+    --input-dir /reports/ \
+    --workers 1
 ```
 
 **Output format** (`usage_alice.txt`):

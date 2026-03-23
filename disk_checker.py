@@ -174,8 +174,12 @@ def main():
             report_generator.generate_report(scan_results)
             print(f"Main report: {config.get('output_file', 'disk_usage_report.json')}")
 
-            # Per-user detail reports (dir + file) - always generated
-            created = report_generator.generate_detail_reports(scan_results)
+            # Per-user detail reports (dir + file) - runs with same
+            # concurrency level as the scanner (Phase 1 workers reused)
+            created = report_generator.generate_detail_reports(
+                scan_results,
+                max_workers=scanner.max_workers,
+            )
 
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
 

@@ -260,7 +260,7 @@ def save_json_report(report: Dict[str, Any], filepath: str) -> None:
             os.makedirs(output_dir, exist_ok=True)
 
         with open(filepath, "w", encoding="utf-8") as f:
-            f.write(_compact_json(report))
+            f.write(_compact_json(report, indent=4))
     except IOError as e:
         print(f"Error saving report to {filepath}: {e}")
 

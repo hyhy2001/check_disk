@@ -10,6 +10,7 @@ sorted by size from highest to lowest.
 Usage:
     python scripts/export_user_reports.py --input-dir /reports/
     python scripts/export_user_reports.py --input-dir /reports/ --output-dir /reports/txt/ --prefix sda1
+    python scripts/export_user_reports.py --input-dir /reports/ --workers 8
 """
 
 import os
@@ -17,6 +18,7 @@ import sys
 import json
 import glob
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +120,7 @@ def export_user(user: str,
                 prefix: str) -> str:
     """
     Load JSON reports for user, write plain-text report.
-    Returns path of the written file.
+    Returns path of the written file, or empty string if skipped.
     """
     dir_path  = build_path(input_dir, prefix, "detail_report_dir",  user)
     file_path = build_path(input_dir, prefix, "detail_report_file", user)
@@ -132,7 +134,6 @@ def export_user(user: str,
 
     entries = build_entries(dir_data, file_data)
 
-    # Build table content
     lines = [
         f"{'Type':<4}  {'User':<20}  {'Size':>12}  Path",
         "-" * 90,
@@ -141,7 +142,6 @@ def export_user(user: str,
     for e in entries:
         lines.append(f"{e['kind']:<4}  {user:<20}  {format_size(e['size']):>12}  {e['path']}")
 
-    # Write output file
     parts = [p for p in [prefix, "usage", user] if p]
     out_fname = "_".join(parts) + ".txt"
     out_path  = os.path.join(output_dir, out_fname)
@@ -171,6 +171,9 @@ def parse_args() -> argparse.Namespace:
                    help="Filename prefix used when scanning (e.g. 'sda1')")
     p.add_argument("--users",      nargs="+", metavar="USER",
                    help="Only export specific user(s). Default: all discovered users.")
+    p.add_argument("--workers",    type=int, default=4,
+                   help="Number of parallel worker threads (default: 4). "
+                        "Use 1 for sequential (legacy) behaviour.")
     return p.parse_args()
 
 
@@ -180,6 +183,7 @@ def main() -> None:
     input_dir  = os.path.abspath(args.input_dir)
     output_dir = os.path.abspath(args.output_dir) if args.output_dir else input_dir
     prefix     = args.prefix
+    workers    = max(1, args.workers)
 
     users = args.users if args.users else find_users(input_dir, prefix)
 
@@ -187,14 +191,35 @@ def main() -> None:
         print(f"No user detail reports found in: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Exporting {len(users)} user(s) -> {output_dir}")
-    written = 0
-    for user in users:
-        out = export_user(user, input_dir, output_dir, prefix)
-        if out:
-            print(f"  {user:20s}  {out}")
-            written += 1
+    mode = f"parallel {workers}w" if workers > 1 else "sequential"
+    print(f"Exporting {len(users)} user(s) [{mode}] -> {output_dir}")
 
+    results: list = []
+    failed:  list = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(export_user, u, input_dir, output_dir, prefix): u
+            for u in users
+        }
+        for fut in as_completed(futures):
+            user = futures[fut]
+            try:
+                out = fut.result()
+                if out:
+                    results.append((user, out))
+            except Exception as exc:
+                failed.append(user)
+                print(f"  [warn] {user}: {exc}", file=sys.stderr)
+
+    # Print results sorted by username for deterministic output
+    for user, out in sorted(results):
+        print(f"  {user:20s}  {out}")
+
+    if failed:
+        print(f"\n  [warn] {len(failed)} export(s) failed: {failed}", file=sys.stderr)
+
+    written = len(results)
     print(f"Done. {written}/{len(users)} file(s) written.")
 
 
