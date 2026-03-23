@@ -191,7 +191,9 @@ class ReportGenerator:
                     line = line.rstrip('\n')
                     if not line:
                         continue
-                    tab = line.index('\t')
+                    tab = line.find('\t')
+                    if tab < 0:
+                        continue  # skip malformed lines without tab separator
                     yield int(line[:tab]), line[tab + 1:]
 
         chunk_files = sorted(
