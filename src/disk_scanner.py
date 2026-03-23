@@ -756,24 +756,32 @@ class DiskScanner:
     
     def _format_permission_issues(self) -> Dict[str, Any]:
         """
-        Format permission issues for reporting.
-        
+        Format permission issues as a flat list for easy pagination.
+
         Returns:
-            Dictionary with formatted permission issues
+            Dict with 'total' (int) and 'items' (list of {user, path, type, error}),
+            sorted: named users first (alphabetically), then unknown items.
         """
-        permission_issues_data = {
-            "users": [],
-            "unknown_items": []
-        }
-        
-        # Process permission issues by user
-        for username, issues in self.permission_issues.items():
-            if username == "unknown":
-                permission_issues_data["unknown_items"] = issues
-            else:
-                permission_issues_data["users"].append({
-                    "name": username,
-                    "inaccessible_items": issues
+        items: List[Dict[str, str]] = []
+
+        # Named users — sorted alphabetically
+        for username in sorted(k for k in self.permission_issues if k != "unknown"):
+            for issue in self.permission_issues[username]:
+                items.append({
+                    "user":  username,
+                    "path":  issue.get("path",  ""),
+                    "type":  issue.get("type",  ""),
+                    "error": issue.get("error", ""),
                 })
-        
-        return permission_issues_data
+
+        # Unknown / orphan items last
+        for issue in self.permission_issues.get("unknown", []):
+            items.append({
+                "user":  "__unknown__",
+                "path":  issue.get("path",  ""),
+                "type":  issue.get("type",  ""),
+                "error": issue.get("error", ""),
+            })
+
+        return {"total": len(items), "items": items}
+
