@@ -44,10 +44,23 @@ Usage:
 import os
 import sys
 import json
+import re
 import glob
 import argparse
 import shutil
 from typing import List, Tuple
+
+
+def _compact_json(obj, indent: int = 4) -> str:
+    """Serialize JSON with plain-dict list items on a single line each."""
+    raw = json.dumps(obj, indent=indent, ensure_ascii=False)
+    pattern = re.compile(r"\{[^{}\[\]]*\}", re.DOTALL)
+    def collapse(m):
+        inner = m.group(0)
+        if "{" not in inner[1:] and "[" not in inner:
+            return re.sub(r"\s+", " ", inner).strip()
+        return inner
+    return pattern.sub(collapse, raw)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +144,7 @@ def migrate_file(src: str, dst: str, dry_run: bool = False) -> Tuple[str, int]:
     tmp = dst + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.write(_compact_json(data))
         shutil.move(tmp, dst)
     except OSError as exc:
         if os.path.exists(tmp):
