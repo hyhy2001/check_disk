@@ -18,13 +18,8 @@ import sys
 import json
 import glob
 import argparse
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-try:
-    import ijson
-    _IJSON_AVAILABLE = True
-except ImportError:
-    _IJSON_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -40,29 +35,20 @@ def format_size(n: int) -> str:
     return f"{n:.2f} EB"
 
 
-def stream_array(path: str, array_key: str) -> list:
+def load_json(path: str, sem: threading.Semaphore) -> dict:
     """
-    Stream items from a top-level JSON array key without loading the full file.
+    Load a JSON file under a shared semaphore to cap concurrent readers.
 
-    Uses ijson for O(1) peak memory per item when reading;
-    falls back to json.load() if ijson is unavailable.
-
-    Returns a list of parsed items (dicts).
+    Only `sem` threads may hold an open file-handle at the same time,
+    bounding peak memory to: max_readers × sizeof(largest JSON file).
     """
     try:
-        if _IJSON_AVAILABLE:
-            items = []
-            with open(path, "rb") as f:          # ijson requires binary mode
-                for item in ijson.items(f, f"{array_key}.item"):
-                    items.append(item)
-            return items
-        else:
+        with sem:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get(array_key, [])
+                return json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         print(f"  [warn] Cannot read {path}: {exc}", file=sys.stderr)
-        return []
+        return {}
 
 
 def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
@@ -117,23 +103,21 @@ def build_path(input_dir: str, prefix: str, segment: str, user: str) -> str:
 # Core
 # ---------------------------------------------------------------------------
 
-def build_entries_streamed(dir_path: str, file_path: str) -> list:
+def build_entries(dir_path: str, file_path: str, sem: threading.Semaphore) -> list:
     """
-    Stream dir/file JSON arrays separately and merge into one sorted list.
+    Load dir/file JSON reports and merge into one sorted entry list.
 
-    Each array key is streamed item-by-item via ijson so only one JSON
-    object is held in memory at a time during the read phase.
-    Peak memory per worker: O(total entry count) for the merged list,
-    NOT O(raw JSON bytes).
+    Reads are gated by `sem` so at most N workers hold file data in
+    RAM simultaneously, capping peak memory regardless of worker count.
     """
     entries: list = []
 
     if os.path.exists(dir_path):
-        for d in stream_array(dir_path, "dirs"):
+        for d in load_json(dir_path, sem).get("dirs", []):
             entries.append({"kind": "dir", "path": d["path"], "size": d["used"]})
 
     if os.path.exists(file_path):
-        for f in stream_array(file_path, "files"):
+        for f in load_json(file_path, sem).get("files", []):
             entries.append({"kind": "file", "path": f["path"], "size": f["size"]})
 
     entries.sort(key=lambda x: x["size"], reverse=True)
@@ -143,14 +127,15 @@ def build_entries_streamed(dir_path: str, file_path: str) -> list:
 def export_user(user: str,
                 input_dir: str,
                 output_dir: str,
-                prefix: str) -> str:
+                prefix: str,
+                sem: threading.Semaphore) -> str:
     """
-    Stream JSON reports for user and write plain-text report.
+    Load JSON reports for user (semaphore-gated) and write plain-text report.
     Returns path of the written file, or empty string if skipped.
 
-    Memory strategy: each JSON file is streamed via ijson so the raw
-    JSON bytes are never fully resident in RAM; only parsed entry dicts
-    are accumulated (much smaller than raw JSON).
+    Memory strategy: `sem` limits how many workers may hold JSON data
+    in RAM at the same time, so peak memory = max_readers x file_size
+    instead of workers x file_size.
     """
     dir_path  = build_path(input_dir, prefix, "detail_report_dir",  user)
     file_path = build_path(input_dir, prefix, "detail_report_file", user)
@@ -159,7 +144,7 @@ def export_user(user: str,
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
         return ""
 
-    entries = build_entries_streamed(dir_path, file_path)
+    entries = build_entries(dir_path, file_path, sem)
 
     if not entries:
         print(f"  [skip] Empty data for user: {user}", file=sys.stderr)
@@ -194,27 +179,34 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--input-dir",  default=".",
+    p.add_argument("--input-dir",   default=".",
                    help="Directory containing detail_report_dir/file JSON files (default: .)")
-    p.add_argument("--output-dir", default=None,
+    p.add_argument("--output-dir",  default=None,
                    help="Directory to write .txt files to (default: same as --input-dir)")
-    p.add_argument("--prefix",     default="",
+    p.add_argument("--prefix",      default="",
                    help="Filename prefix used when scanning (e.g. 'sda1')")
-    p.add_argument("--users",      nargs="+", metavar="USER",
+    p.add_argument("--users",       nargs="+", metavar="USER",
                    help="Only export specific user(s). Default: all discovered users.")
-    p.add_argument("--workers",    type=int, default=4,
+    p.add_argument("--workers",     type=int, default=4,
                    help="Number of parallel worker threads (default: 4). "
                         "Use 1 for sequential (legacy) behaviour.")
+    p.add_argument("--max-readers", type=int, default=2,
+                   help="Max workers that may read JSON files simultaneously (default: 2). "
+                        "Lower = less memory, higher = faster I/O.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    input_dir  = os.path.abspath(args.input_dir)
-    output_dir = os.path.abspath(args.output_dir) if args.output_dir else input_dir
-    prefix     = args.prefix
-    workers    = max(1, args.workers)
+    input_dir   = os.path.abspath(args.input_dir)
+    output_dir  = os.path.abspath(args.output_dir) if args.output_dir else input_dir
+    prefix      = args.prefix
+    workers     = max(1, args.workers)
+    max_readers = max(1, args.max_readers)
+
+    # Semaphore caps concurrent JSON readers → peak memory = max_readers × file_size
+    read_sem = threading.Semaphore(max_readers)
 
     users = args.users if args.users else find_users(input_dir, prefix)
 
@@ -222,7 +214,7 @@ def main() -> None:
         print(f"No user detail reports found in: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
-    mode = f"parallel {workers}w" if workers > 1 else "sequential"
+    mode = f"parallel {workers}w (max-readers={max_readers})" if workers > 1 else "sequential"
     print(f"Exporting {len(users)} user(s) [{mode}] -> {output_dir}")
 
     results: list = []
@@ -230,7 +222,7 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(export_user, u, input_dir, output_dir, prefix): u
+            executor.submit(export_user, u, input_dir, output_dir, prefix, read_sem): u
             for u in users
         }
         for fut in as_completed(futures):
