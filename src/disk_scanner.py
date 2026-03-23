@@ -58,7 +58,7 @@ class DiskScanner:
     """Optimized disk scanner with per-thread queues and streaming file-path flush."""
 
     BATCH_SIZE            = 5000   # dirs to steal from global queue at once
-    DETAIL_FLUSH_THRESHOLD = 100_000 # flush when a thread accumulates this many file entries
+    DETAIL_FLUSH_THRESHOLD = 200_000 # flush when a thread accumulates this many file entries
     DETAIL_TOP_N           = 200    # top-N files kept per user in the final report
 
     def __init__(self, config: Dict[str, Any], max_workers: int = None, debug: bool = False):
