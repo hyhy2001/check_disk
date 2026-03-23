@@ -42,19 +42,36 @@ def load_json(path: str) -> dict:
         return {}
 
 
+def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
+    """
+    Return the directory that actually contains the detail JSON files.
+
+    Handles two layouts:
+      1. input_dir/detail_users/PREFIX_detail_report_dir_*.json  (standard)
+      2. input_dir/PREFIX_detail_report_dir_*.json               (flat, user passed detail_users/ directly)
+    """
+    sub = os.path.join(input_dir, "detail_users")
+    pat_prefix = f"{prefix}_" if prefix else ""
+    probe = f"{pat_prefix}detail_report_dir_*.json"
+
+    if glob.glob(os.path.join(sub, probe)):
+        return sub          # standard layout
+    if glob.glob(os.path.join(input_dir, probe)):
+        return input_dir    # flat layout (input_dir IS detail_users/)
+    return sub              # fallback — will produce a meaningful "not found" message
+
+
 def find_users(input_dir: str, prefix: str) -> list:
     """
-    Return sorted list of usernames discovered from detail_report_dir_*.json files
-    inside the detail_users/ subdirectory.
+    Return sorted list of usernames discovered from detail_report_dir_*.json files.
     """
-    detail_dir = os.path.join(input_dir, "detail_users")
+    detail_dir = _resolve_detail_dir(input_dir, prefix)
 
-    if prefix:
-        pattern = os.path.join(detail_dir, f"{prefix}_detail_report_dir_*.json")
-        strip = f"{prefix}_detail_report_dir_"
-    else:
-        pattern = os.path.join(detail_dir, "detail_report_dir_*.json")
-        strip = "detail_report_dir_"
+    pat_prefix = f"{prefix}_" if prefix else ""
+    pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_*.json")
+    strip   = f"{pat_prefix}detail_report_dir_"
+
+    print(f"  Searching: {pattern}", file=sys.stderr)
 
     users = []
     for path in glob.glob(pattern):
@@ -66,10 +83,10 @@ def find_users(input_dir: str, prefix: str) -> list:
 
 
 def build_path(input_dir: str, prefix: str, segment: str, user: str) -> str:
-    """Construct full path for a detail report file inside detail_users/ subdir."""
-    detail_dir = os.path.join(input_dir, "detail_users")
-    parts = [p for p in [prefix, segment, user] if p]
-    fname = "_".join(parts) + ".json"
+    """Construct full path for a detail report file, auto-detecting layout."""
+    detail_dir = _resolve_detail_dir(input_dir, prefix)
+    pat_prefix = f"{prefix}_" if prefix else ""
+    fname = f"{pat_prefix}{segment}_{user}.json"
     return os.path.join(detail_dir, fname)
 
 
