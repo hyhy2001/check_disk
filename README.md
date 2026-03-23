@@ -44,7 +44,7 @@ produces structured JSON output consumed by the companion **disk_usage** web das
 - **Team ID backfill** — `scripts/backfill_team_ids.py` patches old reports without `team_id`
 
 ### Memory Efficiency (Large Disks)
-- **Streaming flush** — file paths are flushed to temporary `.tsv` files in sorted chunks once per-thread buffer reaches `DETAIL_FLUSH_THRESHOLD` (default 100,000 entries), keeping RAM usage bounded
+- **Streaming flush** — file paths are flushed to temporary `.tsv` files in sorted chunks once per-thread buffer reaches `DETAIL_FLUSH_THRESHOLD` (default 200,000 entries), keeping RAM usage bounded
 - **K-way merge** — final detail report is assembled via a min-heap merge of sorted chunks; RAM is O(chunks), not O(total_files)
 - **Non-UTF-8 paths** — surrogate-escape encoding prevents crashes on exotic Linux filenames; replaced with `U+FFFD` (replacement character) in JSON output
 
@@ -157,7 +157,7 @@ Core parallel scanner using Python threads and `os.scandir()`.
 |-----------|---------|-------------|
 | `max_workers` | `min(cpu*2, 64)` | Worker thread count |
 | `debug` | `False` | Print per-directory and skip events |
-| `DETAIL_FLUSH_THRESHOLD` | `100_000` | Flush per-thread file-path buffer to disk at this size |
+| `DETAIL_FLUSH_THRESHOLD` | `200_000` | Flush per-thread file-path buffer to disk at this size |
 
 **Threading model:**
 
@@ -201,7 +201,7 @@ class ScanResult:
     other_usage:       List[Dict]       # [{name, used}] -- UIDs not in config
     timestamp:         int              # Unix epoch
     top_dir:           List[Dict]       # [{dir, user, user_usage}]
-    permission_issues: Dict             # {users: [...], unknown_items: [...]}
+    permission_issues: Dict             # flat: {total: N, items: [{user, path, type, error}]}
     detail_files:      Dict[str, List]  # username -> [(path, size), ...]
     detail_tmpdir:     Optional[str]    # path to tmp dir with .tsv chunks (streaming mode)
     detail_uid_username: Dict[int, str] # uid -> username mapping
@@ -449,25 +449,27 @@ via the companion web dashboard's paginated API.
 
 ### `permission_issues.json`
 
+Flat array format — each inaccessible item is one entry. Named users are sorted
+alphabetically; orphaned/unknown inodes use `user: "__unknown__"`.
+
 ```json
 {
+  "date": "20260322",
+  "directory": "/data/shared",
   "permission_issues": {
-    "users": [
-      {
-        "name": "alice",
-        "inaccessible_items": [
-          {
-            "path": "/data/shared/alice/private",
-            "type": "directory",
-            "error": "[Errno 13] Permission denied"
-          }
-        ]
-      }
-    ],
-    "unknown_items": []
+    "total": 4,
+    "items": [
+      { "user": "alice",       "path": "/data/shared/alice/private", "type": "directory", "error": "Permission denied" },
+      { "user": "alice",       "path": "/data/shared/alice/keys",    "type": "file",      "error": "Operation not permitted" },
+      { "user": "bob",         "path": "/data/shared/bob/secret",   "type": "file",      "error": "Access denied" },
+      { "user": "__unknown__", "path": "/orphan/inode",             "type": "directory", "error": "Cannot stat" }
+    ]
   }
 }
 ```
+
+> Each item is written on **one line** in the file (compact dict, 4-space outer indent).
+> This makes `grep` and streaming reads efficient on large permission reports.
 
 ---
 
@@ -554,6 +556,44 @@ Done: 5 file(s), 12 team_id field(s) added, 1 error(s)
 
 ---
 
+### `scripts/migrate_permission_issues.py`
+
+One-time migration script: converts `permission_issues_*.json` files from the old
+nested format (`users[].inaccessible_items[]`) to the new flat format (`items[]`).
+
+**Idempotent** — files already in the new format are detected and skipped.
+
+```bash
+# Dry-run: preview what would change
+python scripts/migrate_permission_issues.py \
+    --reports "/reports/**/permission_issues*.json" \
+    --dry-run
+
+# Migrate all matching files in-place
+python scripts/migrate_permission_issues.py \
+    --reports "/reports/**/permission_issues*.json"
+
+# Single file, write to a new path
+python scripts/migrate_permission_issues.py \
+    --report old_permission_issues.json \
+    --output new_permission_issues.json
+```
+
+**Output example:**
+
+```
+Migrating 12 file(s)...
+
+  ✓  permission_issues_20250101.json   87 item(s) migrated
+  ✓  permission_issues_20250201.json  124 item(s) migrated
+  →  permission_issues_20260515.json  already in new format
+  ✗  permission_issues_corrupt.json   ERROR: Invalid JSON
+
+Done: 11 migrated, 1 skipped, 1 error(s). Total items converted: 1,245.
+```
+
+---
+
 ## Performance & Memory Notes
 
 ### Throughput guide
@@ -574,12 +614,14 @@ During a large scan, memory usage breaks down as:
 | Component | Approx. (36M files) |
 |-----------|---------------------|
 | `dir_sizes` dict (6.5M dirs) | ~2.5 GB |
-| `file_paths` buffers (100K threshold × 64 threads) | ~1.3 GB |
+| `file_paths` buffers (200K threshold × 64 threads) | ~2.56 GB |
 | Python runtime + OS page cache | ~0.5–1 GB |
-| **Total peak** | **~5 GB** |
+| **Total peak** | **~6.7 GB** |
 
-> Increasing `DETAIL_FLUSH_THRESHOLD` reduces flush frequency (smoother throughput)
-> at the cost of more RAM for `file_paths`. Set to `200_000` only if you have 8+ GB free.
+> `DETAIL_FLUSH_THRESHOLD` controls the trade-off between flush frequency and RAM usage:
+> - `100_000` → ~360 flushes, ~1.3 GB RAM — best for servers with 8 GB or less
+> - `200_000` → ~180 flushes, ~2.56 GB RAM — **current default**; recommended for servers with 8+ GB free
+> - `300_000+` → fewer flushes, but diminishing returns; use only with 16+ GB RAM
 
 ### Sawtooth throughput pattern
 
