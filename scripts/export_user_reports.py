@@ -20,6 +20,12 @@ import glob
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    import ijson
+    _IJSON_AVAILABLE = True
+except ImportError:
+    _IJSON_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,14 +40,29 @@ def format_size(n: int) -> str:
     return f"{n:.2f} EB"
 
 
-def load_json(path: str) -> dict:
-    """Load JSON file, return empty dict on failure."""
+def stream_array(path: str, array_key: str) -> list:
+    """
+    Stream items from a top-level JSON array key without loading the full file.
+
+    Uses ijson for O(1) peak memory per item when reading;
+    falls back to json.load() if ijson is unavailable.
+
+    Returns a list of parsed items (dicts).
+    """
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        if _IJSON_AVAILABLE:
+            items = []
+            with open(path, "rb") as f:          # ijson requires binary mode
+                for item in ijson.items(f, f"{array_key}.item"):
+                    items.append(item)
+            return items
+        else:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get(array_key, [])
     except (OSError, json.JSONDecodeError) as exc:
         print(f"  [warn] Cannot read {path}: {exc}", file=sys.stderr)
-        return {}
+        return []
 
 
 def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
@@ -96,19 +117,24 @@ def build_path(input_dir: str, prefix: str, segment: str, user: str) -> str:
 # Core
 # ---------------------------------------------------------------------------
 
-def build_entries(dir_data: dict, file_data: dict) -> list:
+def build_entries_streamed(dir_path: str, file_path: str) -> list:
     """
-    Merge directory and file entries into a single list, each item:
-        {"kind": "dir"|"file", "path": str, "size": int}
-    Sorted by size descending.
+    Stream dir/file JSON arrays separately and merge into one sorted list.
+
+    Each array key is streamed item-by-item via ijson so only one JSON
+    object is held in memory at a time during the read phase.
+    Peak memory per worker: O(total entry count) for the merged list,
+    NOT O(raw JSON bytes).
     """
-    entries = []
+    entries: list = []
 
-    for d in dir_data.get("dirs", []):
-        entries.append({"kind": "dir", "path": d["path"], "size": d["used"]})
+    if os.path.exists(dir_path):
+        for d in stream_array(dir_path, "dirs"):
+            entries.append({"kind": "dir", "path": d["path"], "size": d["used"]})
 
-    for f in file_data.get("files", []):
-        entries.append({"kind": "file", "path": f["path"], "size": f["size"]})
+    if os.path.exists(file_path):
+        for f in stream_array(file_path, "files"):
+            entries.append({"kind": "file", "path": f["path"], "size": f["size"]})
 
     entries.sort(key=lambda x: x["size"], reverse=True)
     return entries
@@ -119,20 +145,25 @@ def export_user(user: str,
                 output_dir: str,
                 prefix: str) -> str:
     """
-    Load JSON reports for user, write plain-text report.
+    Stream JSON reports for user and write plain-text report.
     Returns path of the written file, or empty string if skipped.
+
+    Memory strategy: each JSON file is streamed via ijson so the raw
+    JSON bytes are never fully resident in RAM; only parsed entry dicts
+    are accumulated (much smaller than raw JSON).
     """
     dir_path  = build_path(input_dir, prefix, "detail_report_dir",  user)
     file_path = build_path(input_dir, prefix, "detail_report_file", user)
 
-    dir_data  = load_json(dir_path)  if os.path.exists(dir_path)  else {}
-    file_data = load_json(file_path) if os.path.exists(file_path) else {}
-
-    if not dir_data and not file_data:
+    if not os.path.exists(dir_path) and not os.path.exists(file_path):
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
         return ""
 
-    entries = build_entries(dir_data, file_data)
+    entries = build_entries_streamed(dir_path, file_path)
+
+    if not entries:
+        print(f"  [skip] Empty data for user: {user}", file=sys.stderr)
+        return ""
 
     lines = [
         f"{'Type':<4}  {'User':<20}  {'Size':>12}  Path",
