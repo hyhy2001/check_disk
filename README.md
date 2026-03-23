@@ -1,7 +1,8 @@
-# Disk Usage Checker
+# check_disk
 
-A high-performance Python CLI tool for monitoring disk usage by team and user,
-with parallel scanning, JSON reporting, plain-text export, and multi-report comparison.
+A high-performance Python CLI tool for monitoring disk usage across teams and users on Linux servers.
+Uses parallel `scandir()` with work-stealing threads, streaming memory-efficient reporting, and
+produces structured JSON output consumed by the companion **disk_usage** web dashboard.
 
 ---
 
@@ -16,34 +17,43 @@ with parallel scanning, JSON reporting, plain-text export, and multi-report comp
 - [Configuration Format](#configuration-format)
 - [Report Formats](#report-formats)
 - [Scripts](#scripts)
-- [Performance Notes](#performance-notes)
+- [Performance & Memory Notes](#performance--memory-notes)
 
 ---
 
 ## Features
 
+### Scanning Engine
 - **Parallel disk scanning** — work-stealing multi-thread `scandir()`, auto-scales to CPU count (cap 64)
 - **Single `stat()` per entry** — uses `S_ISDIR`/`S_ISREG` from `st_mode` instead of chained `is_dir()`/`is_file()` calls
-- **Hard-link deduplication** — `st_nlink == 1` fast path avoids lock contention; only hard-linked inodes acquire a lock
-- **Snapshot/NFS detection** — automatically skips directories on a different device ID (covers ZFS, Btrfs, NFS, bind-mounts)
-- **Name-based skip** — `.snapshot`, `.snapshots`, `.zfs`, `proc`, `sys`, `dev` skipped without a `stat()` call
-- **Event-driven idle** — idle threads sleep on `threading.Event` instead of busy-waiting every 5 ms
-- **Team/user tracking** — maps filesystem UIDs to configured users and teams
+- **Hard-link deduplication** — `st_nlink == 1` fast-path avoids lock contention; only multi-linked inodes acquire a lock
+- **Snapshot/NFS detection** — skips directories on a different device ID (covers ZFS snapshots, Btrfs subvols, NFS, bind-mounts)
+- **Name-based skip** — `.snapshot`, `.snapshots`, `.zfs`, `proc`, `sys`, `dev`, `run`, and similar pseudo-filesystems are skipped before any `stat()` call
+- **Event-driven idle** — idle threads sleep on `threading.Event` instead of busy-waiting; woken immediately when new dirs are pushed
 - **Sparse file support** — uses `st_blocks * 512` for accurate on-disk size (not logical file size)
-- **Permission issue tracking** — records inaccessible files/dirs per user
-- **Per-user detail reports** — per-user JSON files listing top dirs and files by size
-- **Plain-text export** — `scripts/export_user_reports.py` converts JSON detail reports to sorted plain-text files
-- **Team ID backfill** — `scripts/backfill_team_ids.py` patches existing reports without `team_id` using config mapping
+- **Stall detection** — automatically aborts if the scan makes no progress for 5 minutes
+- **Memory monitoring** — terminates gracefully if RSS exceeds the configured limit
+
+### Reporting
+- **Team and user tracking** — maps filesystem UIDs to configured users and groups them by team
+- **Permission issue tracking** — records every inaccessible file/directory per user
+- **Per-user directory reports** — top directories sorted by disk usage per user (JSON)
+- **Per-user file reports** — all files sorted by size with streaming writes (JSON)
 - **Multi-report comparison** — compare N reports side-by-side with growth/usage ranking
-- **Stall detection** — automatically aborts if scan stops making progress for 5 minutes
-- **Memory monitoring** — terminates if RSS exceeds configured limit
+- **Plain-text export** — `scripts/export_user_reports.py` converts JSON detail reports to sorted `.txt` files
+- **Team ID backfill** — `scripts/backfill_team_ids.py` patches old reports without `team_id`
+
+### Memory Efficiency (Large Disks)
+- **Streaming flush** — file paths are flushed to temporary `.tsv` files in sorted chunks once per-thread buffer reaches `DETAIL_FLUSH_THRESHOLD` (default 100,000 entries), keeping RAM usage bounded
+- **K-way merge** — final detail report is assembled via a min-heap merge of sorted chunks; RAM is O(chunks), not O(total_files)
+- **Non-UTF-8 paths** — surrogate-escape encoding prevents crashes on exotic Linux filenames; replaced with `U+FFFD` (replacement character) in JSON output
 
 ---
 
 ## Requirements
 
 - Python 3.6+
-- [`psutil`](https://pypi.org/project/psutil/) (memory monitoring)
+- [`psutil`](https://pypi.org/project/psutil/) — memory monitoring
 
 ```bash
 pip install psutil
@@ -55,15 +65,15 @@ pip install psutil
 
 ```bash
 # 1. Initialize config with the directory to scan
-python disk_checker.py --init --dir /data/users
+python disk_checker.py --init --dir /data/shared
 
 # 2. Define teams
-python disk_checker.py --add-team JP
-python disk_checker.py --add-team VN
+python disk_checker.py --add-team backend
+python disk_checker.py --add-team frontend
 
 # 3. Add users to teams
-python disk_checker.py --add-user Hirakimoto Sasi --team JP
-python disk_checker.py --add-user Binh --team VN
+python disk_checker.py --add-user alice bob carol --team backend
+python disk_checker.py --add-user dave eve --team frontend
 
 # 4. Run a scan
 python disk_checker.py --run
@@ -71,8 +81,8 @@ python disk_checker.py --run
 # 5. View the report
 python disk_checker.py --show-report --files disk_usage_report.json
 
-# 6. Check per-user detail reports
-python disk_checker.py --check-users Binh Sasi
+# 6. Check per-user detail reports in the terminal
+python disk_checker.py --check-users alice bob
 
 # 7. Export plain-text usage files (one per user)
 python scripts/export_user_reports.py --input-dir /reports/ --output-dir /reports/txt/
@@ -93,29 +103,32 @@ disk_checker_config.json
          v
   DiskScanner.scan()      <- multi-thread scandir()
    |-- _worker() x N      <- per-thread: stat(), mode dispatch, dedup
-   |    |-- ThreadStats   <- uid_sizes, dir_sizes, file_paths, permission_issues
+   |    |-- ThreadStats   <- uid_sizes, dir_sizes, file_paths (streamed to tmp)
    |    `-- inode lock    <- acquired only for hard-linked files (st_nlink > 1)
-   `-- ScanResult         <- merged data from all threads
+   |-- _flush_thread_paths()  <- sort + write chunks to tmp .tsv files
+   `-- _stream_merge_to_results()  <- collect UID→username mapping
          |
          v
   ReportGenerator         <- converts ScanResult -> JSON files
-   |-- disk_usage_report.json         (always)
-   |-- permission_issues.json         (auto, if issues found)
-   |-- detail_report_dir_{user}.json  (per user, always)
-   `-- detail_report_file_{user}.json (per user, always)
+   |-- disk_usage_report.json             (always)
+   |-- permission_issues.json             (if issues found)
+   |-- detail_users/
+   |    |-- detail_report_dir_{user}.json  (per user, always)
+   |    `-- detail_report_file_{user}.json (per user, k-way merge from tmp tsv)
+   `-- [tmp dir auto-cleaned on exit]
 ```
 
 ### Source Layout
 
 ```
 disk_checker.py          <- CLI entry point
-disk_checker_config.json <- configuration file
+disk_checker_config.json <- configuration (created by --init)
 
 src/
   cli_interface.py       <- argparse, argument routing
   config_manager.py      <- JSON config CRUD
-  disk_scanner.py        <- DiskScanner (parallel core)
-  report_generator.py    <- JSON report writer
+  disk_scanner.py        <- DiskScanner (parallel core + streaming flush)
+  report_generator.py    <- JSON report writer (streaming for file reports)
   utils.py               <- shared helpers, ScanHelper
 
   formatters/
@@ -144,6 +157,7 @@ Core parallel scanner using Python threads and `os.scandir()`.
 |-----------|---------|-------------|
 | `max_workers` | `min(cpu*2, 64)` | Worker thread count |
 | `debug` | `False` | Print per-directory and skip events |
+| `DETAIL_FLUSH_THRESHOLD` | `100_000` | Flush per-thread file-path buffer to disk at this size |
 
 **Threading model:**
 
@@ -158,7 +172,7 @@ Core parallel scanner using Python threads and `os.scandir()`.
 entry.stat(follow_symlinks=False)         <- one syscall
   S_ISLNK(mode) -> skip
   S_ISDIR(mode) -> name check -> device ID check -> enqueue
-  S_ISREG(mode) -> st_nlink check -> count size
+  S_ISREG(mode) -> st_nlink check -> count size -> buffer path
 ```
 
 **Hard-link deduplication:**
@@ -166,41 +180,56 @@ entry.stat(follow_symlinks=False)         <- one syscall
 - `st_nlink == 1`: no lock acquired, file counted immediately (fast path, ~99% of files)
 - `st_nlink > 1`: `(st_ino, st_dev)` checked under a single `Lock` (rare path)
 
+**Streaming file-path flush:**
+
+Each worker accumulates `(size, path)` tuples in `file_paths` dict keyed by UID. When
+total accumulated entries exceed `DETAIL_FLUSH_THRESHOLD`, the buffer is:
+1. Sorted descending by size per UID
+2. Written as a TSV chunk to a per-thread temporary file
+
+After scanning completes, `ReportGenerator` performs a k-way merge of all chunks per UID
+to produce the final `detail_report_file_{user}.json` without ever loading all paths into RAM.
+
 **ScanResult fields:**
 
 ```python
 @dataclass
 class ScanResult:
-    general_system:    Dict[str, int]              # total, used, available bytes
-    team_usage:        List[Dict]                  # [{name, used}]
-    user_usage:        List[Dict]                  # [{name, used}] -- users in config
-    other_usage:       List[Dict]                  # [{name, used}] -- UIDs not in config
-    timestamp:         int                         # Unix epoch
-    top_dir:           List[Dict]                  # [{dir, user, user_usage}]
-    permission_issues: Dict                        # {users: [...], unknown_items: [...]}
-    detail_files:      Dict[str, List[Tuple]]      # username -> [(path, size), ...]
+    general_system:    Dict[str, int]   # total, used, available bytes
+    team_usage:        List[Dict]       # [{name, used}]
+    user_usage:        List[Dict]       # [{name, used}] -- users in config
+    other_usage:       List[Dict]       # [{name, used}] -- UIDs not in config
+    timestamp:         int              # Unix epoch
+    top_dir:           List[Dict]       # [{dir, user, user_usage}]
+    permission_issues: Dict             # {users: [...], unknown_items: [...]}
+    detail_files:      Dict[str, List]  # username -> [(path, size), ...]
+    detail_tmpdir:     Optional[str]    # path to tmp dir with .tsv chunks (streaming mode)
+    detail_uid_username: Dict[int, str] # uid -> username mapping
 ```
 
 ---
 
 ### `src/report_generator.py` — ReportGenerator
 
-Converts a `ScanResult` to JSON files. All sibling reports share the same
-`prefix` and directory as the main report.
+Converts a `ScanResult` to JSON files. All sibling reports share the same `prefix` and directory.
 
 | Method | Output file | When |
 |--------|-------------|------|
 | `generate_report(scan_result)` | `disk_usage_report.json` | Always with `--run` |
 | `generate_detail_reports(scan_result)` | `detail_report_dir_{user}.json` + `detail_report_file_{user}.json` | Always with `--run` |
 
+**Streaming mode** (activated when `scan_result.detail_tmpdir` is set):
+
+1. **Pass 1** — iterate all TSV chunks for a UID to count `total_files` and `total_used`
+2. **Pass 2** — k-way min-heap merge of sorted chunks → write JSON entries line-by-line
+
+Peak RAM for file reports = O(number of open chunks), not O(total files). Safe for 36M+ file trees.
+
 **File naming:**
 
 ```
-prefix=sda1  base=permission_issues
--> sda1_permission_issues.json
-
-prefix=sda1  base=detail_report_dir  user=Binh
--> sda1_detail_report_dir_Binh.json
+prefix=sda1  base=detail_report_dir  user=alice
+-> detail_users/sda1_detail_report_dir_alice.json
 ```
 
 ---
@@ -209,7 +238,7 @@ prefix=sda1  base=detail_report_dir  user=Binh
 
 Builds the `argparse` parser and handles:
 
-- Splitting quoted multi-user strings (`"user1 user2"` -> `["user1", "user2"]`)
+- Splitting quoted multi-user strings (`"alice bob"` -> `["alice", "bob"]`)
 - Wildcard expansion for `--files *.json`
 - `--check-users` to display per-user detail reports from disk
 
@@ -224,7 +253,7 @@ Builds the `argparse` parser and handles:
 | `format_time_duration(sec)` | `3661` -> `"1h 1m 1s"` |
 | `get_actual_disk_usage(stat)` | `stat.st_blocks * 512` (sparse-file aware) |
 | `create_usage_bar(pct, width)` | `50, 20` -> `"[##########----------]"` |
-| `build_uid_cache()` | Pre-loads all `/etc/passwd` entries once |
+| `build_uid_cache()` | Pre-loads all `/etc/passwd` entries once at startup |
 | `save_json_report(data, path)` | Atomic JSON write, creates dirs if needed |
 
 **`ScanHelper` class (static methods):**
@@ -255,25 +284,25 @@ Builds the `argparse` parser and handles:
 
 ```bash
 # Initialize with scan target
-python disk_checker.py --init --dir /path/to/scan
+python disk_checker.py --init --dir /data/shared
 
 # Change target directory
 python disk_checker.py --dir /new/path
 
 # Add teams
-python disk_checker.py --add-team JP
-python disk_checker.py --add-team VN
+python disk_checker.py --add-team backend
+python disk_checker.py --add-team frontend
 
 # Add users
-python disk_checker.py --add-user Hirakimoto --team JP
-python disk_checker.py --add-user Hirakimoto Sasi --team JP
+python disk_checker.py --add-user alice --team backend
+python disk_checker.py --add-user alice bob carol --team backend
 
 # Remove users
-python disk_checker.py --remove-user Hirakimoto
+python disk_checker.py --remove-user alice
 
 # List configuration
 python disk_checker.py --list
-python disk_checker.py --list --team JP
+python disk_checker.py --list --team backend
 ```
 
 ### Scanning
@@ -285,7 +314,8 @@ python disk_checker.py --run
 # Custom output location
 python disk_checker.py --run --output-dir /reports/
 python disk_checker.py --run --prefix sda1
-# -> sda1_disk_usage_report.json + sda1_permission_issues.json
+# -> detail_users/sda1_detail_report_dir_*.json
+# -> detail_users/sda1_detail_report_file_*.json
 
 python disk_checker.py --run --prefix sda1 --date
 # -> sda1_disk_usage_report_20260322.json
@@ -304,21 +334,21 @@ python disk_checker.py --run --debug
 python disk_checker.py --show-report --files disk_usage_report.json
 
 # Display with user filter
-python disk_checker.py --show-report --files disk_usage_report.json --user Binh
+python disk_checker.py --show-report --files disk_usage_report.json --user alice
 
-# Compare multiple reports
+# Compare multiple reports side by side
 python disk_checker.py --show-report --files report1.json report2.json report3.json
 
 # Wildcards
 python disk_checker.py --show-report --files "sda1_disk_usage_report_*.json"
 
-# Ranking strategy
+# Ranking strategy (usage = total size, growth = delta between reports)
 python disk_checker.py --show-report --files r1.json r2.json --compare-by usage
 python disk_checker.py --show-report --files r1.json r2.json --compare-by growth
 
-# View per-user detail reports
-python disk_checker.py --check-users Binh Sasi
-python disk_checker.py --check-users Binh --output-dir /reports/ --prefix sda1
+# View per-user detail reports in terminal
+python disk_checker.py --check-users alice bob
+python disk_checker.py --check-users alice --output-dir /reports/ --prefix sda1
 ```
 
 ---
@@ -329,16 +359,16 @@ python disk_checker.py --check-users Binh --output-dir /reports/ --prefix sda1
 
 ```json
 {
-  "directory": "/data/users",
+  "directory": "/data/shared",
   "output_file": "disk_usage_report.json",
   "teams": [
-    { "name": "JP",  "team_ID": 1 },
-    { "name": "VN",  "team_ID": 2 }
+    { "name": "backend",  "team_ID": 1 },
+    { "name": "frontend", "team_ID": 2 }
   ],
   "users": [
-    { "name": "Binh",       "team_ID": 2 },
-    { "name": "Hirakimoto", "team_ID": 1 },
-    { "name": "Sasi",       "team_ID": 1 }
+    { "name": "alice", "team_ID": 1 },
+    { "name": "bob",   "team_ID": 1 },
+    { "name": "carol", "team_ID": 2 }
   ]
 }
 ```
@@ -354,18 +384,18 @@ Users are always sorted alphabetically when saved.
 ```json
 {
   "date": 1742600000,
-  "directory": "/data/users",
+  "directory": "/data/shared",
   "general_system": {
     "total":     10995116277760,
     "used":       8246337208320,
     "available":  2748779069440
   },
   "team_usage": [
-    { "name": "JP",    "used": 3298534883328, "team_id": 1 },
-    { "name": "Other", "used":  549755813888 }
+    { "name": "backend",  "used": 3298534883328, "team_id": 1 },
+    { "name": "Other",    "used":  549755813888 }
   ],
   "user_usage": [
-    { "name": "Binh", "used": 2748779069440, "team_id": 2 }
+    { "name": "alice", "used": 2748779069440, "team_id": 1 }
   ],
   "other_usage": [
     { "name": "uid-1234", "used": 549755813888 }
@@ -382,30 +412,38 @@ Users are always sorted alphabetically when saved.
 ```json
 {
   "date": 1742600000,
-  "directory": "/data/users",
-  "user": "Binh",
+  "directory": "/data/shared",
+  "user": "alice",
   "total_used": 2748779069440,
   "dirs": [
-    { "path": "/data/users/Binh/projects", "used": 1099511627776 }
+    { "path": "/data/shared/alice/models",   "used": 1099511627776 },
+    { "path": "/data/shared/alice/datasets", "used":  549755813888 }
   ]
 }
 ```
+
+Dirs are sorted by `used` descending.
+
+---
 
 ### `detail_report_file_{user}.json` — File Detail
 
 ```json
 {
   "date": 1742600000,
-  "user": "Binh",
-  "total_files": 12345,
+  "user": "alice",
+  "total_files": 45231,
   "total_used": 2748779069440,
   "files": [
-    { "path": "/data/users/Binh/projects/model.bin", "size": 536870912 }
+    { "path": "/data/shared/alice/models/weights.bin", "size": 536870912 },
+    { "path": "/data/shared/alice/datasets/train.tar", "size": 268435456 }
   ]
 }
 ```
 
-Files are sorted by size descending.
+Files are sorted by `size` descending. On large disks (36M+ files), the array is written
+via streaming k-way merge — the file can be hundreds of MB in size and is safe to stream
+via the companion web dashboard's paginated API.
 
 ---
 
@@ -416,10 +454,10 @@ Files are sorted by size descending.
   "permission_issues": {
     "users": [
       {
-        "name": "Hirakimoto",
+        "name": "alice",
         "inaccessible_items": [
           {
-            "path": "/data/users/Hirakimoto/private",
+            "path": "/data/shared/alice/private",
             "type": "directory",
             "error": "[Errno 13] Permission denied"
           }
@@ -437,45 +475,52 @@ Files are sorted by size descending.
 
 ### `scripts/export_user_reports.py`
 
-Reads per-user JSON detail reports and exports one plain-text file per user.
-Each file lists directories and files sorted by size (high to low).
+Reads per-user JSON detail reports and exports one plain-text file per user, listing all
+directories and files sorted by size (largest first).
+
+**Auto-detects two directory layouts:**
+- `--input-dir /reports/` → looks in `/reports/detail_users/`
+- `--input-dir /reports/detail_users/` → looks directly in that folder (flat layout)
 
 ```bash
-# Export all users found in input dir
+# Export all users
 python scripts/export_user_reports.py --input-dir /reports/
 
-# Custom output dir and prefix
+# Custom output dir and filename prefix
 python scripts/export_user_reports.py \
     --input-dir /reports/ \
-    --output-dir /reports/txt/ \
+    --output-dir /exports/txt/ \
     --prefix sda1
 
 # Only specific users
-python scripts/export_user_reports.py --input-dir /reports/ --users Binh Sasi
+python scripts/export_user_reports.py \
+    --input-dir /reports/ \
+    --users alice bob carol
 ```
 
-**Output format** (`usage_Binh.txt`):
+**Output format** (`usage_alice.txt`):
 
 ```
 Type  User                          Size  Path
 ------------------------------------------------------------------------------------------
-dir   Binh                      1.96 MB  /data/users/Binh/projects
-file  Binh                     96.00 KB  /data/users/Binh/notes.txt
+dir   alice                      1.96 TB  /data/shared/alice/models
+dir   alice                    512.00 GB  /data/shared/alice/datasets
+file  alice                    256.00 GB  /data/shared/alice/models/weights.bin
+file  alice                     64.00 GB  /data/shared/alice/datasets/train.tar
 ```
 
 ---
 
 ### `scripts/backfill_team_ids.py`
 
-Patches an existing `disk_usage_report.json` by injecting `team_id` fields into
-`team_usage` and `user_usage` entries, using the mappings defined in `disk_checker_config.json`.
-Useful for reports generated before `team_id` support was added.
+Patches existing `disk_usage_report.json` files by injecting `team_id` fields into
+`team_usage` and `user_usage` entries, using mappings from `disk_checker_config.json`.
 
-The script is **idempotent** — running it multiple times will not duplicate or overwrite
-existing `team_id` values.
+Useful for reports generated before `team_id` support was added. **Idempotent** — safe
+to run multiple times; already-patched entries are skipped.
 
 ```bash
-# Basic — auto-detect config next to report, overwrite in-place
+# Basic — auto-detect config, overwrite in-place
 python scripts/backfill_team_ids.py --report disk_usage_report.json
 
 # Explicit config path
@@ -483,7 +528,7 @@ python scripts/backfill_team_ids.py \
     --config disk_checker_config.json \
     --report /reports/disk_usage_report.json
 
-# Preview without writing
+# Dry-run preview (no writes)
 python scripts/backfill_team_ids.py --report report.json --dry-run
 
 # Write to a new file, keep original untouched
@@ -491,9 +536,6 @@ python scripts/backfill_team_ids.py --report report.json --output patched.json
 
 # Batch: patch all dated reports in a directory
 python scripts/backfill_team_ids.py --reports "reports/disk_usage_report_*.json"
-
-# Batch dry-run to preview changes across all files
-python scripts/backfill_team_ids.py --reports "reports/*.json" --dry-run
 ```
 
 **Batch output example:**
@@ -503,33 +545,48 @@ Backfilling 5 file(s) using disk_checker_config.json ...
 
   ✓  disk_usage_report_20250101.json   4 field(s) added
   ✓  disk_usage_report_20250102.json   4 field(s) added
-  ✓  disk_usage_report_20250103.json   0 field(s) added   ← already patched
+  ✓  disk_usage_report_20250103.json   0 field(s) added   <- already patched
   ✓  disk_usage_report_20250104.json   4 field(s) added
   ✗  disk_usage_report_corrupt.json   ERROR: ...
 
 Done: 5 file(s), 12 team_id field(s) added, 1 error(s)
 ```
 
-**What it patches** (only entries missing `team_id`):
-
-```json
-// Before
-{ "name": "JP", "used": 3298534883328 }
-
-// After
-{ "name": "JP", "used": 3298534883328, "team_id": 1 }
-```
-
 ---
 
-## Performance Notes
+## Performance & Memory Notes
+
+### Throughput guide
 
 | Scenario | Recommendation |
 |----------|----------------|
-| NVMe local, ~10M files | Default workers (auto), scan completes in under 1 min |
-| SSD local, 100M files | Default or `--workers 32`, ~5-15 min |
-| HDD single disk | Use `--workers 4-8` to avoid random-seek contention |
-| NFS / SAN high-latency | Use `--workers 32-64`; more threads compensate for per-request latency |
-| Very large trees | Monitor with `--debug`; stall detector aborts after 5 min of no progress |
-| Slow `/etc/passwd` | UID cache is pre-built once at startup via `build_uid_cache()` |
+| NVMe local, ~10M files | Default workers (auto), completes in under 1 min |
+| SSD local, 50M+ files | Default or `--workers 32`, expect 5–20 min |
+| HDD single disk | Use `--workers 4–8` to avoid random-seek thrashing |
+| NFS / SAN high-latency | Use `--workers 32–64`; threads compensate for per-request latency |
+| Very large trees (80 TB, 36M files) | Default workers, expect 30–90 min; stall detector aborts after 5 min |
 | Periodic reports | Use `--prefix` + `--date` in cron: `0 2 * * 0 python disk_checker.py --run --prefix weekly --date` |
+
+### Memory consumption
+
+During a large scan, memory usage breaks down as:
+
+| Component | Approx. (36M files) |
+|-----------|---------------------|
+| `dir_sizes` dict (6.5M dirs) | ~2.5 GB |
+| `file_paths` buffers (100K threshold × 64 threads) | ~1.3 GB |
+| Python runtime + OS page cache | ~0.5–1 GB |
+| **Total peak** | **~5 GB** |
+
+> Increasing `DETAIL_FLUSH_THRESHOLD` reduces flush frequency (smoother throughput)
+> at the cost of more RAM for `file_paths`. Set to `200_000` only if you have 8+ GB free.
+
+### Sawtooth throughput pattern
+
+Scan speed naturally varies in a sawtooth pattern:
+
+1. **Initial burst (~15 k files/s)** — root dirs hot in OS page cache; no flush overhead yet
+2. **Drop (~5–10 k files/s)** — threads hit `DETAIL_FLUSH_THRESHOLD` and flush (sort + write); deeper dirs cause more cache misses
+3. **Recovery (~10 k files/s steady)** — flush cycles stabilise; throughput becomes consistent
+
+This is expected behaviour. Use `--debug` to observe per-second stats.
