@@ -140,6 +140,8 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let threads_count = 16.max(cpus * 4);
     let thread_counter = Arc::new(AtomicUsize::new(0));
+    // Shared cross-worker hard-link deduplication (equivalent to Python's inode_lock + hardlink_inodes)
+    let hardlink_inodes: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let _walk_thread = thread::spawn(move || {
         WalkBuilder::new(&dir_clone)
@@ -166,7 +168,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                 };
                 let skips = skips.clone();
                 let dir = dir_clone.clone();
-                let mut hardlinks: HashSet<(u64, u64)> = HashSet::new();
+                let hardlinks_shared = hardlink_inodes.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -234,10 +236,11 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                             }
                         };
 
-                        // --- Hard-link deduplication ---
+                        // --- Hard-link deduplication (shared across all workers, like Python inode_lock) ---
                         if meta.nlink() > 1 {
                             let key = (meta.ino(), meta.dev());
-                            if !hardlinks.insert(key) { return WalkState::Continue; }
+                            let mut seen = hardlinks_shared.lock().unwrap();
+                            if !seen.insert(key) { return WalkState::Continue; }
                         }
 
                         // st_blocks * 512 = actual on-disk bytes, same as Python legacy
