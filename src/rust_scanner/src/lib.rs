@@ -51,6 +51,24 @@ fn format_rate(rate: f64) -> String {
     format!("{}.{}", format_num(int_part), frac)
 }
 
+/// Read RSS memory from /proc/self/status in MB (Linux only).
+fn get_rss_mb() -> f64 {
+    // VmRSS line looks like: "VmRSS:   123456 kB"
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let kb: u64 = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                return kb as f64 / 1024.0;
+            }
+        }
+    }
+    0.0
+}
+
 struct GlobalStats {
     total_files: u64,
     total_dirs: u64,
@@ -325,11 +343,12 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
             let total_size  = prog_size.load(Ordering::Relaxed);
             let total_elapsed = now.duration_since(start_time).as_secs();
             let rate = total_files.saturating_sub(last_files) as f64 / elapsed_secs as f64;
+            let mem_mb = get_rss_mb();
             println!(
-                "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s",
+                "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s | Mem: {:.1} MB",
                 total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
                 format_num(total_files), format_num(total_dirs),
-                format_size(total_size), format_rate(rate)
+                format_size(total_size), format_rate(rate), mem_mb
             );
             last_report = now;
             last_files = total_files;
