@@ -108,14 +108,14 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                 total_files += 1;
                 total_size += size;
                 
-                if total_files % 50_000 == 0 {
+                if total_files % 1_000 == 0 {
                     let now = Instant::now();
                     let elapsed = now.duration_since(last_report).as_secs();
-                    if elapsed >= 5 { // Print every 5 seconds
+                    if elapsed >= 1 { // Print every 1 second instead of 5
                         let total_elapsed = now.duration_since(start_time).as_secs();
                         let rate = (total_files - last_files) as f64 / elapsed as f64;
-                        println!(
-                            "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s",
+                        print!(
+                            "\r[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s   ",
                             total_elapsed / 3600,
                             (total_elapsed % 3600) / 60,
                             total_elapsed % 60,
@@ -124,6 +124,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                             format_size(total_size),
                             format_num(rate as u64)
                         );
+                        let _ = std::io::stdout().flush();
                         last_report = now;
                         last_files = total_files;
                     }
