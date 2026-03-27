@@ -21,6 +21,26 @@ fn format_num(mut n: u64) -> String {
     s
 }
 
+fn format_size(bytes: u64) -> String {
+    let kb = 1024_f64;
+    let mb = kb * 1024_f64;
+    let gb = mb * 1024_f64;
+    let tb = gb * 1024_f64;
+    let bytes_f = bytes as f64;
+
+    if bytes_f >= tb {
+        format!("{:.2} TB", bytes_f / tb)
+    } else if bytes_f >= gb {
+        format!("{:.2} GB", bytes_f / gb)
+    } else if bytes_f >= mb {
+        format!("{:.2} MB", bytes_f / mb)
+    } else if bytes_f >= kb {
+        format!("{:.2} KB", bytes_f / kb)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 #[pyfunction]
 fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<PyObject> {
     let mut total_files: u64 = 0;
@@ -95,12 +115,13 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                         let total_elapsed = now.duration_since(start_time).as_secs();
                         let rate = (total_files - last_files) as f64 / elapsed as f64;
                         println!(
-                            "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Rate: {} files/s",
+                            "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s",
                             total_elapsed / 3600,
                             (total_elapsed % 3600) / 60,
                             total_elapsed % 60,
                             format_num(total_files),
                             format_num(total_dirs),
+                            format_size(total_size),
                             format_num(rate as u64)
                         );
                         last_report = now;
