@@ -6,3 +6,6 @@ __pycache__/
 .gitignore
 .agent/
 reports/
+detail_users/
+docs/
+*.json
