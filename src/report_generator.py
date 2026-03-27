@@ -16,6 +16,13 @@ from typing import Dict, Any, Optional, List, Tuple
 from src.disk_scanner import ScanResult
 from src.utils import format_size, save_json_report, ScanHelper
 
+try:
+    import fast_scanner as _fast_scanner
+    HAS_RUST_PHASE2 = hasattr(_fast_scanner, 'merge_write_user_report')
+except ImportError:
+    _fast_scanner = None  # type: ignore
+    HAS_RUST_PHASE2 = False
+
 
 class ReportGenerator:
     """Generates and saves disk usage reports."""
@@ -225,17 +232,24 @@ class ReportGenerator:
     ) -> str:
         """Write a complete per-user file detail JSON by streaming from temp files.
 
-        Uses two passes over the temp files:
-          - Pass 1: count total_files and sum total_used  (O(1) RAM)
-          - Pass 2: k-way merge of sorted chunks → write JSON  (O(1) RAM)
-
-        Paths with non-UTF-8 bytes (surrogate-escaped) are sanitised with
-        ``errors='replace'`` before JSON serialisation so the output file
-        is always valid UTF-8 JSON.
+        Tries the native Rust merge_write_user_report() for maximum performance
+        (single BufRead pass, no GIL). Falls back to Python heapq.merge path
+        if the Rust extension is unavailable.
 
         Returns:
             The output path that was written.
         """
+        # ── Rust fast path ────────────────────────────────────────────────────
+        if HAS_RUST_PHASE2:
+            try:
+                _fast_scanner.merge_write_user_report(
+                    tmpdir, uid, username, output_path, timestamp
+                )
+                return output_path
+            except Exception as e:
+                print(f"  [warn] Rust Phase 2 failed for {username!r}, falling back to Python: {e}")
+
+        # ── Python fallback ───────────────────────────────────────────────────
         def _safe_path(p: str) -> str:
             """Replace surrogate chars with U+FFFD so json.dumps never raises."""
             return p.encode('utf-8', errors='replace').decode('utf-8')
