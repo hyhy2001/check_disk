@@ -62,7 +62,8 @@ struct GlobalStats {
 
 struct ProgressStats {
     files: u64,
-    size: u64,
+    dirs:  u64,
+    size:  u64,
 }
 
 struct ThreadLocalState {
@@ -132,7 +133,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
         uid_sizes: HashMap::new(), dir_sizes: HashMap::new(),
         permission_issues: Vec::new(),
     }));
-    let progress_stats = Arc::new(Mutex::new(ProgressStats { files: 0, size: 0 }));
+    let progress_stats = Arc::new(Mutex::new(ProgressStats { files: 0, dirs: 0, size: 0 }));
     let done = Arc::new(AtomicBool::new(false));
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
@@ -230,6 +231,12 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                         }
 
                         state.t_dirs += 1;
+                        // Track dirs in progress stats every 500 dirs
+                        if state.t_dirs % 500 == 0 {
+                            if let Ok(mut p) = state.progress_stats.lock() {
+                                p.dirs += 500;
+                            }
+                        }
 
                     } else if ft.is_file() {
                         let meta = match entry.metadata() {
@@ -317,23 +324,23 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
         thread::sleep(Duration::from_millis(200));
 
         let now = Instant::now();
-        let elapsed = now.duration_since(last_report).as_secs();
-        if elapsed >= 1 {
+        let elapsed_secs = now.duration_since(last_report).as_secs();
+        if elapsed_secs >= 10 {
             if let Ok(p) = progress_stats.lock() {
                 let total_elapsed = now.duration_since(start_time).as_secs();
-                let rate = p.files.saturating_sub(last_files) as f64 / elapsed as f64;
-                print!(
-                    "\r[{:02}:{:02}:{:02}] Files: {} | Size: {} | Rate: {} files/s   ",
+                let rate = p.files.saturating_sub(last_files) as f64 / elapsed_secs as f64;
+                println!(
+                    "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s",
                     total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
-                    format_num(p.files), format_size(p.size), format_rate(rate)
+                    format_num(p.files), format_num(p.dirs),
+                    format_size(p.size), format_rate(rate)
                 );
-                let _ = std::io::stdout().flush();
                 last_report = now;
                 last_files = p.files;
             }
         }
     }
-    println!(""); // newline after progress bar
+    // no trailing newline needed — println already adds one
 
     // --- Build Python return dict ---
     let g = global_stats.lock().unwrap();
