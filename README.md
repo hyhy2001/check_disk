@@ -23,9 +23,10 @@ produces structured JSON output consumed by the companion **disk_usage** web das
 
 ## Features
 
-### Scanning Engine
-- **Parallel disk scanning** — work-stealing multi-thread `scandir()`, auto-scales to CPU count (cap 64)
-- **Single `stat()` per entry** — uses `S_ISDIR`/`S_ISREG` from `st_mode` instead of chained `is_dir()`/`is_file()` calls
+### Scanning Engine (Dual Core)
+- **Rust High-Performance Core (`fast_scanner.so`)** — native parallel tree traversal via `jwalk` bypassing Python's GIL. Can scan 10M+ files in seconds. Active by default if compiled (can be disabled via `"use_rust": false` in config).
+- **Pure-Python Auto-Fallback** — graceful fallback to work-stealing multi-thread `scandir()` if the Rust extension is not installed.
+- **Single `stat()` per entry** — avoids chained checks by directly accessing metadata.
 - **Hard-link deduplication** — `st_nlink == 1` fast-path avoids lock contention; only multi-linked inodes acquire a lock
 - **Snapshot/NFS detection** — skips directories on a different device ID (covers ZFS snapshots, Btrfs subvols, NFS, bind-mounts)
 - **Name-based skip** — `.snapshot`, `.snapshots`, `.zfs`, `proc`, `sys`, `dev`, `run`, and similar pseudo-filesystems are skipped before any `stat()` call
@@ -54,9 +55,23 @@ produces structured JSON output consumed by the companion **disk_usage** web das
 
 - Python 3.6+
 - [`psutil`](https://pypi.org/project/psutil/) — memory monitoring
+- (Optional) **Rust toolchain & `maturin`** — required to compile the high-performance underlying scanner.
 
 ```bash
 pip install psutil
+```
+
+**Compiling the High-Performance Rust extension:**
+```bash
+# 1. Ensure Rust is installed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# 2. Build and install the PyO3 module
+pip install maturin
+cd src/rust_scanner
+maturin build --release
+pip install target/wheels/fast_scanner*.whl --force-reinstall
 ```
 
 ---
