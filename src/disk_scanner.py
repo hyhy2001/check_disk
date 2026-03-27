@@ -902,6 +902,15 @@ class DiskScanner:
                     break
             owner = uid_guess or "unknown"
             perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
+            
+        # Re-use LegacyDiskScanner's table formatting for the console summary
+        dummy = LegacyDiskScanner(self.config, 1, self.debug)
+        dummy.general_system = system
+        dummy.team_usage_results = team_usage_results
+        dummy.user_usage_results = user_usage_results
+        dummy.other_usage_results = other_usage_results
+        dummy.permission_issues = perm_by_user
+        dummy._display_scan_summary()
         
         return ScanResult(
             general_system=get_general_system_info(directory),
