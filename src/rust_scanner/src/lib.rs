@@ -46,7 +46,14 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
     let mut last_report = start_time;
     let mut last_files = 0;
     
+    let mut check_counter: u64 = 0;
+    
     for entry_res in WalkDir::new(&directory).skip_hidden(false) {
+        check_counter += 1;
+        if check_counter % 10_000 == 0 {
+            py.check_signals()?;
+        }
+        
         let entry = match entry_res {
             Ok(e) => e,
             Err(_) => continue,
