@@ -1,0 +1,14 @@
+{
+    "date": 1774606265,
+    "directory": "/www/wwwroot",
+    "general_system": { "total": 122465890304, "used": 19235840000, "available": 98059796480 },
+    "team_usage": [
+        { "name": "Test", "used": 196325557, "team_id": 1 },
+        { "name": "Other", "used": 0 }
+    ],
+    "user_usage": [
+        { "name": "root", "used": 196325556, "team_id": 1 },
+        { "name": "www", "used": 1, "team_id": 1 }
+    ],
+    "other_usage": []
+}

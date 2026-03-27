@@ -22,6 +22,12 @@ from src.utils import (
     format_time_duration, get_actual_disk_usage, create_usage_bar
 )
 
+try:
+    import fast_scanner
+    HAS_RUST_CORE = True
+except ImportError:
+    HAS_RUST_CORE = False
+
 
 @dataclass
 class ScanResult:
@@ -55,7 +61,7 @@ class ThreadStats:
     flush_count: int = 0      # Increment each time to ensure chunk uniqueness
 
 
-class DiskScanner:
+class LegacyDiskScanner:
     """Optimized disk scanner with per-thread queues and streaming file-path flush."""
 
     BATCH_SIZE            = 2000   # dirs to steal from global queue at once
@@ -761,4 +767,107 @@ class DiskScanner:
             "users": users_list,
             "unknown_items": unknown_items
         }
+
+
+class DiskScanner:
+    """Proxy class routing scanning to the high-performance Rust core or Python fallback"""
+    
+    def __init__(self, config: Dict[str, Any], max_workers: int = None, debug: bool = False):
+        import os
+        self.config = config
+        self.max_workers = (
+            max_workers if max_workers 
+            else config.get("workers", min(32, (os.cpu_count() or 1) * 2))
+        )
+        self.debug = debug
+        self.use_rust = config.get("use_rust", True) and HAS_RUST_CORE
+        
+        if not self.use_rust:
+            if config.get("use_rust", True):
+                print("  [fallback] Rust core 'fast_scanner' not loaded. Using pure-Python scanner.")
+            self._scanner = LegacyDiskScanner(config, max_workers, debug)
+        else:
+            self._scanner = None
+
+    def scan(self) -> ScanResult:
+        if self.use_rust:
+            return self._rust_scan()
+        return self._scanner.scan()
+        
+    def _rust_scan(self) -> ScanResult:
+        """Execute the Rust core scanner"""
+        print(f"\n[RUST] Initiating High-Performance Rust Core Engine")
+        
+        directory = self.config.get("directory", "/")
+        skip_dirs = self.config.get("exclude_patterns", [])
+        
+        print("Calling fast_scanner.scan_disk()...")
+        start = time.time()
+        result = fast_scanner.scan_disk(directory, skip_dirs)
+        duration = time.time() - start
+        print(f"\\n[RUST] Scan completed in {duration:.2f} seconds")
+        print(f"Files: {result.get('total_files', 0):,} | Dirs: {result.get('total_dirs', 0):,}")
+        
+        # Build UID mapping
+        from src.utils import get_username_from_uid, get_general_system_info, ScanHelper
+        from collections import defaultdict
+        
+        uid_cache = {}
+        for uid_str in result.get("uid_sizes", {}).keys():
+            uid = int(uid_str)
+            if uid not in uid_cache:
+                uid_cache[uid] = get_username_from_uid(uid)
+                
+        user_usage_results = defaultdict(int)
+        team_usage_results = defaultdict(int)
+        other_usage_results = defaultdict(int)
+        
+        valid_users = {u["name"]: u for u in self.config.get("users", [])}
+        valid_teams = {t["name"]: t for t in self.config.get("teams", [])}
+        
+        for uid_str, size in result.get("uid_sizes", {}).items():
+            uid = int(uid_str)
+            username = uid_cache[uid]
+            if username in valid_users:
+                user_usage_results[username] += size
+                team_id = valid_users[username].get("team_ID")
+                team_name = next((t for t, v in valid_teams.items() if v.get("team_ID") == team_id), "Other")
+                team_usage_results[team_name] += size
+            else:
+                other_usage_results[username] += size
+                
+        user_list = ScanHelper.create_user_list(user_usage_results)
+        team_list = ScanHelper.create_user_list(team_usage_results)
+        other_list = ScanHelper.create_user_list(other_usage_results)
+        
+        other_total = sum(item["used"] for item in other_list)
+        team_list.append({"name": "Other", "used": other_total})
+        
+        top_dir_list = []
+        relevant_users = set(valid_users.keys()) | set(other_usage_results.keys())
+        
+        for dir_path, user_sizes in result.get("dir_sizes", {}).items():
+            for uid_str, size in user_sizes.items():
+                uid = int(uid_str)
+                username = uid_cache[uid]
+                if username in relevant_users and size > 0:
+                    top_dir_list.append({
+                        "dir": dir_path,
+                        "user": username,
+                        "user_usage": size
+                    })
+        top_dir_list.sort(key=lambda x: x["user_usage"], reverse=True)
+        
+        return ScanResult(
+            general_system=get_general_system_info(directory),
+            team_usage=team_list,
+            user_usage=user_list,
+            other_usage=other_list,
+            timestamp=int(time.time()),
+            top_dir=top_dir_list,
+            permission_issues={'unknown': []},
+            detail_tmpdir=result.get("detail_tmpdir", ""),
+            detail_uid_username=uid_cache
+        )
+
 
