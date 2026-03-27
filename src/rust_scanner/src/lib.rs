@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{Write, BufWriter};
 use std::time::{Instant, Duration};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 // Same list as Python's critical_skip_dirs
@@ -60,11 +60,8 @@ struct GlobalStats {
     permission_issues: Vec<(String, String, String)>, // (path, kind, error)
 }
 
-struct ProgressStats {
-    files: u64,
-    dirs:  u64,
-    size:  u64,
-}
+// ProgressStats replaced by 3 AtomicU64 (no lock, exact counts)
+
 
 struct ThreadLocalState {
     t_files: u64,
@@ -77,7 +74,9 @@ struct ThreadLocalState {
     t_flush_counts: HashMap<u32, u32>,
     t_perm_issues: Vec<(String, String, String)>,
     global_stats: Arc<Mutex<GlobalStats>>,
-    progress_stats: Arc<Mutex<ProgressStats>>,
+    prog_files: Arc<AtomicU64>,
+    prog_dirs:  Arc<AtomicU64>,
+    prog_size:  Arc<AtomicU64>,
     tmpdir: String,
     thread_id: usize,
 }
@@ -133,14 +132,18 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
         uid_sizes: HashMap::new(), dir_sizes: HashMap::new(),
         permission_issues: Vec::new(),
     }));
-    let progress_stats = Arc::new(Mutex::new(ProgressStats { files: 0, dirs: 0, size: 0 }));
+    let prog_files = Arc::new(AtomicU64::new(0));
+    let prog_dirs  = Arc::new(AtomicU64::new(0));
+    let prog_size  = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
 
     let g_clone = global_stats.clone();
-    let p_clone = progress_stats.clone();
+    let pf_clone = prog_files.clone();
+    let pd_clone = prog_dirs.clone();
+    let ps_clone = prog_size.clone();
     let d_clone = done.clone();
     let dir_clone = directory.clone();
     let skips = skip_dirs.clone();
@@ -171,7 +174,9 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                     t_flush_counts: HashMap::new(),
                     t_perm_issues: Vec::new(),
                     global_stats: g_clone.clone(),
-                    progress_stats: p_clone.clone(),
+                    prog_files: pf_clone.clone(),
+                    prog_dirs:  pd_clone.clone(),
+                    prog_size:  ps_clone.clone(),
                     tmpdir: tmpdir_clone.clone(),
                     thread_id: tid,
                 };
@@ -231,12 +236,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                         }
 
                         state.t_dirs += 1;
-                        // Track dirs in progress stats every 500 dirs
-                        if state.t_dirs % 500 == 0 {
-                            if let Ok(mut p) = state.progress_stats.lock() {
-                                p.dirs += 500;
-                            }
-                        }
+                        state.prog_dirs.fetch_add(1, Ordering::Relaxed);
 
                     } else if ft.is_file() {
                         let meta = match entry.metadata() {
@@ -296,15 +296,9 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                             buf.clear();
                         }
 
-                        // Progress reporting: use delta, not cumulative
-                        if state.t_files % 5_000 == 0 {
-                            if let Ok(mut p) = state.progress_stats.lock() {
-                                p.files += 5_000;
-                                // Add only the SIZE DELTA since last report
-                                p.size  += state.t_size.saturating_sub(state.t_size_last_progress);
-                                state.t_size_last_progress = state.t_size;
-                            }
-                        }
+                        // Exact progress tracking via atomics — no lock, no rounding
+                        state.prog_files.fetch_add(1, Ordering::Relaxed);
+                        state.prog_size.fetch_add(size, Ordering::Relaxed);
                     }
 
                     WalkState::Continue
@@ -326,18 +320,19 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
         let now = Instant::now();
         let elapsed_secs = now.duration_since(last_report).as_secs();
         if elapsed_secs >= 10 {
-            if let Ok(p) = progress_stats.lock() {
-                let total_elapsed = now.duration_since(start_time).as_secs();
-                let rate = p.files.saturating_sub(last_files) as f64 / elapsed_secs as f64;
-                println!(
-                    "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s",
-                    total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
-                    format_num(p.files), format_num(p.dirs),
-                    format_size(p.size), format_rate(rate)
-                );
-                last_report = now;
-                last_files = p.files;
-            }
+            let total_files = prog_files.load(Ordering::Relaxed);
+            let total_dirs  = prog_dirs.load(Ordering::Relaxed);
+            let total_size  = prog_size.load(Ordering::Relaxed);
+            let total_elapsed = now.duration_since(start_time).as_secs();
+            let rate = total_files.saturating_sub(last_files) as f64 / elapsed_secs as f64;
+            println!(
+                "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s",
+                total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
+                format_num(total_files), format_num(total_dirs),
+                format_size(total_size), format_rate(rate)
+            );
+            last_report = now;
+            last_files = total_files;
         }
     }
     // no trailing newline needed — println already adds one
