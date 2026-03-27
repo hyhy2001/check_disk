@@ -805,7 +805,7 @@ class DiskScanner:
         start = time.time()
         result = fast_scanner.scan_disk(directory, skip_dirs)
         duration = time.time() - start
-        print(f"\\n[RUST] Scan completed in {duration:.2f} seconds")
+        print(f"\n[RUST] Scan completed in {duration:.2f} seconds")
         print(f"Files: {result.get('total_files', 0):,} | Dirs: {result.get('total_dirs', 0):,}")
         
         # Build UID mapping
