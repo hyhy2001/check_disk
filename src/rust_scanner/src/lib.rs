@@ -318,7 +318,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                 print!(
                     "\r[{:02}:{:02}:{:02}] Files: {} | Size: {} | Rate: {} files/s   ",
                     total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
-                    format_num(p.files), format_size(p.size), format_num(rate as u64)
+                    format_num(p.files), format_size(p.size), format_num(rate.round() as u64)
                 );
                 let _ = std::io::stdout().flush();
                 last_report = now;
