@@ -858,6 +858,21 @@ class DiskScanner:
                     })
         top_dir_list.sort(key=lambda x: x["user_usage"], reverse=True)
         
+        # Build permission_issues in the same nested format as Python legacy
+        rust_perm_flat = result.get("permission_issues", [])
+        perm_by_user: Dict[str, List] = {}
+        for item in rust_perm_flat:
+            path = item.get("path", "")
+            kind = item.get("type", "unknown")
+            err  = item.get("error", "")
+            uid_guess = None
+            for uid_key, uname in uid_cache.items():
+                if path.startswith(f"/{uname}/") or path.startswith(f"/{uname}"):
+                    uid_guess = uname
+                    break
+            owner = uid_guess or "unknown"
+            perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
+        
         return ScanResult(
             general_system=get_general_system_info(directory),
             team_usage=team_list,
@@ -865,7 +880,7 @@ class DiskScanner:
             other_usage=other_list,
             timestamp=int(time.time()),
             top_dir=top_dir_list,
-            permission_issues={'unknown': []},
+            permission_issues=perm_by_user,
             detail_tmpdir=result.get("detail_tmpdir", ""),
             detail_uid_username=uid_cache
         )
