@@ -52,14 +52,14 @@ class ThreadStats:
     # In-memory buffer flushed periodically to tmpdir (never holds full 36M entries)
     file_paths: Dict[int, List[Tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
     file_path_count: int = 0  # total unflushed entries across all uids
+    flush_count: int = 0      # Increment each time to ensure chunk uniqueness
 
 
 class DiskScanner:
     """Optimized disk scanner with per-thread queues and streaming file-path flush."""
 
-    BATCH_SIZE            = 5000   # dirs to steal from global queue at once
+    BATCH_SIZE            = 2000   # dirs to steal from global queue at once
     DETAIL_FLUSH_THRESHOLD = 200000  # flush when a thread accumulates this many file entries
-    DETAIL_TOP_N           = 200    # top-N files kept per user in the final report
 
     def __init__(self, config: Dict[str, Any], max_workers: int = None, debug: bool = False):
         """
@@ -99,7 +99,6 @@ class DiskScanner:
         # Temp directory for streaming file-path flush (auto-cleaned on exit)
         self._tmpdir = tempfile.mkdtemp(prefix='diskscanner_detail_')
         atexit.register(shutil.rmtree, self._tmpdir, ignore_errors=True)
-        self.detail_top_n: int = config.get('detail_top_n', self.DETAIL_TOP_N)
 
         # Progress reporting
         self.progress_interval = 10.0  # Report progress every 10 seconds
@@ -150,7 +149,7 @@ class DiskScanner:
         my_stats = thread_stats[thread_id]
         my_queue = work_queues[thread_id]
 
-        MAX_DIR_PROCESS_TIME = 300  # Maximum time to spend on a single directory (s)
+        MAX_DIR_PROCESS_TIME = 1800  # Maximum time to spend on a single directory (s)
 
         while not done_flag[0]:
             # --- Grab work ---
@@ -298,44 +297,18 @@ class DiskScanner:
 
         TSV format: ``<size_bytes>\t<absolute_path>\n``
         """
+        stats.flush_count += 1
         for uid, files in stats.file_paths.items():
             if not files:
                 continue
             # Sort descending so heapq.merge(reverse=True) works correctly
             files.sort(key=lambda x: x[1], reverse=True)
-            tmpfile = os.path.join(self._tmpdir, f"uid_{uid}_t{thread_id}.tsv")
-            with open(tmpfile, 'a', encoding='utf-8', errors='surrogateescape') as fh:
+            tmpfile = os.path.join(self._tmpdir, f"uid_{uid}_t{thread_id}_c{stats.flush_count}.tsv")
+            with open(tmpfile, 'w', encoding='utf-8', errors='surrogateescape') as fh:
                 for path, size in files:
                     fh.write(f"{size}\t{path}\n")
             files.clear()
         stats.file_path_count = 0
-
-    def _get_top_n_for_uid(self, uid: int) -> List[Tuple[str, int]]:
-        """Stream all temp files for *uid* through an O(top_n) min-heap.
-
-        Returns a list of (path, size) sorted by size descending, capped at
-        ``self.detail_top_n`` entries.  Peak RAM: O(top_n) regardless of the
-        total number of files owned by this UID.
-        """
-        n = self.detail_top_n
-        heap: List[Tuple[int, str]] = []  # (size, path) — min-heap
-
-        for fpath in glob_module.glob(os.path.join(self._tmpdir, f"uid_{uid}_t*.tsv")):
-            with open(fpath, encoding='utf-8') as fh:
-                for line in fh:
-                    line = line.rstrip('\n')
-                    if not line:
-                        continue
-                    tab = line.index('\t')
-                    size = int(line[:tab])
-                    path = line[tab + 1:]
-                    if len(heap) < n:
-                        heapq.heappush(heap, (size, path))
-                    elif size > heap[0][0]:
-                        heapq.heapreplace(heap, (size, path))
-
-        # Sort descending and drop the heap internals
-        return [(p, s) for s, p in sorted(heap, key=lambda x: x[0], reverse=True)]
 
     def _stream_merge_to_results(self) -> None:
         """Collect uid→username mapping from temp files.
@@ -400,7 +373,7 @@ class DiskScanner:
         last_progress_time = [time.time()]
         last_progress_files = [0]
         stalled_time = [0]
-        MAX_STALL_TIME = 300  # Maximum time to allow stalled progress (seconds)
+        MAX_STALL_TIME = 1800  # Maximum time to allow stalled progress (seconds)
         
         def report_progress():
             """Progress reporting thread function"""
@@ -756,32 +729,36 @@ class DiskScanner:
     
     def _format_permission_issues(self) -> Dict[str, Any]:
         """
-        Format permission issues as a flat list for easy pagination.
-
-        Returns:
-            Dict with 'total' (int) and 'items' (list of {user, path, type, error}),
-            sorted: named users first (alphabetically), then unknown items.
+        Format permission issues in the nested structure.
         """
-        items: List[Dict[str, str]] = []
+        users_list = []
 
         # Named users — sorted alphabetically
         for username in sorted(k for k in self.permission_issues if k != "unknown"):
+            inaccessible_items = []
             for issue in self.permission_issues[username]:
-                items.append({
-                    "user":  username,
+                inaccessible_items.append({
                     "path":  issue.get("path",  ""),
                     "type":  issue.get("type",  ""),
                     "error": issue.get("error", ""),
                 })
+            
+            users_list.append({
+                "name": username,
+                "inaccessible_items": inaccessible_items
+            })
 
-        # Unknown / orphan items last
+        # Unknown / orphan items
+        unknown_items = []
         for issue in self.permission_issues.get("unknown", []):
-            items.append({
-                "user":  "__unknown__",
+            unknown_items.append({
                 "path":  issue.get("path",  ""),
                 "type":  issue.get("type",  ""),
                 "error": issue.get("error", ""),
             })
 
-        return {"total": len(items), "items": items}
+        return {
+            "users": users_list,
+            "unknown_items": unknown_items
+        }
 
