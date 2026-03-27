@@ -251,13 +251,29 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                         state.t_size  += size;
                         *state.t_uid_sizes.entry(uid).or_insert(0) += size;
 
-                        // Top-level dir attribution
+                        // Attribute size to every ancestor dir up to (not including) root
+                        // Matches Python legacy: dir_sizes[current_dir] accumulates direct files
                         if let Ok(rel) = path.strip_prefix(&dir) {
-                            if let Some(comp) = rel.components().next() {
-                                let top = format!("{}/{}", dir.trim_end_matches('/'),
-                                    comp.as_os_str().to_string_lossy());
+                            // Walk from file's parent up to (not including) root dir
+                            let mut ancestor = path.parent();
+                            while let Some(anc) = ancestor {
+                                if anc == std::path::Path::new(&dir) {
+                                    break; // reached root — stop
+                                }
+                                if !anc.starts_with(&dir) {
+                                    break; // outside root — stop
+                                }
+                                let anc_str = anc.to_string_lossy().to_string();
                                 *state.t_dir_sizes
-                                    .entry(top).or_insert_with(HashMap::new)
+                                    .entry(anc_str).or_insert_with(HashMap::new)
+                                    .entry(uid).or_insert(0) += size;
+                                ancestor = anc.parent();
+                            }
+                            // Also attribute to the root itself so top-level is covered
+                            if rel.components().next().is_some() {
+                                let root_trimmed = dir.trim_end_matches('/');
+                                *state.t_dir_sizes
+                                    .entry(root_trimmed.to_string()).or_insert_with(HashMap::new)
                                     .entry(uid).or_insert(0) += size;
                             }
                         }
