@@ -61,11 +61,6 @@ parallel traversal, with automatic fallback to a pure-Python engine if the binar
 ## Requirements
 
 - **Python 3.6+**
-- [`psutil`](https://pypi.org/project/psutil/) — memory monitoring in post-scan summary
-
-```bash
-pip install psutil
-```
 
 > The precompiled `fast_scanner.abi3.so` is included in the repository.
 > It is built for **Linux x86_64, glibc ≥ 2.17** (RHEL 7/8, CentOS 7/8, Ubuntu 18+).

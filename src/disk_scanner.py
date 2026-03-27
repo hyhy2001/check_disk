@@ -5,9 +5,20 @@ import os
 import stat as stat_module
 import time
 import threading
-import psutil
 import heapq
 import glob as glob_module
+
+def _get_rss_mb() -> float:
+    """Read RSS memory from /proc/self/status in MB (Linux only) to avoid psutil dependency."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
 import shutil
 import atexit
 import tempfile
@@ -383,7 +394,6 @@ class LegacyDiskScanner:
         
         def report_progress():
             """Progress reporting thread function"""
-            process = psutil.Process(os.getpid())
             while not done_flag[0]:
                 time.sleep(0.5)
                 current_time = time.time()
@@ -426,8 +436,7 @@ class LegacyDiskScanner:
                     global_q = len(global_queue)  # len(deque) is atomic under GIL
                     
                     # Get memory usage
-                    mem_info = process.memory_info()
-                    mem_usage = mem_info.rss / (1024 * 1024)  # Convert to MB
+                    mem_usage = _get_rss_mb()
                     
                     # Check memory limit
                     if hasattr(self, 'max_memory_mb') and mem_usage > getattr(self, 'max_memory_mb', 20480):
@@ -482,9 +491,7 @@ class LegacyDiskScanner:
         avg_rate = total_files / elapsed if elapsed > 0 else 0
         
         # Get memory usage
-        process = psutil.Process(os.getpid())
-        mem_info = process.memory_info()
-        mem_usage = mem_info.rss / (1024 * 1024)  # Convert to MB
+        mem_usage = _get_rss_mb()
         
         # Get general system info
         system = self.general_system
