@@ -193,7 +193,8 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                                 if !hardlinks.insert(key) { return WalkState::Continue; }
                             }
                             
-                            let size = meta.len();
+                            // Use st_blocks * 512 = actual on-disk bytes (same as Python legacy)
+                            let size = meta.blocks() * 512;
                             let uid = meta.uid();
                             
                             state.t_files += 1;
