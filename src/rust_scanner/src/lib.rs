@@ -44,6 +44,13 @@ fn format_size(bytes: u64) -> String {
     else { format!("{} B", bytes) }
 }
 
+fn format_rate(rate: f64) -> String {
+    // e.g. 300,123.4
+    let int_part = rate as u64;
+    let frac = ((rate - int_part as f64).abs() * 10.0).round() as u8;
+    format!("{}.{}", format_num(int_part), frac)
+}
+
 struct GlobalStats {
     total_files: u64,
     total_dirs: u64,
@@ -318,7 +325,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                 print!(
                     "\r[{:02}:{:02}:{:02}] Files: {} | Size: {} | Rate: {} files/s   ",
                     total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
-                    format_num(p.files), format_size(p.size), format_num(rate.round() as u64)
+                    format_num(p.files), format_size(p.size), format_rate(rate)
                 );
                 let _ = std::io::stdout().flush();
                 last_report = now;
