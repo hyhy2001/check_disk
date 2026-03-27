@@ -62,6 +62,7 @@ struct ThreadLocalState {
     t_files: u64,
     t_dirs: u64,
     t_size: u64,
+    t_size_last_progress: u64, // tracks last-reported size for delta calculation
     t_uid_sizes: HashMap<u32, u64>,
     t_dir_sizes: HashMap<String, HashMap<u32, u64>>,
     t_uid_buffers: HashMap<u32, Vec<(String, u64)>>,
@@ -155,7 +156,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
             .run(|| {
                 let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
                 let mut state = ThreadLocalState {
-                    t_files: 0, t_dirs: 0, t_size: 0,
+                    t_files: 0, t_dirs: 0, t_size: 0, t_size_last_progress: 0,
                     t_uid_sizes: HashMap::new(),
                     t_dir_sizes: HashMap::new(),
                     t_uid_buffers: HashMap::new(),
@@ -251,29 +252,14 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                         state.t_size  += size;
                         *state.t_uid_sizes.entry(uid).or_insert(0) += size;
 
-                        // Attribute size to every ancestor dir up to (not including) root
-                        // Matches Python legacy: dir_sizes[current_dir] accumulates direct files
-                        if let Ok(rel) = path.strip_prefix(&dir) {
-                            // Walk from file's parent up to (not including) root dir
-                            let mut ancestor = path.parent();
-                            while let Some(anc) = ancestor {
-                                if anc == std::path::Path::new(&dir) {
-                                    break; // reached root — stop
-                                }
-                                if !anc.starts_with(&dir) {
-                                    break; // outside root — stop
-                                }
-                                let anc_str = anc.to_string_lossy().to_string();
+                        // Attribute size to direct parent dir only (flat, matches Python legacy)
+                        // Python: dir_sizes[current_dir] = sizes of files DIRECTLY inside it
+                        if let Some(parent) = path.parent() {
+                            // Only attribute if parent is at or below the scan root
+                            if parent.starts_with(&dir) {
+                                let parent_str = parent.to_string_lossy().to_string();
                                 *state.t_dir_sizes
-                                    .entry(anc_str).or_insert_with(HashMap::new)
-                                    .entry(uid).or_insert(0) += size;
-                                ancestor = anc.parent();
-                            }
-                            // Also attribute to the root itself so top-level is covered
-                            if rel.components().next().is_some() {
-                                let root_trimmed = dir.trim_end_matches('/');
-                                *state.t_dir_sizes
-                                    .entry(root_trimmed.to_string()).or_insert_with(HashMap::new)
+                                    .entry(parent_str).or_insert_with(HashMap::new)
                                     .entry(uid).or_insert(0) += size;
                             }
                         }
@@ -296,11 +282,13 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                             buf.clear();
                         }
 
-                        // Progress reporting update
+                        // Progress reporting: use delta, not cumulative
                         if state.t_files % 5_000 == 0 {
                             if let Ok(mut p) = state.progress_stats.lock() {
                                 p.files += 5_000;
-                                p.size  += state.t_size;
+                                // Add only the SIZE DELTA since last report
+                                p.size  += state.t_size.saturating_sub(state.t_size_last_progress);
+                                state.t_size_last_progress = state.t_size;
                             }
                         }
                     }
