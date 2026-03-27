@@ -812,11 +812,34 @@ class DiskScanner:
         start = time.time()
         result = fast_scanner.scan_disk(directory, skip_dirs)
         duration = time.time() - start
-        print(f"\n[RUST] Scan completed in {duration:.2f} seconds")
-        print(f"Files: {result.get('total_files', 0):,} | Dirs: {result.get('total_dirs', 0):,}")
+        
+        from src.utils import get_username_from_uid, get_general_system_info, ScanHelper, format_time_duration, format_size
+        
+        system = get_general_system_info(directory)
+        mem_usage = _get_rss_mb()
+        
+        total_files = result.get('total_files', 0)
+        total_dirs = result.get('total_dirs', 0)
+        total_size = result.get('total_size', 0)
+        avg_rate = total_files / duration if duration > 0 else 0
+        
+        print(f"\n{'='*60}")
+        print(f"SCAN COMPLETED in {format_time_duration(duration)}")
+        print(f"{'='*60}")
+        print(f"Directory scanned: {directory}")
+        print(f"Total directories: {total_dirs:,}")
+        print(f"Total files:      {total_files:,}")
+        print(f"Total size:       {format_size(total_size)}")
+        print(f"Scan rate:        {avg_rate:,.0f} files/sec")
+        print(f"Memory usage:     {mem_usage:.1f} MB")
+        print(f"{'='*60}")
+        print(f"Disk Information:")
+        print(f"  Total capacity: {format_size(system.get('total', 0))}")
+        print(f"  Used space:     {format_size(system.get('used', 0))} ({system.get('used', 0) * 100 / system.get('total', 1):.1f}%)")
+        print(f"  Available:      {format_size(system.get('available', 0))}")
+        print(f"{'='*60}")
         
         # Build UID mapping
-        from src.utils import get_username_from_uid, get_general_system_info, ScanHelper
         from collections import defaultdict
         
         uid_cache = {}
