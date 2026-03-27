@@ -6,6 +6,20 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::fs;
 use std::io::{Write, BufWriter};
+use std::time::Instant;
+
+fn format_num(mut n: u64) -> String {
+    if n == 0 { return "0".to_string(); }
+    let mut s = String::new();
+    let mut count = 0;
+    while n > 0 {
+        if count != 0 && count % 3 == 0 { s.insert(0, ','); }
+        s.insert(0, (b'0' + (n % 10) as u8) as char);
+        n /= 10;
+        count += 1;
+    }
+    s
+}
 
 #[pyfunction]
 fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<PyObject> {
@@ -27,6 +41,10 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
     
     let mut flush_counts: HashMap<u32, u32> = HashMap::new();
     let mut uid_buffers: HashMap<u32, Vec<(String, u64)>> = HashMap::new();
+    
+    let start_time = Instant::now();
+    let mut last_report = start_time;
+    let mut last_files = 0;
     
     for entry_res in WalkDir::new(&directory).skip_hidden(false) {
         let entry = match entry_res {
@@ -62,6 +80,26 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>) -> PyResult<
                 
                 total_files += 1;
                 total_size += size;
+                
+                if total_files % 50_000 == 0 {
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_report).as_secs();
+                    if elapsed >= 5 { // Print every 5 seconds
+                        let total_elapsed = now.duration_since(start_time).as_secs();
+                        let rate = (total_files - last_files) as f64 / elapsed as f64;
+                        println!(
+                            "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Rate: {} files/s",
+                            total_elapsed / 3600,
+                            (total_elapsed % 3600) / 60,
+                            total_elapsed % 60,
+                            format_num(total_files),
+                            format_num(total_dirs),
+                            format_num(rate as u64)
+                        );
+                        last_report = now;
+                        last_files = total_files;
+                    }
+                }
                 
                 *uid_sizes.entry(uid).or_insert(0) += size;
                 
