@@ -9,3 +9,4 @@ reports/
 detail_users/
 docs/
 *.json
+src/rust_scanner/
