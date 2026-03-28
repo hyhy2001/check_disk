@@ -33,11 +33,7 @@ from src.utils import (
     format_time_duration, get_actual_disk_usage, create_usage_bar
 )
 
-try:
-    import fast_scanner
-    HAS_RUST_CORE = True
-except ImportError:
-    HAS_RUST_CORE = False
+import fast_scanner
 
 
 @dataclass
@@ -68,7 +64,7 @@ class DiskScanner:
             else config.get("workers", min(32, (os.cpu_count() or 1) * 2))
         )
         self.debug = debug
-        self.use_rust = config.get("use_rust", True) and HAS_RUST_CORE
+        self.use_rust = config.get("use_rust", True)
         
         if not self.use_rust:
             if config.get("use_rust", True):

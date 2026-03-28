@@ -6,7 +6,7 @@ This package provides tools for checking disk usage by team and user.
 
 from src.cli_interface import CLIInterface
 from src.config_manager import ConfigManager
-from src.disk_scanner import DiskScanner, ScanResult, ThreadStats
+from src.disk_scanner import DiskScanner, ScanResult
 from src.report_generator import ReportGenerator
 from src.utils import (
     format_size, parse_size, get_terminal_size, get_username_from_uid,
@@ -22,7 +22,6 @@ __all__ = [
     'ConfigManager',
     'DiskScanner',
     'ScanResult',
-    'ThreadStats',
     'ReportGenerator',
     'TableFormatter',
     'ReportFormatter',
