@@ -33,7 +33,7 @@ from src.utils import (
     format_time_duration, get_actual_disk_usage, create_usage_bar
 )
 
-import fast_scanner
+from src import fast_scanner
 
 
 @dataclass

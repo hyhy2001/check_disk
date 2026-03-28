@@ -17,7 +17,7 @@ from src.disk_scanner import ScanResult
 from src.utils import format_size, save_json_report, ScanHelper
 
 try:
-    import fast_scanner as _fast_scanner
+    from src import fast_scanner as _fast_scanner
     HAS_RUST_PHASE2 = hasattr(_fast_scanner, 'merge_write_user_report')
 except ImportError:
     _fast_scanner = None  # type: ignore
