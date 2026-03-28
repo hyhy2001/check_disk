@@ -38,8 +38,8 @@ class ConfigDisplay(BaseFormatter):
             print("\nNo teams defined in configuration.")
             return
         
-        # Create a mapping of team_ID to team name
-        team_id_map = {team["team_ID"]: team["name"] for team in teams}
+        # Create a mapping of team_id to team name
+        team_id_map = {team["team_id"]: team["name"] for team in teams}
         
         # Filter teams if team_filter is provided
         if team_filter:
@@ -56,10 +56,10 @@ class ConfigDisplay(BaseFormatter):
         # Group users by team
         users_by_team = {}
         for team in teams:
-            users_by_team[team["team_ID"]] = []
+            users_by_team[team["team_id"]] = []
         
         for user in config.get("users", []):
-            team_id = user["team_ID"]
+            team_id = user["team_id"]
             if team_id in users_by_team:
                 users_by_team[team_id].append(user["name"])
         
@@ -82,7 +82,7 @@ class ConfigDisplay(BaseFormatter):
     
     def _display_team_users_table(self, team: Dict[str, Any], users_by_team: Dict[str, List[str]]) -> None:
         """Display a table of users for a specific team."""
-        team_id = team["team_ID"]
+        team_id = team["team_id"]
         team_users = sorted(users_by_team.get(team_id, []))
         
         if not team_users:
@@ -116,7 +116,7 @@ class ConfigDisplay(BaseFormatter):
         """Display users with unknown team IDs."""
         # Check for users with unknown team IDs
         unknown_team_users = [user["name"] for user in config.get("users", []) 
-                            if user["team_ID"] not in team_id_map]
+                            if user["team_id"] not in team_id_map]
         
         if not unknown_team_users:
             return

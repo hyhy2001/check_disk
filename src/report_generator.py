@@ -95,10 +95,10 @@ class ReportGenerator:
 
     def _build_team_id_maps(self):
         """Build team_name -> team_id and username -> team_id lookup dicts from config."""
-        team_id_map = {t["name"]: t["team_ID"] for t in self.config.get("teams", [])}
+        team_id_map = {t["name"]: t["team_id"] for t in self.config.get("teams", [])}
         user_team_id_map = {}
         for user in self.config.get("users", []):
-            user_team_id_map[user["name"]] = user["team_ID"]
+            user_team_id_map[user["name"]] = user["team_id"]
         return team_id_map, user_team_id_map
 
     # ------------------------------------------------------------------ #

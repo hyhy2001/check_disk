@@ -66,14 +66,14 @@ def _walk(node, lines: list, level: int, indent: int):
 def build_maps(config: dict):
     """Return (team_name->team_id, username->team_id) from config."""
     team_id_map = {
-        t["name"]: t["team_ID"]
+        t["name"]: t["team_id"]
         for t in config.get("teams", [])
-        if "name" in t and "team_ID" in t
+        if "name" in t and "team_id" in t
     }
     user_team_id_map = {
-        u["name"]: u["team_ID"]
+        u["name"]: u["team_id"]
         for u in config.get("users", [])
-        if "name" in u and "team_ID" in u
+        if "name" in u and "team_id" in u
     }
     return team_id_map, user_team_id_map
 

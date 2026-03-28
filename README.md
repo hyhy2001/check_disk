@@ -307,13 +307,13 @@ python disk_checker.py --check-users alice --output-dir /reports/ --prefix sda1
   "output_file": "disk_usage_report.json",
   "use_rust": true,
   "teams": [
-    { "name": "backend",  "team_ID": 1 },
-    { "name": "frontend", "team_ID": 2 }
+    { "name": "backend",  "team_id": 1 },
+    { "name": "frontend", "team_id": 2 }
   ],
   "users": [
-    { "name": "alice", "team_ID": 1 },
-    { "name": "bob",   "team_ID": 1 },
-    { "name": "carol", "team_ID": 2 }
+    { "name": "alice", "team_id": 1 },
+    { "name": "bob",   "team_id": 1 },
+    { "name": "carol", "team_id": 2 }
   ]
 }
 ```

@@ -142,8 +142,8 @@ class DiskScanner:
             username = uid_cache[uid]
             if username in valid_users:
                 user_usage_results[username] += size
-                team_id = valid_users[username].get("team_ID")
-                team_name = next((t for t, v in valid_teams.items() if v.get("team_ID") == team_id), "Other")
+                team_id = valid_users[username].get("team_id")
+                team_name = next((t for t, v in valid_teams.items() if v.get("team_id") == team_id), "Other")
                 team_usage_results[team_name] += size
             else:
                 other_usage_results[username] += size

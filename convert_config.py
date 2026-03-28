@@ -36,7 +36,7 @@ def convert_config(old_config_path, new_config_path):
             team_id_map[team_name] = i
             new_config["teams"].append({
                 "name": team_name,
-                "team_ID": i
+                "team_id": i
             })
         
         # Convert users
@@ -47,7 +47,7 @@ def convert_config(old_config_path, new_config_path):
             for username in team.get("users", []):
                 new_config["users"].append({
                     "name": username,
-                    "team_ID": team_id
+                    "team_id": team_id
                 })
         
         # Save new config

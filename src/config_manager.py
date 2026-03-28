@@ -102,18 +102,18 @@ class ConfigManager:
                 print(f"Team '{team_name}' already exists")
                 return
         
-        # Add new team with next available team_ID
+        # Add new team with next available team_id
         if "teams" not in self._config:
             self._config["teams"] = []
         
-        # Find the highest team_ID and increment by 1
+        # Find the highest team_id and increment by 1
         next_id = 1
         if self._config["teams"]:
-            next_id = max(team.get("team_ID", 0) for team in self._config["teams"]) + 1
+            next_id = max(team.get("team_id", 0) for team in self._config["teams"]) + 1
         
         self._config["teams"].append({
             "name": team_name,
-            "team_ID": next_id
+            "team_id": next_id
         })
         self._save_config()
     
@@ -128,11 +128,11 @@ class ConfigManager:
         Returns:
             True if user already exists, False otherwise
         """
-        # Find the team_ID for the given team_name
+        # Find the team_id for the given team_name
         team_id = None
         for team in self._config.get("teams", []):
             if team["name"] == team_name:
-                team_id = team["team_ID"]
+                team_id = team["team_id"]
                 break
         
         if team_id is None:
@@ -148,10 +148,10 @@ class ConfigManager:
                 print(f"User '{username}' already exists")
                 return True
         
-        # Add user to the users list with the team_ID
+        # Add user to the users list with the team_id
         self._config["users"].append({
             "name": username,
-            "team_ID": team_id
+            "team_id": team_id
         })
         self._save_config()
         return False
@@ -204,18 +204,18 @@ class ConfigManager:
         Returns:
             List of usernames
         """
-        # Find the team_ID for the given team_name
+        # Find the team_id for the given team_name
         team_id = None
         for team in self._config.get("teams", []):
             if team["name"] == team_name:
-                team_id = team["team_ID"]
+                team_id = team["team_id"]
                 break
         
         if team_id is None:
             return []
         
-        # Return all usernames with matching team_ID, sorted alphabetically
-        users = [user["name"] for user in self._config.get("users", []) if user["team_ID"] == team_id]
+        # Return all usernames with matching team_id, sorted alphabetically
+        users = [user["name"] for user in self._config.get("users", []) if user["team_id"] == team_id]
         return sorted(users)
     
     def get_all_users(self) -> List[str]:
@@ -238,19 +238,19 @@ class ConfigManager:
         Returns:
             Team name or None if user not found
         """
-        # Find the user and get their team_ID
+        # Find the user and get their team_id
         team_id = None
         for user in self._config.get("users", []):
             if user["name"] == username:
-                team_id = user["team_ID"]
+                team_id = user["team_id"]
                 break
         
         if team_id is None:
             return None
         
-        # Find the team name for this team_ID
+        # Find the team name for this team_id
         for team in self._config.get("teams", []):
-            if team["team_ID"] == team_id:
+            if team["team_id"] == team_id:
                 return team["name"]
         
         return None
@@ -260,9 +260,9 @@ class ConfigManager:
         Get a mapping of team IDs to team names.
         
         Returns:
-            Dictionary mapping team_ID to team name
+            Dictionary mapping team_id to team name
         """
-        return {team["team_ID"]: team["name"] for team in self._config.get("teams", [])}
+        return {team["team_id"]: team["name"] for team in self._config.get("teams", [])}
     
     def add_users_batch(self, usernames: List[str], team_name: str) -> Set[str]:
         """
@@ -275,11 +275,11 @@ class ConfigManager:
         Returns:
             Set of usernames that were already in the configuration
         """
-        # Find the team_ID for the given team_name
+        # Find the team_id for the given team_name
         team_id = None
         for team in self._config.get("teams", []):
             if team["name"] == team_name:
-                team_id = team["team_ID"]
+                team_id = team["team_id"]
                 break
         
         if team_id is None:
@@ -301,7 +301,7 @@ class ConfigManager:
             else:
                 self._config["users"].append({
                     "name": username,
-                    "team_ID": team_id
+                    "team_id": team_id
                 })
         
         # Save if any users were added
