@@ -242,14 +242,26 @@ class DiskScanner:
         headers = ["Username", "Disk Usage", "Percent"]
         rows = []
         total_capacity = self.general_system.get('total', 1)
-        all_users = {**self.user_usage_results, **self.other_usage_results}
-        for user, size in sorted(all_users.items(), key=lambda x: x[1], reverse=True)[:20]:
+        for user, size in sorted(self.user_usage_results.items(), key=lambda x: x[1], reverse=True)[:20]:
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
             rows.append([user, format_size(size), f"{usage_bar} {percent:.1f}%"])
         if rows:
             table = table_formatter.format_table(headers, rows, title="Top 20 Users by Disk Usage")
             print(table)
+        
+        # Show top OTHER users in console
+        if self.other_usage_results:
+            print("\nTop other users by disk usage:")
+            headers = ["Username", "Disk Usage", "Percent"]
+            rows = []
+            for user, size in sorted(self.other_usage_results.items(), key=lambda x: x[1], reverse=True)[:20]:
+                percent = (size / total_capacity) * 100
+                usage_bar = self._create_usage_bar(percent)
+                rows.append([user, format_size(size), f"{usage_bar} {percent:.1f}%"])
+            if rows:
+                table = table_formatter.format_table(headers, rows, title="Top 20 Other Users by Disk Usage")
+                print(table)
         
         # Display users with permission issues
         if self.permission_issues:
