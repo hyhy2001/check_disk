@@ -155,7 +155,7 @@ class ReportGenerator:
                 "other_usage": scan_result.other_usage
             }
 
-            if hasattr(scan_result, 'permission_issues') and scan_result.permission_issues:
+            if hasattr(scan_result, 'permission_issues'):
                 self.generate_permission_issues_report(scan_result)
 
         save_json_report(report, self.output_file)
