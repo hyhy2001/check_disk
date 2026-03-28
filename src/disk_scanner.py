@@ -89,10 +89,20 @@ class DiskScanner:
         
         directory = self.config.get("directory", "/")
         skip_dirs = self.config.get("exclude_patterns", [])
-        
+        target_users_only = self.config.get('target_users_only', False)
+        target_uids = None
+        if target_users_only and self.config.get('users'):
+            import pwd
+            target_uids = []
+            for u in self.config.get('users'):
+                try:
+                    target_uids.append(pwd.getpwnam(u['name']).pw_uid)
+                except KeyError:
+                    pass
+
         print("Calling fast_scanner.scan_disk()...")
         start = time.time()
-        result = fast_scanner.scan_disk(directory, skip_dirs)
+        result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
         duration = time.time() - start
         
         from src.utils import get_username_from_uid, get_general_system_info, ScanHelper, format_time_duration, format_size
@@ -145,7 +155,7 @@ class DiskScanner:
                 team_id = valid_users[username].get("team_id")
                 team_name = next((t for t, v in valid_teams.items() if v.get("team_id") == team_id), "Other")
                 team_usage_results[team_name] += size
-            else:
+            elif not self.config.get('target_users_only', False):
                 other_usage_results[username] += size
                 
         user_list = ScanHelper.create_user_list(user_usage_results)
@@ -183,6 +193,8 @@ class DiskScanner:
                     uid_guess = uname
                     break
             owner = uid_guess or "unknown"
+            if self.config.get('target_users_only', False) and owner not in valid_users:
+                continue
             perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
             
         # Re-use LegacyDiskScanner's table formatting for the console summary

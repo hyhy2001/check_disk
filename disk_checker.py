@@ -155,6 +155,18 @@ def main():
         config['output_prefix'] = output_prefix
         config['output_date_suffix'] = output_date
 
+        target_users = getattr(args, 'user', None)
+        if target_users:
+            original_users = {u['name']: u for u in config.get('users', [])}
+            filtered_users = []
+            for tu in target_users:
+                if tu in original_users:
+                    filtered_users.append(original_users[tu])
+                else:
+                    filtered_users.append({"name": tu, "team_id": None})
+            config['users'] = filtered_users
+            config['target_users_only'] = True
+
         try:
             print("\n=== STARTING DISK USAGE SCAN ===")
             print(f"Target directory: {config.get('directory', '')}")
