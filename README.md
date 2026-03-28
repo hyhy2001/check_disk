@@ -162,9 +162,12 @@ scripts/
 
 Precompiled PyO3 module. Compatible with Python 3.8+ (abi3). Exposes two functions:
 
-#### `fast_scanner.scan_disk(directory, skip_dirs, use_rust) -> dict`
+#### `fast_scanner.scan_disk(directory, skip_dirs, target_uids) -> dict`
 
-Scans `directory` in parallel using `ignore::WalkBuilder`. Returns:
+Scans `directory` in parallel using `ignore::WalkBuilder`.
+- `target_uids`: Optional list of Linux UIDs to specifically track. Drastically improves RAM and I/O performance by only recording buffers for these users, while still calculating accurate total disk usage metrics globally.
+
+Returns:
 
 ```python
 {
@@ -278,6 +281,9 @@ python disk_checker.py --run
 
 # Custom output
 python disk_checker.py --run --output-dir /reports/ --prefix sda1 --date
+
+# Targeted scan (Drastically accelerates Phase 2 by isolating specific users)
+python disk_checker.py --run --user root alice bob --output-dir /reports/ --date
 
 # Force Python fallback (no Rust)
 # set "use_rust": false in disk_checker_config.json
