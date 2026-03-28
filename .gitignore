@@ -9,6 +9,4 @@ reports/
 detail_users/
 docs/
 *.json
-src/rust_scanner/
-src/legacy_scanner_backup.py
-src/rust_exporter/
+target/
