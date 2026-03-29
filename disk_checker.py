@@ -171,6 +171,9 @@ def main():
             print("\n=== STARTING DISK USAGE SCAN ===")
             print(f"Target directory: {config.get('directory', '')}")
 
+            report_generator = ReportGenerator(config)
+            report_generator.clear_old_detail_reports()
+
             scanner = DiskScanner(
                 config,
                 max_workers=args.workers,
@@ -180,7 +183,6 @@ def main():
             scan_results = scanner.scan()
 
             print("\n=== GENERATING REPORTS ===")
-            report_generator = ReportGenerator(config)
 
             # Main summary report
             report_generator.generate_report(scan_results)

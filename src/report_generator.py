@@ -79,6 +79,23 @@ class ReportGenerator:
         fname = "_".join(parts) + ".json"
         return os.path.join(detail_dir, fname)
 
+    def clear_old_detail_reports(self) -> None:
+        """
+        Remove all old JSON files in the detail_users directory before scanning.
+        """
+        dir_part = os.path.dirname(self.output_file)
+        detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
+        if os.path.exists(detail_dir):
+            import glob
+            old_files = glob.glob(os.path.join(detail_dir, "*.json"))
+            if old_files:
+                print(f"Cleaning up {len(old_files)} old JSON files in {detail_dir}...")
+                for fpath in old_files:
+                    try:
+                        os.remove(fpath)
+                    except OSError:
+                        pass
+
     # ------------------------------------------------------------------ #
     # Legacy helpers                                                       #
     # ------------------------------------------------------------------ #

@@ -10,3 +10,4 @@ detail_users/
 docs/
 *.json
 target/
+test_zone/
