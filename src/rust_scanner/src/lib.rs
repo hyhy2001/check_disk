@@ -496,14 +496,10 @@ fn merge_write_user_report(
         let mut tf: u64 = 0;
         let mut tu: u64 = 0;
 
-        let mut readers2: Vec<std::io::Lines<BufReader<fs::File>>> = Vec::new();
         for path in &chunk_files {
             let f = fs::File::open(path)
                 .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path, e)))?;
-            readers2.push(BufReader::new(f).lines());
-        }
-        for reader in &mut readers2 {
-            for line in reader.by_ref() {
+            for line in BufReader::new(f).lines() {
                 if let Ok(l) = line {
                     if let Some((sz, _)) = parse_tsv_line(&l) {
                         tf += 1;
@@ -568,9 +564,10 @@ fn merge_write_user_report(
     w.write_all(b"\n  ]\n}\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     w.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let mem_mb = get_rss_mb();
-    eprintln!("  [Phase 2] {}: {} files, {} bytes written | Mem: {:.1} MB",
-        username, total_files, total_used, mem_mb);
+    // Output omitted to keep terminal clean during parallel processing
+    // let mem_mb = get_rss_mb();
+    // eprintln!("  [Phase 2] {}: {} files, {} bytes written | Mem: {:.1} MB",
+    //     username, total_files, total_used, mem_mb);
 
     Ok((total_files, total_used))
 }
