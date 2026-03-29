@@ -388,6 +388,8 @@ class ReportGenerator:
 
         created: List[str] = []
         failed: List[str] = []
+        total_users = len(users)
+        completed = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -396,6 +398,8 @@ class ReportGenerator:
             }
             for fut in as_completed(futures):
                 user = futures[fut]
+                completed += 1
+                
                 try:
                     dir_p, file_p = fut.result()
                     if dir_p:
@@ -405,6 +409,9 @@ class ReportGenerator:
                 except Exception as exc:
                     failed.append(user)
                     print(f"  [warn] Failed report for {user!r}: {exc}")
+                
+                if completed % 20 == 0 or completed == total_users:
+                    print(f"  [Phase 2] Progress: {completed}/{total_users} users completed...")
 
         if failed:
             print(f"  [warn] {len(failed)} user report(s) failed: {failed}")
