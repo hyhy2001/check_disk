@@ -318,7 +318,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             // Streaming TSV buffer (same as Python's DETAIL_FLUSH_THRESHOLD)
                             let buf = state.t_uid_buffers.entry(uid).or_insert_with(Vec::new);
                             buf.push((path_str, size));
-                            if buf.len() >= 100_000 {
+                            if buf.len() >= 500_000 {
                                 let count = state.t_flush_counts.entry(uid).or_insert(0);
                                 *count += 1;
                                 buf.sort_by(|a, b| b.1.cmp(&a.1));
