@@ -187,15 +187,30 @@ class DiskScanner:
             path = item.get("path", "")
             kind = item.get("type", "unknown")
             err  = item.get("error", "")
+            
             uid_guess = None
+            path_parts = path.split(os.sep)
             for uid_key, uname in uid_cache.items():
-                if path.startswith(f"/{uname}/") or path.startswith(f"/{uname}"):
+                if uname in path_parts:
                     uid_guess = uname
                     break
+                    
             owner = uid_guess or "unknown"
             if self.config.get('target_users_only', False) and owner not in valid_users:
                 continue
             perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
+            
+        # Format into users and unknown_items exactly like legacy Python expected output
+        perm_formatted = {
+            "users": [],
+            "unknown_items": perm_by_user.get("unknown", [])
+        }
+        for owner, issues in sorted(perm_by_user.items()):
+            if owner != "unknown":
+                perm_formatted["users"].append({
+                    "name": owner,
+                    "inaccessible_items": issues
+                })
             
         # Re-use LegacyDiskScanner's table formatting for the console summary
         self.general_system = system
@@ -212,7 +227,7 @@ class DiskScanner:
             other_usage=other_list,
             timestamp=int(time.time()),
             top_dir=top_dir_list,
-            permission_issues=perm_by_user,
+            permission_issues=perm_formatted,
             detail_tmpdir=result.get("detail_tmpdir", ""),
             detail_uid_username=uid_cache
         )
@@ -289,16 +304,6 @@ class DiskScanner:
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Permission Issues (Count by User)")
                 print(table)
-                
-                print("\nSample Inaccessible Paths (Top 10):")
-                all_issues = []
-                for issues in self.permission_issues.values():
-                    all_issues.extend(issues)
-                for issue in all_issues[:10]:
-                    path = issue.get('path', 'Unknown Path')
-                    err = issue.get('error', '').replace(' (os error 13)', '')
-                    kind = issue.get('type', 'unknown')
-                    print(f" - [{kind}] {path} -> {err}")
     
     def _create_usage_bar(self, percent: float, width: int = 20) -> str:
         """Delegate to shared utility."""

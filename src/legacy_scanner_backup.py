@@ -659,16 +659,6 @@ class LegacyDiskScanner:
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Permission Issues (Count by User)")
                 print(table)
-                
-                print("\nSample Inaccessible Paths (Top 10):")
-                all_issues = []
-                for issues in self.permission_issues.values():
-                    all_issues.extend(issues)
-                for issue in all_issues[:10]:
-                    path = issue.get('path', 'Unknown Path')
-                    err = issue.get('error', '').replace(' (os error 13)', '')
-                    kind = issue.get('type', 'unknown')
-                    print(f" - [{kind}] {path} -> {err}")
     
     def _create_usage_bar(self, percent: float, width: int = 20) -> str:
         """Delegate to shared utility."""
