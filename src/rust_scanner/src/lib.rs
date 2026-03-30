@@ -85,9 +85,6 @@ struct ThreadLocalState {
     t_files: u64,
     t_dirs: u64,
     t_size: u64,
-    t_files_last_progress: u64,
-    t_dirs_last_progress: u64,
-    t_size_last_progress: u64,
     t_uid_sizes: HashMap<u32, u64>,
     t_dir_sizes: HashMap<String, HashMap<u32, u64>>,
     t_uid_buffers: HashMap<u32, Vec<(String, u64)>>,
@@ -120,12 +117,7 @@ impl Drop for ThreadLocalState {
             buf.clear();
         }
 
-        // 2. Tally remaining local sizes -> global Atoms
-        self.prog_files.fetch_add(self.t_files.saturating_sub(self.t_files_last_progress), Ordering::Relaxed);
-        self.prog_dirs.fetch_add(self.t_dirs.saturating_sub(self.t_dirs_last_progress), Ordering::Relaxed);
-        self.prog_size.fetch_add(self.t_size.saturating_sub(self.t_size_last_progress), Ordering::Relaxed);
-
-        // 3. Merge into global state
+        // 2. Merge into global state
         if let Ok(mut g) = self.global_stats.lock() {
             g.total_files += self.t_files;
             g.total_dirs  += self.t_dirs;
@@ -195,7 +187,6 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                 let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
                 let mut state = ThreadLocalState {
                     t_files: 0, t_dirs: 0, t_size: 0,
-                    t_files_last_progress: 0, t_dirs_last_progress: 0, t_size_last_progress: 0,
                     t_uid_sizes: HashMap::new(),
                     t_dir_sizes: HashMap::new(),
                     t_uid_buffers: HashMap::new(),
@@ -244,11 +235,11 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                     };
 
                     let path = entry.path();
-                    let path_cow = path.to_string_lossy();
+                    let path_str = path.to_string_lossy().into_owned();
 
                     // --- Configured skip_dirs (prefix match — prunes whole subtree) ---
                     for s in &skips {
-                        if path_cow.starts_with(s.as_str()) {
+                        if path_str.starts_with(s.as_str()) {
                             return WalkState::Skip;
                         }
                     }
@@ -287,7 +278,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             Err(e) => {
                                 let uid_opt = fs::symlink_metadata(path).map(|m| m.uid()).ok();
                                 state.t_perm_issues.push((
-                                    path_cow.into_owned(),
+                                    path_str,
                                     "file".to_string(),
                                     e.to_string(),
                                     uid_opt,
@@ -320,24 +311,17 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             // Attribute size to direct parent dir only (flat, matches Python legacy)
                             // Python: dir_sizes[current_dir] = sizes of files DIRECTLY inside it
                             if let Some(parent) = path.parent() {
-                                // Only attribute if parent is at or below the scan root
                                 if parent.starts_with(&dir) {
-                                    let parent_cow = parent.to_string_lossy();
-                                    
-                                    // Optimization: avoid String allocation per file by using get_mut with &str
-                                    if let Some(user_map) = state.t_dir_sizes.get_mut(parent_cow.as_ref()) {
-                                        *user_map.entry(uid).or_insert(0) += size;
-                                    } else {
-                                        let mut new_map = HashMap::new();
-                                        new_map.insert(uid, size);
-                                        state.t_dir_sizes.insert(parent_cow.into_owned(), new_map);
-                                    }
+                                    let parent_str = parent.to_string_lossy().into_owned();
+                                    *state.t_dir_sizes
+                                        .entry(parent_str).or_insert_with(HashMap::new)
+                                        .entry(uid).or_insert(0) += size;
                                 }
                             }
 
                             // Streaming TSV buffer (same as Python's DETAIL_FLUSH_THRESHOLD)
                             let buf = state.t_uid_buffers.entry(uid).or_insert_with(Vec::new);
-                            buf.push((path_cow.into_owned(), size));
+                            buf.push((path_str, size));
                             if buf.len() >= 500_000 {
                                 let count = state.t_flush_counts.entry(uid).or_insert(0);
                                 *count += 1;
@@ -354,18 +338,9 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             }
                         }
 
-                        // Exact progress tracking via atomics — explicitly batched to avoid cache-line bouncing
-                        let local_total = state.t_files + state.t_dirs;
-                        if local_total % 2048 == 0 {
-                            state.prog_files.fetch_add(state.t_files.saturating_sub(state.t_files_last_progress), Ordering::Relaxed);
-                            state.t_files_last_progress = state.t_files;
-
-                            state.prog_dirs.fetch_add(state.t_dirs.saturating_sub(state.t_dirs_last_progress), Ordering::Relaxed);
-                            state.t_dirs_last_progress = state.t_dirs;
-
-                            state.prog_size.fetch_add(state.t_size.saturating_sub(state.t_size_last_progress), Ordering::Relaxed);
-                            state.t_size_last_progress = state.t_size;
-                        }
+                        // Progress tracking
+                        state.prog_files.fetch_add(1, Ordering::Relaxed);
+                        state.prog_size.fetch_add(size, Ordering::Relaxed);
                     }
 
                     WalkState::Continue
