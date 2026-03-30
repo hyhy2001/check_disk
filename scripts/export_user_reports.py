@@ -178,13 +178,12 @@ def main() -> None:
             try:
                 out = fut.result()
                 if out:
+                    # In realtime ngay khi xử lý xong (flush=True để hiển thị ngay)
+                    print(f"  [ok] {user:20s}  {out}", flush=True)
                     results.append((user, out))
             except Exception as exc:
                 failed.append(user)
-                print(f"  [warn] {user}: {exc}", file=sys.stderr)
-
-    for user, out in sorted(results):
-        print(f"  {user:20s}  {out}")
+                print(f"  [warn] {user}: {exc}", file=sys.stderr, flush=True)
 
     if failed:
         print(f"\n  [warn] {len(failed)} export(s) failed: {failed}", file=sys.stderr)
