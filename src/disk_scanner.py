@@ -188,14 +188,13 @@ class DiskScanner:
             kind = item.get("type", "unknown")
             err  = item.get("error", "")
             
-            uid_guess = None
-            path_parts = path.split(os.sep)
-            for uid_key, uname in uid_cache.items():
-                if uname in path_parts:
-                    uid_guess = uname
-                    break
-                    
-            owner = uid_guess or "unknown"
+            uid_value = item.get("uid")
+            if uid_value is not None:
+                # Dùng uid trực tiếp kết hợp bộ đệm `uid_cache` để lấy chuẩn user name
+                owner = uid_cache.get(uid_value, get_username_from_uid(uid_value, uid_cache))
+            else:
+                owner = "unknown"
+                
             if self.config.get('target_users_only', False) and owner not in valid_users:
                 continue
             perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})

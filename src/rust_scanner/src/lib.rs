@@ -75,7 +75,7 @@ struct GlobalStats {
     total_size: u64,
     uid_sizes: HashMap<u32, u64>,
     dir_sizes: HashMap<String, HashMap<u32, u64>>,
-    permission_issues: Vec<(String, String, String)>, // (path, kind, error)
+    permission_issues: Vec<(String, String, String, Option<u32>)>, // (path, kind, error, uid)
 }
 
 // ProgressStats replaced by 3 AtomicU64 (no lock, exact counts)
@@ -90,7 +90,7 @@ struct ThreadLocalState {
     t_dir_sizes: HashMap<String, HashMap<u32, u64>>,
     t_uid_buffers: HashMap<u32, Vec<(String, u64)>>,
     t_flush_counts: HashMap<u32, u32>,
-    t_perm_issues: Vec<(String, String, String)>,
+    t_perm_issues: Vec<(String, String, String, Option<u32>)>,
     global_stats: Arc<Mutex<GlobalStats>>,
     prog_files: Arc<AtomicU64>,
     prog_dirs:  Arc<AtomicU64>,
@@ -213,17 +213,23 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             let err_str = err.to_string();
                             let mut path_str = String::new();
                             // ignore::Error usually formats as: "/path/to/dir: Permission denied"
-                            if err_str.starts_with('/') {
-                                if let Some(idx) = err_str.find(": ") {
-                                    path_str = err_str[..idx].to_string();
-                                } else {
-                                    path_str = err_str.clone();
-                                }
+                            if let Some(idx) = err_str.find(": ") {
+                                path_str = err_str[..idx].to_string();
+                            } else {
+                                path_str = err_str.clone();
                             }
+                            
+                            let uid_opt = if !path_str.is_empty() {
+                                fs::symlink_metadata(&path_str).map(|m| m.uid()).ok()
+                            } else {
+                                None
+                            };
+
                             state.t_perm_issues.push((
                                 path_str,
                                 "unknown".to_string(),
                                 err_str,
+                                uid_opt,
                             ));
                             return WalkState::Continue;
                         }
@@ -273,10 +279,12 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                         let meta = match entry.metadata() {
                             Ok(m) => m,
                             Err(e) => {
+                                let uid_opt = fs::symlink_metadata(&path_str).map(|m| m.uid()).ok();
                                 state.t_perm_issues.push((
                                     path_str,
                                     "file".to_string(),
                                     e.to_string(),
+                                    uid_opt,
                                 ));
                                 return WalkState::Continue;
                             }
@@ -397,13 +405,18 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     }
     result.set_item("dir_sizes", py_dir)?;
 
-    // permission_issues as list of dicts (path, type, error)
+    // permission_issues as list of dicts (path, type, error, uid)
     let py_perms = PyList::empty(py);
-    for (path, kind, err) in &g.permission_issues {
+    for (path, kind, err, uid_opt) in &g.permission_issues {
         let d = PyDict::new(py);
         d.set_item("path", path)?;
         d.set_item("type", kind)?;
         d.set_item("error", err)?;
+        if let Some(uid) = uid_opt {
+            d.set_item("uid", uid)?;
+        } else {
+            d.set_item("uid", py.None())?;
+        }
         py_perms.append(d)?;
     }
     result.set_item("permission_issues", py_perms)?;
