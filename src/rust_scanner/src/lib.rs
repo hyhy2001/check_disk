@@ -210,13 +210,10 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                         Ok(e) => e,
                         Err(err) => {
                             let err_str = err.to_string();
-                            let mut path_str = String::new();
-                            // ignore::Error usually formats as: "/path/to/dir: Permission denied"
-                            if let Some(idx) = err_str.find(": ") {
-                                path_str = err_str[..idx].to_string();
-                            } else {
-                                path_str = err_str.clone();
-                            }
+                            // ignore::Error formats as: "/path/to/dir: Permission denied (os error 13)"
+                            let path_str = err_str.find(": ")
+                                .map(|idx| err_str[..idx].to_string())
+                                .unwrap_or_default();
                             
                             let uid_opt = if !path_str.is_empty() {
                                 fs::symlink_metadata(&path_str).map(|m| m.uid()).ok()
@@ -226,7 +223,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
 
                             state.t_perm_issues.push((
                                 path_str,
-                                "unknown".to_string(),
+                                "directory".to_string(),
                                 err_str,
                                 uid_opt,
                             ));
@@ -272,6 +269,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                         }
 
                         state.t_dirs += 1;
+                        state.prog_dirs.fetch_add(1, Ordering::Relaxed);
                     } else if ft.is_file() {
                         let meta = match entry.metadata() {
                             Ok(m) => m,
@@ -441,7 +439,7 @@ use std::io::{BufRead, BufReader};
 /// valid UTF-8 JSON: replace any surrogate or invalid code points with U+FFFD.
 fn sanitise_path(raw: &str) -> String {
     raw.chars()
-        .map(|c| if c == '\u{FFFD}' || c.is_control() && c != '\t' { '\u{FFFD}' } else { c })
+        .map(|c| if c == '\u{FFFD}' || (c.is_control() && c != '\t') { '\u{FFFD}' } else { c })
         .collect()
 }
 
