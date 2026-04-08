@@ -14,25 +14,29 @@ from typing import Dict, Any, List, Optional, Tuple, Set
 def format_size(size_bytes: int) -> str:
     """
     Format size in bytes to human-readable format.
-    
+    Uses SI/decimal units (1 KB = 1,000 B) to match the dashboard display.
+
     Args:
         size_bytes: Size in bytes
-        
+
     Returns:
         Human-readable size string
     """
     if size_bytes < 0:
         return "0 B"
-        
-    units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-    size = float(size_bytes)
-    unit_index = 0
-    
-    while size >= 1024 and unit_index < len(units) - 1:
-        size /= 1024
-        unit_index += 1
-        
-    return f"{size:.2f} {units[unit_index]}"
+
+    TB = 1e12; GB = 1e9; MB = 1e6; KB = 1e3
+    abs_bytes = float(size_bytes)
+
+    if abs_bytes >= TB:
+        return f"{abs_bytes / TB:.2f} TB"
+    if abs_bytes >= GB:
+        return f"{abs_bytes / GB:.1f} GB"
+    if abs_bytes >= MB:
+        return f"{abs_bytes / MB:.0f} MB"
+    if abs_bytes >= KB:
+        return f"{abs_bytes / KB:.0f} KB"
+    return f"{size_bytes} B"
 
 def format_time_duration(seconds: float) -> str:
     """
