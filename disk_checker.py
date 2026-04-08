@@ -197,6 +197,10 @@ def main():
 
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
 
+            if getattr(args, 'webhook_url', None):
+                from src.msteams_notifier import send_msteams_notification
+                send_msteams_notification(args.webhook_url, scan_results, config)
+
         except KeyboardInterrupt:
             print("\nScan interrupted by user.")
             sys.exit(1)

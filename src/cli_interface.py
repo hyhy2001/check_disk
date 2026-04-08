@@ -54,6 +54,7 @@ class CLIInterface:
         scan_group.add_argument("--date", action="store_true", help="Add current date (YYYYMMDD) to output filenames")
         scan_group.add_argument("--output", metavar="FILE", help="Output file for report (full path including filename)")
         scan_group.add_argument("--output-dir", metavar="DIR", help="Directory to store output reports (will use default filename)")
+        scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
         
         # Report commands
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
