@@ -165,19 +165,23 @@ class DiskScanner:
         other_total = sum(item["used"] for item in other_list)
         team_list.append({"name": "Other", "used": other_total})
         
-        top_dir_list = []
         relevant_users = set(valid_users.keys()) | set(other_usage_results.keys())
-        
+
+        # Merge by (dir_path, username) to avoid duplicate paths when multiple
+        # UIDs map to the same username (e.g. after UID rename/migration).
+        dir_by_user: dict = {}
         for dir_path, user_sizes in result.get("dir_sizes", {}).items():
             for uid_str, size in user_sizes.items():
                 uid = int(uid_str)
                 username = uid_cache[uid]
                 if username in relevant_users and size > 0:
-                    top_dir_list.append({
-                        "dir": dir_path,
-                        "user": username,
-                        "user_usage": size
-                    })
+                    key = (dir_path, username)
+                    dir_by_user[key] = dir_by_user.get(key, 0) + size
+
+        top_dir_list = [
+            {"dir": dp, "user": un, "user_usage": sz}
+            for (dp, un), sz in dir_by_user.items()
+        ]
         top_dir_list.sort(key=lambda x: x["user_usage"], reverse=True)
         
         # Build permission_issues in the same nested format as Python legacy
