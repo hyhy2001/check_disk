@@ -57,6 +57,11 @@ class CLIInterface:
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
         
         # Report commands
+        report_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")
+        report_group.add_argument("--sync-user", metavar="USER", help="SSH username of the remote server")
+        report_group.add_argument("--sync-host", metavar="HOST", help="IP or hostname of the remote server")
+        report_group.add_argument("--sync-dest-dir", metavar="DIR", help="Destination directory on the remote server")
+
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
         report_group.add_argument("--check-users", metavar="USER", nargs="+",

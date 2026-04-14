@@ -16,6 +16,7 @@ from src.config_manager import ConfigManager
 from src.disk_scanner import DiskScanner
 from src.report_generator import ReportGenerator
 from src.cli_interface import CLIInterface
+from src.sync_manager import ReportSyncer
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully."""
@@ -196,6 +197,18 @@ def main():
             )
 
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
+
+            if getattr(args, 'sync', False):
+                out_dir = os.path.dirname(config.get('output_file', ''))
+                if not out_dir:
+                    out_dir = "."
+                
+                ReportSyncer.sync_to_remote(
+                    output_dir=out_dir,
+                    user=getattr(args, 'sync_user', None),
+                    host=getattr(args, 'sync_host', None),
+                    dest_dir=getattr(args, 'sync_dest_dir', None)
+                )
 
             if getattr(args, 'webhook_url', None):
                 from src.msteams_notifier import send_msteams_notification
