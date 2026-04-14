@@ -173,6 +173,8 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     let target_uids_shared = Arc::new(target_uids);
     // Shared cross-worker hard-link deduplication (equivalent to Python's inode_lock + hardlink_inodes)
     let hardlink_inodes: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Shared directory loop/bind-mount deduplication
+    let visited_dirs: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let _walk_thread = thread::spawn(move || {
         WalkBuilder::new(&dir_clone)
@@ -203,6 +205,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                 let skips = skips.clone();
                 let dir = dir_clone.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
+                let visited_dirs_shared = visited_dirs.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -259,9 +262,15 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             }
                         }
 
-                        // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
-                        if let Some(rdev) = root_dev {
-                            if let Ok(meta) = entry.metadata() {
+                        // --- Bind mount / Loop deduplication ---
+                        if let Ok(meta) = entry.metadata() {
+                            let key = (meta.ino(), meta.dev());
+                            if !visited_dirs_shared.lock().unwrap().insert(key) {
+                                return WalkState::Skip;
+                            }
+
+                            // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
+                            if let Some(rdev) = root_dev {
                                 if meta.dev() != rdev {
                                     return WalkState::Skip;
                                 }
@@ -468,13 +477,16 @@ fn json_escape(s: &str) -> String {
 #[pyfunction]
 fn merge_write_user_report(
     tmpdir:      String,
-    uid:         u32,
+    uids:        Vec<u32>,
     username:    String,
     output_path: String,
     timestamp:   i64,
 ) -> PyResult<(u64, u64)> {
-    // 1. Glob chunk files sorted (uid_{uid}_t*.tsv)
-    let mut chunk_files: Vec<String> = glob_module_rust(&tmpdir, uid)?;
+    // 1. Glob chunk files sorted (uid_{uid}_t*.tsv) for all uids
+    let mut chunk_files: Vec<String> = Vec::new();
+    for uid in uids {
+        chunk_files.extend(glob_module_rust(&tmpdir, uid)?);
+    }
     chunk_files.sort();
 
     if chunk_files.is_empty() {

@@ -210,8 +210,8 @@ class ReportGenerator:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _iter_uid_tsv(tmpdir: str, uid: int):
-        """Yield (size, path) tuples from all temp TSV chunks for *uid*.
+    def _iter_uid_tsv(tmpdir: str, uids: List[int]):
+        """Yield (size, path) tuples from all temp TSV chunks for all *uids*.
 
         Each chunk is sorted descending (written that way by _flush_thread_paths).
         Using ``heapq.merge(..., reverse=True)`` over these iterators gives a
@@ -231,9 +231,11 @@ class ReportGenerator:
                         continue  # skip malformed lines
                     yield int(line[:tab]), line[tab + 1:]
 
-        chunk_files = sorted(
-            glob_module.glob(os.path.join(tmpdir, f'uid_{uid}_t*.tsv'))
-        )
+        chunk_files = []
+        for uid in uids:
+            chunk_files.extend(glob_module.glob(os.path.join(tmpdir, f'uid_{uid}_t*.tsv')))
+        chunk_files.sort()
+        
         if not chunk_files:
             return
 
@@ -242,7 +244,7 @@ class ReportGenerator:
     def _stream_write_file_report(
         self,
         tmpdir: str,
-        uid: int,
+        uids: List[int],
         username: str,
         output_path: str,
         timestamp: int,
@@ -260,7 +262,7 @@ class ReportGenerator:
         if HAS_RUST_PHASE2:
             try:
                 _fast_scanner.merge_write_user_report(
-                    tmpdir, uid, username, output_path, timestamp
+                    tmpdir, uids, username, output_path, timestamp
                 )
                 return output_path
             except Exception as e:
@@ -274,7 +276,7 @@ class ReportGenerator:
         # Pass 1: totals
         total_files = 0
         total_used = 0
-        for size, _ in self._iter_uid_tsv(tmpdir, uid):
+        for size, _ in self._iter_uid_tsv(tmpdir, uids):
             total_files += 1
             total_used += size
 
@@ -290,7 +292,7 @@ class ReportGenerator:
             out.write('  "files": [')
 
             first = True
-            for size, path in self._iter_uid_tsv(tmpdir, uid):
+            for size, path in self._iter_uid_tsv(tmpdir, uids):
                 sep = '' if first else ','
                 out.write(f'{sep}\n    {{"path": {json.dumps(_safe_path(path))}, "size": {size}}}')
                 first = False
@@ -341,17 +343,14 @@ class ReportGenerator:
 
         streaming = bool(scan_result.detail_tmpdir)
         if streaming:
-            uid = next(
-                (u for u, n in scan_result.detail_uid_username.items() if n == user),
-                None,
-            )
-            if uid is not None:
+            uids = [u for u, n in scan_result.detail_uid_username.items() if n == user]
+            if uids:
                 self._stream_write_file_report(
-                    scan_result.detail_tmpdir, uid, user, file_path,
+                    scan_result.detail_tmpdir, uids, user, file_path,
                     scan_result.timestamp,
                 )
             else:
-                print(f"  [warn] No UID found for user {user!r}, skipping file report")
+                print(f"  [warn] No UIDs found for user {user!r}, skipping file report")
                 file_path = ""
         else:
             # Legacy in-memory path
