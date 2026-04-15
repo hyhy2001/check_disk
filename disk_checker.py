@@ -207,7 +207,8 @@ def main():
                     output_dir=out_dir,
                     user=getattr(args, 'sync_user', None),
                     host=getattr(args, 'sync_host', None),
-                    dest_dir=getattr(args, 'sync_dest_dir', None)
+                    dest_dir=getattr(args, 'sync_dest_dir', None),
+                    password=getattr(args, 'sync_pass', None)
                 )
 
             if getattr(args, 'webhook_url', None):

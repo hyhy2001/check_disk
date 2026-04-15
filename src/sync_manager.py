@@ -5,7 +5,7 @@ class ReportSyncer:
     """Handles syncing reports to a remote server over SSH using Tar Stream Pipeline."""
     
     @staticmethod
-    def sync_to_remote(output_dir: str, user: str, host: str, dest_dir: str) -> bool:
+    def sync_to_remote(output_dir: str, user: str, host: str, dest_dir: str, password: str = None) -> bool:
         """
         Compresses and streams the contents of output_dir to a remote server.
         
@@ -14,6 +14,7 @@ class ReportSyncer:
             user (str): SSH username for the remote server.
             host (str): IP address or hostname of the remote server.
             dest_dir (str): Destination directory on the remote server.
+            password (str): Optional SSH password (requires 'sshpass' installed).
             
         Returns:
             bool: True if successful, False otherwise.
@@ -31,9 +32,14 @@ class ReportSyncer:
         # Build the exact SSH pipeline specified
         # "rm -rf <dest> && mkdir -p <dest> && tar -xzf - -C <dest>"
         # Using -q to suppress basic ssh warnings, and no -v on tar to keep it silent.
+        ssh_cmd = f"ssh -q {user}@{host}"
+        if password:
+            safe_pass = password.replace("'", "'\\''")
+            ssh_cmd = f"sshpass -p '{safe_pass}' {ssh_cmd}"
+            
         cmd = (
             f"tar -czf - -C \"{output_dir}\" . | "
-            f"ssh -q {user}@{host} "
+            f"{ssh_cmd} "
             f"\"rm -rf {dest_dir} && mkdir -p {dest_dir} && tar -xzf - -C {dest_dir}\""
         )
         
