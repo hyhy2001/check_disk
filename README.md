@@ -164,6 +164,24 @@ All results are exported as standard JSON files:
 | `detail_users/detail_report_dir_{user}.json` | `detail_users/` subdir | Largest directories owned by each user. |
 | `detail_users/detail_report_file_{user}.json` | `detail_users/` subdir | Largest files owned by each user, sorted descending by size. |
 
+**Detail Report Formats (`detail_report_dir_{user}.json` & `detail_report_file_{user}.json`)**
+Both detail report formats share the same top-level metadata structure for consistency:
+
+```json
+{
+  "date": 1713337200,
+  "user": "alice",
+  "total_dirs": 12,       // (or "total_files" for file reports)
+  "total_used": 1048576,
+  "dirs": [               // (or "files" for file reports)
+    {
+      "path": "/data/shared/alice_data", 
+      "used": 512000      // (or "size" for file reports)
+    }
+  ]
+}
+```
+
 > When `--prefix` is used, all filenames are prefixed accordingly, e.g., `sda1_permission_issues.json` and `detail_users/sda1_detail_report_dir_alice.json`.
 
 ---

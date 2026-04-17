@@ -327,8 +327,8 @@ class ReportGenerator:
         total_dir_used = sum(d['user_usage'] for d in dirs)
         dir_data = {
             'date': scan_result.timestamp,
-            'directory': self.config.get('directory', ''),
             'user': user,
+            'total_dirs': len(dirs),
             'total_used': total_dir_used,
             'dirs': [
                 {'path': d['dir'], 'used': d['user_usage']}
