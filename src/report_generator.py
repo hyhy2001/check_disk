@@ -163,10 +163,15 @@ class ReportGenerator:
                     entry["team_id"] = tid
                 user_usage.append(entry)
 
+            filtered_general_system = {
+                k: v for k, v in scan_result.general_system.items()
+                if not k.startswith("inodes_")
+            }
+
             report = {
                 "date": scan_result.timestamp,
                 "directory": self.config.get("directory", ""),
-                "general_system": scan_result.general_system,
+                "general_system": filtered_general_system,
                 "team_usage": team_usage,
                 "user_usage": user_usage,
                 "other_usage": scan_result.other_usage
@@ -174,6 +179,9 @@ class ReportGenerator:
 
             if hasattr(scan_result, 'permission_issues'):
                 self.generate_permission_issues_report(scan_result)
+            
+            if hasattr(scan_result, 'user_inodes'):
+                self.generate_inode_report(scan_result)
 
         save_json_report(report, self.output_file)
         return report
@@ -202,6 +210,36 @@ class ReportGenerator:
         output_path = self._get_output_filename("permission_issues")
         save_json_report(report, output_path)
         print(f"Permission issues report saved to: {output_path}")
+
+        return report
+
+    # ------------------------------------------------------------------ #
+    # Inode usage report                                                   #
+    # ------------------------------------------------------------------ #
+
+    def generate_inode_report(self, scan_result: ScanResult) -> Dict[str, Any]:
+        """
+        Generate a report for inode usage (files count).
+
+        Args:
+            scan_result: ScanResult object with disk usage data
+
+        Returns:
+            Dictionary containing the report data
+        """
+        report = {
+            "date": scan_result.timestamp,
+            "directory": self.config.get("directory", ""),
+            "inodes_total": scan_result.general_system.get("inodes_total", 0),
+            "inodes_used": scan_result.general_system.get("inodes_used", 0),
+            "inodes_free": scan_result.general_system.get("inodes_free", 0),
+            "inodes_scanned": scan_result.general_system.get("inodes_scanned", 0),
+            "users": scan_result.user_inodes
+        }
+
+        output_path = self._get_output_filename("inode_usage_report")
+        save_json_report(report, output_path)
+        print(f"Inode usage report saved to: {output_path}")
 
         return report
 

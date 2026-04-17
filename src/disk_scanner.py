@@ -46,6 +46,7 @@ class ScanResult:
     timestamp: int
     top_dir: List[Dict[str, Any]] = field(default_factory=list)
     permission_issues: Dict[str, Any] = field(default_factory=dict)
+    user_inodes: List[Dict[str, Any]] = field(default_factory=list)
     # username -> [(path, size), ...] sorted by size desc (legacy / small scans)
     detail_files: Dict[str, List[Tuple[str, int]]] = field(default_factory=dict)
     # Streaming mode: temp dir + uid mapping populated instead of detail_files
@@ -141,26 +142,36 @@ class DiskScanner:
                 uid_cache[uid] = get_username_from_uid(uid)
                 
         user_usage_results = defaultdict(int)
+        user_inode_results = defaultdict(int)
         team_usage_results = defaultdict(int)
         other_usage_results = defaultdict(int)
         
         valid_users = {u["name"]: u for u in self.config.get("users", [])}
         valid_teams = {t["name"]: t for t in self.config.get("teams", [])}
         
+        uid_files_dict = result.get("uid_files", {})
+
         for uid_str, size in result.get("uid_sizes", {}).items():
             uid = int(uid_str)
             username = uid_cache[uid]
+            file_count = uid_files_dict.get(uid_str, 0)
+            
             if username in valid_users:
                 user_usage_results[username] += size
+                user_inode_results[username] += file_count
                 team_id = valid_users[username].get("team_id")
                 team_name = next((t for t, v in valid_teams.items() if v.get("team_id") == team_id), "Other")
                 team_usage_results[team_name] += size
             elif not self.config.get('target_users_only', False):
                 other_usage_results[username] += size
+                user_inode_results[username] += file_count
                 
         user_list = ScanHelper.create_user_list(user_usage_results)
         team_list = ScanHelper.create_user_list(team_usage_results)
         other_list = ScanHelper.create_user_list(other_usage_results)
+        
+        user_inode_list = [{"name": name, "inodes": count} for name, count in user_inode_results.items()]
+        user_inode_list.sort(key=lambda x: x["inodes"], reverse=True)
         
         other_total = sum(item["used"] for item in other_list)
         team_list.append({"name": "Other", "used": other_total})
@@ -223,14 +234,18 @@ class DiskScanner:
         self.permission_issues = perm_by_user
         self._display_scan_summary()
         
+        system_info = get_general_system_info(directory)
+        system_info["inodes_scanned"] = result.get("total_inodes", 0)
+
         return ScanResult(
-            general_system=get_general_system_info(directory),
+            general_system=system_info,
             team_usage=team_list,
             user_usage=user_list,
             other_usage=other_list,
             timestamp=int(time.time()),
             top_dir=top_dir_list,
             permission_issues=perm_formatted,
+            user_inodes=user_inode_list,
             detail_tmpdir=result.get("detail_tmpdir", ""),
             detail_uid_username=uid_cache
         )

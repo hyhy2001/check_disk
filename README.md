@@ -61,6 +61,7 @@ python disk_checker.py --check-users alice bob
 - **User & Team Quota Tracking**
   - Map filesystem UIDs to custom Teams and Users for granular insights.
   - Track accessibility boundaries with out-of-the-box permission error reporting.
+  - **Inode Exhaustion Monitoring**: Detect hidden storage limits by tracking total/free filesystem inodes alongside per-user inode usage (file count tracking).
 - **MS Teams Notifications**
   - Post a rich Adaptive Card summary to a Microsoft Teams channel via a Workflow Webhook URL after each scan.
 - **Remote SSH Sync**
@@ -77,6 +78,7 @@ python disk_checker.py --check-users alice bob
 - **OS**: Linux x86_64, glibc ≥ 2.17 (e.g., RHEL/CentOS 7/8, Ubuntu 18+).
 
 > **Note:** The Rust `.so` binaries are already included. No Rust toolchain or compilation is required to deploy this tool.
+
 
 ---
 
@@ -160,6 +162,7 @@ All results are exported as standard JSON files:
 | File | Location | Description |
 |------|----------|-------------|
 | `disk_usage_report.json` | Root output dir | Overall summary: system stats, team usage, per-user totals, UID mappings. |
+| `inode_usage_report.json` | Root output dir | Inode monitoring: system total/free inodes, and top users ranked by inode consumption (files count). |
 | `permission_issues.json` | Root output dir | Paths that could not be accessed due to permission errors. |
 | `detail_users/detail_report_dir_{user}.json` | `detail_users/` subdir | Largest directories owned by each user. |
 | `detail_users/detail_report_file_{user}.json` | `detail_users/` subdir | Largest files owned by each user, sorted descending by size. |

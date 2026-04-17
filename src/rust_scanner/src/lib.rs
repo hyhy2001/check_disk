@@ -72,8 +72,10 @@ fn get_rss_mb() -> f64 {
 struct GlobalStats {
     total_files: u64,
     total_dirs: u64,
+    total_inodes: u64,
     total_size: u64,
     uid_sizes: HashMap<u32, u64>,
+    uid_files: HashMap<u32, u64>,
     dir_sizes: HashMap<String, HashMap<u32, u64>>,
     permission_issues: Vec<(String, String, String, Option<u32>)>, // (path, kind, error, uid)
 }
@@ -84,8 +86,10 @@ struct GlobalStats {
 struct ThreadLocalState {
     t_files: u64,
     t_dirs: u64,
+    t_inodes: u64,
     t_size: u64,
     t_uid_sizes: HashMap<u32, u64>,
+    t_uid_files: HashMap<u32, u64>,
     t_dir_sizes: HashMap<String, HashMap<u32, u64>>,
     t_uid_buffers: HashMap<u32, Vec<(String, u64)>>,
     t_flush_counts: HashMap<u32, u32>,
@@ -121,9 +125,13 @@ impl Drop for ThreadLocalState {
         if let Ok(mut g) = self.global_stats.lock() {
             g.total_files += self.t_files;
             g.total_dirs  += self.t_dirs;
+            g.total_inodes += self.t_inodes;
             g.total_size  += self.t_size;
             for (uid, size) in &self.t_uid_sizes {
                 *g.uid_sizes.entry(*uid).or_insert(0) += size;
+            }
+            for (uid, files) in &self.t_uid_files {
+                *g.uid_files.entry(*uid).or_insert(0) += files;
             }
             for (dir, user_map) in &self.t_dir_sizes {
                 let gm = g.dir_sizes.entry(dir.clone()).or_insert_with(HashMap::new);
@@ -146,8 +154,8 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     let _ = _tmpdir.into_path(); // leak — Python cleans up later
 
     let global_stats = Arc::new(Mutex::new(GlobalStats {
-        total_files: 0, total_dirs: 0, total_size: 0,
-        uid_sizes: HashMap::new(), dir_sizes: HashMap::new(),
+        total_files: 0, total_dirs: 0, total_inodes: 0, total_size: 0,
+        uid_sizes: HashMap::new(), uid_files: HashMap::new(), dir_sizes: HashMap::new(),
         permission_issues: Vec::new(),
     }));
     let prog_files = Arc::new(AtomicU64::new(0));
@@ -188,8 +196,9 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
             .run(|| {
                 let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
                 let mut state = ThreadLocalState {
-                    t_files: 0, t_dirs: 0, t_size: 0,
+                    t_files: 0, t_dirs: 0, t_inodes: 0, t_size: 0,
                     t_uid_sizes: HashMap::new(),
+                    t_uid_files: HashMap::new(),
                     t_dir_sizes: HashMap::new(),
                     t_uid_buffers: HashMap::new(),
                     t_flush_counts: HashMap::new(),
@@ -250,6 +259,17 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                     };
 
                     if ft.is_symlink() {
+                        state.t_inodes += 1;
+                        if let Ok(meta) = fs::symlink_metadata(path) {
+                            let uid = meta.uid();
+                            let is_target = match &state.target_uids {
+                                Some(vec) => vec.contains(&uid),
+                                None => true,
+                            };
+                            if is_target {
+                                *state.t_uid_files.entry(uid).or_insert(0) += 1;
+                            }
+                        }
                         return WalkState::Continue;
                     }
 
@@ -264,6 +284,15 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
 
                         // --- Bind mount / Loop deduplication ---
                         if let Ok(meta) = entry.metadata() {
+                            let uid = meta.uid();
+                            let is_target = match &state.target_uids {
+                                Some(vec) => vec.contains(&uid),
+                                None => true,
+                            };
+                            if is_target {
+                                *state.t_uid_files.entry(uid).or_insert(0) += 1;
+                            }
+
                             let key = (meta.ino(), meta.dev());
                             if !visited_dirs_shared.lock().unwrap().insert(key) {
                                 return WalkState::Skip;
@@ -278,6 +307,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                         }
 
                         state.t_dirs += 1;
+                        state.t_inodes += 1;
                         state.prog_dirs.fetch_add(1, Ordering::Relaxed);
                     } else if ft.is_file() {
                         let meta = match entry.metadata() {
@@ -310,10 +340,12 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                         };
 
                         state.t_files += 1;
+                        state.t_inodes += 1;
                         state.t_size  += size;
 
                         if is_target {
                             *state.t_uid_sizes.entry(uid).or_insert(0) += size;
+                            *state.t_uid_files.entry(uid).or_insert(0) += 1;
 
                             // Attribute size to direct parent dir only (flat, matches Python legacy)
                             // Python: dir_sizes[current_dir] = sizes of files DIRECTLY inside it
@@ -393,12 +425,17 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     let result = PyDict::new(py);
     result.set_item("total_files",  g.total_files)?;
     result.set_item("total_dirs",   g.total_dirs)?;
+    result.set_item("total_inodes", g.total_inodes)?;
     result.set_item("total_size",   g.total_size)?;
     result.set_item("detail_tmpdir", &tmpdir_str)?;
 
     let py_uid = PyDict::new(py);
     for (uid, size) in &g.uid_sizes { py_uid.set_item(uid, size)?; }
     result.set_item("uid_sizes", py_uid)?;
+
+    let py_uid_files = PyDict::new(py);
+    for (uid, files) in &g.uid_files { py_uid_files.set_item(uid, files)?; }
+    result.set_item("uid_files", py_uid_files)?;
 
     let py_dir = PyDict::new(py);
     for (dir, user_map) in &g.dir_sizes {

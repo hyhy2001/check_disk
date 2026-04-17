@@ -146,19 +146,33 @@ def build_uid_cache() -> Dict[int, str]:
 
 def get_general_system_info(directory: str) -> Dict[str, int]:
     """
-    Get general system disk information.
+    Get general system disk information, including inodes.
     
     Args:
         directory: Path to check
         
     Returns:
-        Dictionary with total, used, and available space
+        Dictionary with total, used, available space, and inode stats.
     """
+    info = {
+        "total": 0, "used": 0, "available": 0,
+        "inodes_total": 0, "inodes_used": 0, "inodes_free": 0
+    }
     try:
         total, used, free = shutil.disk_usage(directory)
-        return {"total": total, "used": used, "available": free}
+        info.update({"total": total, "used": used, "available": free})
     except Exception:
-        return {"total": 0, "used": 0, "available": 0}
+        pass
+
+    try:
+        st = os.statvfs(directory)
+        info["inodes_total"] = st.f_files
+        info["inodes_free"] = st.f_ffree
+        info["inodes_used"] = st.f_files - st.f_ffree
+    except Exception:
+        pass
+
+    return info
 
 def get_actual_disk_usage(stat_result):
     """
