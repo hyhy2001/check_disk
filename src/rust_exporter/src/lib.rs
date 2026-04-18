@@ -2,12 +2,12 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use serde::Deserialize;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 #[derive(Deserialize, Default)]
 struct JsonItem {
-    path: String,
+    path: Option<String>,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -46,40 +46,65 @@ fn format_size(mut n: f64) -> String {
     }
 }
 
+fn parse_file_items(file_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
+    if !Path::new(file_path).exists() {
+        return;
+    }
+    let f = match File::open(file_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("  [rust-warn] Failed to open {}: {}", file_path, e);
+            return;
+        }
+    };
+    
+    if file_path.ends_with(".ndjson") {
+        for line in BufReader::new(f).lines() {
+            if let Ok(l) = line {
+                if let Ok(item) = serde_json::from_str::<JsonItem>(&l) {
+                    if let Some(path) = item.path {
+                        let sz = if kind == "dir " { item.used.unwrap_or(0) } else { item.size.unwrap_or(0) };
+                        entries.push(ExportEntry { kind, path, size: sz });
+                    }
+                }
+            }
+        }
+    } else {
+        // legacy JSON
+        if kind == "dir " {
+            if let Ok(data) = serde_json::from_reader::<_, ReportDir>(BufReader::new(f)) {
+                for d in data.dirs {
+                    if let Some(path) = d.path {
+                        let sz = d.used.unwrap_or(0);
+                        entries.push(ExportEntry { kind, path, size: sz });
+                    }
+                }
+            }
+        } else {
+            if let Ok(data) = serde_json::from_reader::<_, ReportFile>(BufReader::new(f)) {
+                for file in data.files {
+                    if let Some(path) = file.path {
+                        let sz = file.size.unwrap_or(0);
+                        entries.push(ExportEntry { kind, path, size: sz });
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[pyfunction]
 fn process(user: String, dir_path: String, file_path: String, out_path: String) -> PyResult<String> {
     let mut entries = Vec::new();
 
-    // 1. Read dir JSON if exists
-    if Path::new(&dir_path).exists() {
-        match File::open(&dir_path) {
-            Ok(f) => match serde_json::from_reader::<_, ReportDir>(BufReader::new(f)) {
-                Ok(data) => {
-                    for d in data.dirs {
-                        let sz = d.used.unwrap_or(0);
-                        entries.push(ExportEntry { kind: "dir ", path: d.path, size: sz });
-                    }
-                }
-                Err(e) => eprintln!("  [rust-warn] Failed to parse {}: {}", dir_path, e),
-            },
-            Err(e) => eprintln!("  [rust-warn] Failed to open {}: {}", dir_path, e),
-        }
+    // 1. Read dir JSON/NDJSON if exists
+    if !dir_path.is_empty() {
+        parse_file_items(&dir_path, "dir ", &mut entries);
     }
 
-    // 2. Read file JSON if exists
-    if Path::new(&file_path).exists() {
-        match File::open(&file_path) {
-            Ok(f) => match serde_json::from_reader::<_, ReportFile>(BufReader::new(f)) {
-                Ok(data) => {
-                    for file in data.files {
-                        let sz = file.size.unwrap_or(0);
-                        entries.push(ExportEntry { kind: "file", path: file.path, size: sz });
-                    }
-                }
-                Err(e) => eprintln!("  [rust-warn] Failed to parse {}: {}", file_path, e),
-            },
-            Err(e) => eprintln!("  [rust-warn] Failed to open {}: {}", file_path, e),
-        }
+    // 2. Read file JSON/NDJSON if exists
+    if !file_path.is_empty() {
+        parse_file_items(&file_path, "file", &mut entries);
     }
 
     if entries.is_empty() {

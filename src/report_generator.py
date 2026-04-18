@@ -76,7 +76,7 @@ class ReportGenerator:
         detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
         prefix = self.config.get("output_prefix", "")
         parts = [p for p in [prefix, base, user] if p]
-        fname = "_".join(parts) + ".json"
+        fname = "_".join(parts) + ".ndjson"
         return os.path.join(detail_dir, fname)
 
     def clear_old_detail_reports(self) -> None:
@@ -87,7 +87,7 @@ class ReportGenerator:
         detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
         if os.path.exists(detail_dir):
             import glob
-            old_files = glob.glob(os.path.join(detail_dir, "*.json"))
+            old_files = glob.glob(os.path.join(detail_dir, "*.json")) + glob.glob(os.path.join(detail_dir, "*.ndjson"))
             if old_files:
                 print(f"Cleaning up {len(old_files)} old JSON files in {detail_dir}...")
                 for fpath in old_files:
@@ -322,20 +322,25 @@ class ReportGenerator:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         with open(output_path, 'w', encoding='utf-8') as out:
-            out.write('{\n')
-            out.write(f'  "date": {timestamp},\n')
-            out.write(f'  "user": {json.dumps(_safe_path(username))},\n')
-            out.write(f'  "total_files": {total_files},\n')
-            out.write(f'  "total_used": {total_used},\n')
-            out.write('  "files": [')
+            meta = {
+                "_meta": {
+                    "date": timestamp,
+                    "user": _safe_path(username),
+                    "total_files": total_files,
+                    "total_used": total_used
+                }
+            }
+            out.write(json.dumps(meta, separators=(',', ':')) + '\n')
 
-            first = True
             for size, path in self._iter_uid_tsv(tmpdir, uids):
-                sep = '' if first else ','
-                out.write(f'{sep}\n    {{"path": {json.dumps(_safe_path(path))}, "size": {size}}}')
-                first = False
-
-            out.write('\n  ]\n}\n')
+                safe_path = _safe_path(path)
+                xt = os.path.splitext(safe_path)[1][1:]
+                line = {
+                    "path": safe_path,
+                    "size": size,
+                    "xt": xt
+                }
+                out.write(json.dumps(line, separators=(',', ':')) + '\n')
 
         return output_path
 
@@ -363,18 +368,23 @@ class ReportGenerator:
         # ── Directory detail report (always in-memory — bounded by dir count) ──
         dirs = [e for e in scan_result.top_dir if e['user'] == user]
         total_dir_used = sum(d['user_usage'] for d in dirs)
-        dir_data = {
-            'date': scan_result.timestamp,
-            'user': user,
-            'total_dirs': len(dirs),
-            'total_used': total_dir_used,
-            'dirs': [
-                {'path': d['dir'], 'used': d['user_usage']}
-                for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True)
-            ],
-        }
         dir_path = self._get_user_detail_filename('detail_report_dir', user)
-        save_json_report(dir_data, dir_path)
+        with open(dir_path, 'w', encoding='utf-8') as out:
+            meta = {
+                "_meta": {
+                    "date": scan_result.timestamp,
+                    "user": user,
+                    "total_dirs": len(dirs),
+                    "total_used": total_dir_used
+                }
+            }
+            out.write(json.dumps(meta, separators=(',', ':')) + '\n')
+            for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True):
+                line = {
+                    "path": d['dir'],
+                    "used": d['user_usage']
+                }
+                out.write(json.dumps(line, separators=(',', ':')) + '\n')
 
         # ── File detail report ────────────────────────────────────────────────
         file_path = self._get_user_detail_filename('detail_report_file', user)
@@ -393,14 +403,24 @@ class ReportGenerator:
         else:
             # Legacy in-memory path
             user_files = scan_result.detail_files.get(user, [])
-            file_data = {
-                'date': scan_result.timestamp,
-                'user': user,
-                'total_files': len(user_files),
-                'total_used': sum(s for _, s in user_files),
-                'files': [{'path': p, 'size': s} for p, s in user_files],
-            }
-            save_json_report(file_data, file_path)
+            with open(file_path, 'w', encoding='utf-8') as out:
+                meta = {
+                    "_meta": {
+                        "date": scan_result.timestamp,
+                        "user": user,
+                        "total_files": len(user_files),
+                        "total_used": sum(s for _, s in user_files)
+                    }
+                }
+                out.write(json.dumps(meta, separators=(',', ':')) + '\n')
+                for p, s in user_files:
+                    xt = os.path.splitext(p)[1][1:]
+                    line = {
+                        "path": p,
+                        "size": s,
+                        "xt": xt
+                    }
+                    out.write(json.dumps(line, separators=(',', ':')) + '\n')
 
         return dir_path, file_path
 

@@ -32,10 +32,11 @@ def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
     sub = os.path.join(input_dir, "detail_users")
     pat_prefix = f"{prefix}_" if prefix else ""
     
-    # Check for new format (detail_report_*.json) OR legacy format (detail_report_dir_*.json)
-    if glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.json")):
+    if glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.ndjson")) or \
+       glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.json")):
         return sub
-    if glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.json")):
+    if glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.ndjson")) or \
+       glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.json")):
         return input_dir
     return sub
 
@@ -45,27 +46,31 @@ def find_users(input_dir: str, prefix: str) -> list:
     detail_dir = _resolve_detail_dir(input_dir, prefix)
     pat_prefix = f"{prefix}_" if prefix else ""
     
-    # Try looking for the unified detail_report_<user>.json pattern
-    unified_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_*.json")
-    strip_unified = f"{pat_prefix}detail_report_"
-    
+    # Try looking for the unified detail_report_<user>.ndjson or .json pattern
     users = set()
-    for path in glob.glob(unified_pattern):
-        name = os.path.basename(path)
-        # Exclude legacy dir/file markers if mixed
-        if name.startswith(strip_unified) and name.endswith(".json") and "dir_" not in name and "file_" not in name:
-            user = name[len(strip_unified):-len(".json")]
-            users.add(user)
-            
-    # If using legacy format fallback (detail_report_dir_<user>.json)
-    if not users:
-        legacy_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_*.json")
-        strip_legacy = f"{pat_prefix}detail_report_dir_"
-        for path in glob.glob(legacy_pattern):
+    for ext in [".ndjson", ".json"]:
+        unified_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_*{ext}")
+        strip_unified = f"{pat_prefix}detail_report_"
+        
+        for path in glob.glob(unified_pattern):
             name = os.path.basename(path)
-            if name.startswith(strip_legacy) and name.endswith(".json"):
-                user = name[len(strip_legacy):-len(".json")]
+            # Exclude legacy dir/file markers if mixed
+            if name.startswith(strip_unified) and name.endswith(ext) and "dir_" not in name and "file_" not in name:
+                user = name[len(strip_unified):-len(ext)]
                 users.add(user)
+                
+        # If using legacy format fallback
+        if not users:
+            legacy_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_*{ext}")
+            strip_legacy = f"{pat_prefix}detail_report_dir_"
+            for path in glob.glob(legacy_pattern):
+                name = os.path.basename(path)
+                if name.startswith(strip_legacy) and name.endswith(ext):
+                    user = name[len(strip_legacy):-len(ext)]
+                    users.add(user)
+                    
+        if users:
+            break
 
     return sorted(list(users))
 
@@ -75,9 +80,13 @@ def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
     detail_dir = _resolve_detail_dir(input_dir, prefix)
     pat_prefix = f"{prefix}_" if prefix else ""
     
-    unified_path = os.path.join(detail_dir, f"{pat_prefix}detail_report_{user}.json")
-    dir_path = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_{user}.json")
-    file_path = os.path.join(detail_dir, f"{pat_prefix}detail_report_file_{user}.json")
+    # Determine extension
+    ndjson_file = os.path.join(detail_dir, f"{pat_prefix}detail_report_file_{user}.ndjson")
+    ext = ".ndjson" if os.path.exists(ndjson_file) else ".json"
+    
+    unified_path = os.path.join(detail_dir, f"{pat_prefix}detail_report_{user}{ext}")
+    dir_path = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_{user}{ext}")
+    file_path = os.path.join(detail_dir, f"{pat_prefix}detail_report_file_{user}{ext}")
     
     return (unified_path, dir_path, file_path)
 
@@ -112,7 +121,7 @@ def export_user(user: str,
         try:
             if has_unified:
                 # Fast_scanner emits a unified file; pass it directly.
-                export_rust.process(user, unified_path, "", out_path)
+                export_rust.process(user, unified_path, unified_path, out_path)
             else:
                 # Legacy scanner emits separate dir/file jsons.
                 export_rust.process(user, dir_path, file_path, out_path)

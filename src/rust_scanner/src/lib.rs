@@ -573,15 +573,9 @@ fn merge_write_user_report(
     let mut w = BufWriter::new(out_file);
 
     // Write header
-    w.write_all(b"{\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    writeln!(w, "  \"date\": {},", timestamp).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    writeln!(w, "  \"user\": {},", json_escape(&sanitise_path(&username)))
+    writeln!(w, "{{\"_meta\":{{\"date\":{},\"user\":{},\"total_files\":{},\"total_used\":{}}}}}",
+        timestamp, json_escape(&sanitise_path(&username)), total_files, total_used)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    writeln!(w, "  \"total_files\": {},", total_files)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    writeln!(w, "  \"total_used\": {},", total_used)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    w.write_all(b"  \"files\": [").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // K-way merge from re-opened readers
     let mut readers3: Vec<std::io::Lines<BufReader<fs::File>>> = Vec::new();
@@ -601,12 +595,10 @@ fn merge_write_user_report(
         }
     }
 
-    let mut first = true;
     while let Some((size, raw_path, idx)) = heap3.pop() {
-        let sep = if first { "" } else { "," };
-        first = false;
         let safe = sanitise_path(&raw_path);
-        write!(w, "{}\n    {{\"path\": {}, \"size\": {}}}", sep, json_escape(&safe), size)
+        let xt = std::path::Path::new(&safe).extension().and_then(|s| s.to_str()).unwrap_or("");
+        writeln!(w, "{{\"path\":{},\"size\":{},\"xt\":{}}}", json_escape(&safe), size, json_escape(xt))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Pull next line from same chunk
@@ -617,7 +609,6 @@ fn merge_write_user_report(
         }
     }
 
-    w.write_all(b"\n  ]\n}\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     w.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Output omitted to keep terminal clean during parallel processing
@@ -659,7 +650,7 @@ fn _write_empty_report(output_path: &str, username: &str, timestamp: i64) -> PyR
         fs::File::create(output_path)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     );
-    writeln!(w, "{{\n  \"date\": {},\n  \"user\": {},\n  \"total_files\": 0,\n  \"total_used\": 0,\n  \"files\": []\n}}",
+    writeln!(w, "{{\"_meta\":{{\"date\":{},\"user\":{},\"total_files\":0,\"total_used\":0}}}}",
         timestamp, json_escape(username))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(())
