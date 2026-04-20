@@ -15,6 +15,7 @@ import sqlite3
 import time
 import queue
 import threading
+import pwd
 from typing import Dict, Any, List, Set, Tuple, Optional
 from collections import defaultdict
 
@@ -44,6 +45,8 @@ class TreeMapGenerator:
         self.id_to_path = []
         self.path_to_id = {}
         self.total_processed = 0
+        self.uid_to_owner = {}
+        self.path_to_owner = {}
 
     def _get_id(self, path: str) -> int:
         """String interning: Returns an integer ID for a path string."""
@@ -64,6 +67,28 @@ class TreeMapGenerator:
             rel = os.path.relpath(path, self.root_dir)
             return 0 if rel == "." else rel.count(os.sep) + 1
         except ValueError: return 999
+
+    def _get_owner_username(self, path: str) -> str:
+        """Resolve owner username for a directory path with cache."""
+        cached = self.path_to_owner.get(path)
+        if cached is not None:
+            return cached
+
+        owner = "unknown"
+        try:
+            uid = os.stat(path).st_uid
+            owner = self.uid_to_owner.get(uid)
+            if owner is None:
+                try:
+                    owner = pwd.getpwuid(uid).pw_name
+                except KeyError:
+                    owner = f"uid-{uid}"
+                self.uid_to_owner[uid] = owner
+        except (OSError, PermissionError):
+            owner = "unknown"
+
+        self.path_to_owner[path] = owner
+        return owner
 
     def _serialization_worker(self, parent_to_children_ids, recursive_sizes, direct_sizes_ids):
         """Producer: Processes directory IDs and serializes them."""
@@ -90,6 +115,7 @@ class TreeMapGenerator:
                     "path": child_path,
                     "value": child_size,
                     "type": "directory",
+                    "owner": self._get_owner_username(child_path),
                     "shard_id": self._get_path_hash(child_path),
                     "has_children": child_id in parent_to_children_ids and self._get_depth(child_path) < self.max_level
                 })
@@ -102,6 +128,7 @@ class TreeMapGenerator:
                     "path": os.path.join(path, "__files__"),
                     "value": local_files_size,
                     "type": "file_group",
+                    "owner": self._get_owner_username(path),
                     "has_children": False
                 })
             
@@ -220,7 +247,7 @@ class TreeMapGenerator:
 
     def save(self, output_path: str):
         start_time = time.time()
-        print(f"Phase 1: Building Integer-based hierarchy for {len(self.dir_sizes):,} directories...")
+        print(f"Phase 3.1: Building TreeMap hierarchy for {len(self.dir_sizes):,} directories...")
 
         # 1. Structure Analysis (Integer-based to save RAM)
         direct_sizes_ids = {}
@@ -279,6 +306,7 @@ class TreeMapGenerator:
                 "path": cp,
                 "value": recursive_sizes.get(child_id, 0),
                 "type": "directory",
+                "owner": self._get_owner_username(cp),
                 "shard_id": self._get_path_hash(cp),
                 "has_children": child_id in parent_to_children_ids and self.max_level > 1
             })
@@ -288,7 +316,7 @@ class TreeMapGenerator:
             root_children.append({
                 "name": f"[Files in {os.path.basename(self.root_dir) or self.root_dir}]",
                 "path": os.path.join(self.root_dir, "__files__"),
-                "value": rf_size, "type": "file_group", "has_children": False
+                "value": rf_size, "type": "file_group", "owner": self._get_owner_username(self.root_dir), "has_children": False
             })
         root_children.sort(key=lambda x: x["value"], reverse=True)
 
@@ -296,17 +324,17 @@ class TreeMapGenerator:
             "name": os.path.basename(self.root_dir) or self.root_dir,
             "path": self.root_dir,
             "value": recursive_sizes.get(root_id, 0),
-            "type": "directory", "shard_id": self._get_path_hash(self.root_dir),
+            "type": "directory", "owner": self._get_owner_username(self.root_dir), "shard_id": self._get_path_hash(self.root_dir),
             "has_children": len(root_children) > 0, "children": root_children
         }
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(root_node, f, separators=(',', ':'))
 
-        # 4. Phase 2: Parallel Serialization and Streaming to SQLite
+        # 4. Phase 3: Parallel serialization and streaming to SQLite
         db_path = os.path.join(os.path.dirname(output_path), "tree_map_data.db")
         if os.path.exists(db_path): os.remove(db_path)
 
-        print(f"Phase 2: Processing shards with {self.max_workers} threads...")
+        print(f"Phase 3.2: Processing shards with {self.max_workers} threads...")
         db_thread = threading.Thread(target=self._db_worker, args=(db_path,))
         db_thread.start()
 
@@ -329,4 +357,4 @@ class TreeMapGenerator:
         db_thread.join()
 
         print(f"Completed: {self.total_processed:,} shards. RAM Strings: {len(self.id_to_path):,} unique paths.")
-        print(f"Totat time: {time.time() - start_time:.2f}s")
+        print(f"Total TreeMap time: {time.time() - start_time:.2f}s")

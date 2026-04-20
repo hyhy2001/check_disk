@@ -191,17 +191,17 @@ def main():
             report_generator.generate_report(scan_results)
             print(f"Main report: {config.get('output_file', 'disk_usage_report.json')}")
 
-            # TreeMap report
-            if getattr(args, 'tree_map', False):
-                level = getattr(args, 'level', 3)
-                report_generator.generate_tree_map(scan_results, level=level)
-
             # Per-user detail reports (dir + file) - runs with same
             # concurrency level as the scanner (Phase 1 workers reused)
             created = report_generator.generate_detail_reports(
                 scan_results,
                 max_workers=scanner.max_workers,
             )
+
+            # TreeMap report runs after detail export (Phase 3)
+            if getattr(args, 'tree_map', False):
+                level = getattr(args, 'level', 3)
+                report_generator.generate_tree_map(scan_results, level=level)
 
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             total_elapsed = time.time() - run_started_at
