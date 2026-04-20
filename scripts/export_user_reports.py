@@ -99,35 +99,55 @@ def export_user(user: str,
                 input_dir: str,
                 output_dir: str,
                 prefix: str,
-                sem: threading.Semaphore) -> str:
+                sem: threading.Semaphore) -> list:
     """
     Load JSON reports for user and write plain-text report using Rust.
-    Memory footprint is minimal since Rust streams JSON values efficiently.
-    `sem` provides an overarching read limit if required by system IO.
+    Outputs TWO separate files: one for directories (dir) and one for files (file).
     """
     unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
     
     # Check what exists
     has_unified = os.path.exists(unified_path)
-    if not has_unified and not os.path.exists(dir_path) and not os.path.exists(file_path):
-        print(f"  [skip] No data found for user: {user}", file=sys.stderr)
-        return ""
+    has_dir = os.path.exists(dir_path)
+    has_file = os.path.exists(file_path)
 
-    parts = [p for p in [prefix, "usage", user] if p]
-    out_fname = "_".join(parts) + ".txt"
-    out_path  = os.path.join(output_dir, out_fname)
+    if not has_unified and not has_dir and not has_file:
+        print(f"  [skip] No data found for user: {user}", file=sys.stderr)
+        return []
+
+    results = []
+    base_parts = [p for p in [prefix, "usage"] if p]
 
     with sem:
         try:
             if has_unified:
-                # Fast_scanner emits a unified file; pass it directly.
-                export_rust.process(user, unified_path, unified_path, out_path)
+                # If we only have a unified file, we might still want to split by type?
+                # But typically unified means one file. Let's produce one dir and one file report from it.
+                out_dir_fname = "_".join(base_parts + ["dir", user]) + ".txt"
+                out_dir_path = os.path.join(output_dir, out_dir_fname)
+                export_rust.process(user, unified_path, "", out_dir_path)
+                results.append(out_dir_path)
+
+                out_file_fname = "_".join(base_parts + ["file", user]) + ".txt"
+                out_file_path = os.path.join(output_dir, out_file_fname)
+                export_rust.process(user, "", unified_path, out_file_path)
+                results.append(out_file_path)
             else:
-                # Legacy scanner emits separate dir/file jsons.
-                export_rust.process(user, dir_path, file_path, out_path)
-            return out_path
+                if has_dir:
+                    out_dir_fname = "_".join(base_parts + ["dir", user]) + ".txt"
+                    out_dir_path = os.path.join(output_dir, out_dir_fname)
+                    export_rust.process(user, dir_path, "", out_dir_path)
+                    results.append(out_dir_path)
+                
+                if has_file:
+                    out_file_fname = "_".join(base_parts + ["file", user]) + ".txt"
+                    out_file_path = os.path.join(output_dir, out_file_fname)
+                    export_rust.process(user, "", file_path, out_file_path)
+                    results.append(out_file_path)
+                    
+            return results
         except Exception as e:
-            raise RuntimeError(f"Rust export failed: {e}")
+            raise RuntimeError(f"Rust export failed for {user}: {e}")
 
 
 # ---------------------------------------------------------------------------
