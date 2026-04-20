@@ -1,8 +1,14 @@
 """
 export_user_reports.py
 
-Reads per-user detail JSON reports and exports one plain-text file per user.
-This script uses a high-performance Rust core `export_rust` to parse JSON and dump TXT.
+Reads per-user detail JSON/NDJSON reports and exports plain-text usage files per user.
+This script uses a high-performance Rust core `export_rust` to parse reports and dump TXT.
+
+Output contract note:
+- Prefer canonical keys in source reports for best compatibility with disk_usage backend:
+  - dirs rows: path, used
+  - files rows: path, size, xt
+- Legacy short keys (n/s) are still supported by parser-side normalization.
 """
 
 import os
