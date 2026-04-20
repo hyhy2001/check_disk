@@ -108,7 +108,6 @@ class DiskScanner:
         
         from src.utils import get_username_from_uid, get_general_system_info, ScanHelper, format_time_duration, format_size
         
-        system = get_general_system_info(directory)
         mem_usage = _get_rss_mb()
         
         total_files = result.get('total_files', 0)
@@ -125,12 +124,6 @@ class DiskScanner:
         print(f"Total size:       {format_size(total_size)}")
         print(f"Scan rate:        {avg_rate:,.0f} files/sec")
         print(f"Memory usage:     {mem_usage:.1f} MB")
-        print(f"{'='*60}")
-        print(f"Disk Information:")
-        print(f"  Total capacity: {format_size(system.get('total', 0))}")
-        print(f"  Used space:     {format_size(system.get('used', 0))} ({system.get('used', 0) * 100 / system.get('total', 1):.1f}%)")
-        print(f"  Available:      {format_size(system.get('available', 0))}")
-        print(f"{'='*60}")
         
         # Build UID mapping
         from collections import defaultdict
@@ -227,15 +220,24 @@ class DiskScanner:
                 })
             
         # Re-use LegacyDiskScanner's table formatting for the console summary
-        self.general_system = system
+        # Use one final filesystem snapshot after scan for consistency
+        # between terminal output and report JSON.
+        system_info = get_general_system_info(directory)
+        system_info["inodes_scanned"] = result.get("total_inodes", 0)
+
+        print(f"{'='*60}")
+        print(f"Disk Information (final snapshot):")
+        print(f"  Total capacity: {format_size(system_info.get('total', 0))}")
+        print(f"  Used space:     {format_size(system_info.get('used', 0))} ({system_info.get('used', 0) * 100 / system_info.get('total', 1):.1f}%)")
+        print(f"  Available:      {format_size(system_info.get('available', 0))}")
+        print(f"{'='*60}")
+
+        self.general_system = system_info
         self.team_usage_results = team_usage_results
         self.user_usage_results = user_usage_results
         self.other_usage_results = other_usage_results
         self.permission_issues = perm_by_user
         self._display_scan_summary()
-        
-        system_info = get_general_system_info(directory)
-        system_info["inodes_scanned"] = result.get("total_inodes", 0)
 
         return ScanResult(
             general_system=system_info,

@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3::exceptions::PyRuntimeError;
 use ignore::{WalkBuilder, WalkState};
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::fs;
@@ -656,9 +657,84 @@ fn _write_empty_report(output_path: &str, username: &str, timestamp: i64) -> PyR
     Ok(())
 }
 
+fn _insert_shard_batch(conn: &mut Connection, batch: &[(String, String)]) -> Result<(), rusqlite::Error> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare("INSERT INTO shards (id, data) VALUES (?1, ?2)")?;
+        for (id, data) in batch.iter() {
+            stmt.execute(params![id, data])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[pyfunction]
+fn write_shards_tsv_to_sqlite(tsv_path: String, db_path: String, batch_size: Option<usize>) -> PyResult<u64> {
+    let bs = batch_size.unwrap_or(5000).max(1);
+
+    let mut conn = Connection::open(&db_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("open sqlite {}: {}", db_path, e)))?;
+
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = OFF;
+         PRAGMA cache_size = -50000;
+         PRAGMA temp_store = MEMORY;
+         DROP TABLE IF EXISTS shards;
+         CREATE TABLE shards (id TEXT PRIMARY KEY, data TEXT);"
+    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite setup failed: {}", e)))?;
+
+    let file = fs::File::open(&tsv_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("open tsv {}: {}", tsv_path, e)))?;
+    let reader = BufReader::new(file);
+
+    let mut batch: Vec<(String, String)> = Vec::with_capacity(bs);
+    let mut total: u64 = 0;
+
+    for line in reader.lines() {
+        let l = match line {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(PyRuntimeError::new_err(format!("read tsv {}: {}", tsv_path, e)));
+            }
+        };
+        if l.is_empty() {
+            continue;
+        }
+        let tab = match l.find('\t') {
+            Some(i) => i,
+            None => continue,
+        };
+
+        let id = l[..tab].to_string();
+        let data = l[tab + 1..].to_string();
+        batch.push((id, data));
+        total += 1;
+
+        if batch.len() >= bs {
+            _insert_shard_batch(&mut conn, &batch)
+                .map_err(|e| PyRuntimeError::new_err(format!("sqlite batch insert failed: {}", e)))?;
+            batch.clear();
+        }
+    }
+
+    if !batch.is_empty() {
+        _insert_shard_batch(&mut conn, &batch)
+            .map_err(|e| PyRuntimeError::new_err(format!("sqlite final insert failed: {}", e)))?;
+    }
+
+    Ok(total)
+}
+
 #[pymodule]
 fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_disk, m)?)?;
     m.add_function(wrap_pyfunction!(merge_write_user_report, m)?)?;
+    m.add_function(wrap_pyfunction!(write_shards_tsv_to_sqlite, m)?)?;
     Ok(())
 }

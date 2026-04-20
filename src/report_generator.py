@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from src.disk_scanner import ScanResult
 from src.utils import format_size, save_json_report, ScanHelper
+from src.tree_map_generator import TreeMapGenerator
 
 try:
     from src import fast_scanner as _fast_scanner
@@ -244,6 +245,45 @@ class ReportGenerator:
         return report
 
     # ------------------------------------------------------------------ #
+    # TreeMap report                                                       #
+    # ------------------------------------------------------------------ #
+
+    def generate_tree_map(self, scan_result: ScanResult, level: int = 3) -> str:
+        """
+        Generate a TreeMap JSON report for directory visualization.
+
+        Args:
+            scan_result: ScanResult object with disk usage data
+            level: Maximum depth level for the tree
+
+        Returns:
+            The output path that was written.
+        """
+        # Resolve output path
+        output_path = self._get_output_filename("tree_map_report")
+        
+        # Build dir_sizes map from top_dir if not directly available in scan_result
+        # TreeMapGenerator expects Dict[str, Dict[str, int]]
+        dir_sizes_map = {}
+        for entry in scan_result.top_dir:
+            d = entry['dir']
+            u = entry['user']
+            s = entry['user_usage']
+            if d not in dir_sizes_map:
+                dir_sizes_map[d] = {}
+            dir_sizes_map[d][u] = s
+
+        generator = TreeMapGenerator(
+            root_dir=self.config.get("directory", "/"),
+            dir_sizes=dir_sizes_map,
+            max_level=level,
+            max_workers=self.config.get("workers", 4)
+        )
+        
+        generator.save(output_path)
+        return output_path
+
+    # ------------------------------------------------------------------ #
     # Streaming file-detail report writer                                  #
     # ------------------------------------------------------------------ #
 
@@ -369,6 +409,10 @@ class ReportGenerator:
         dirs = [e for e in scan_result.top_dir if e['user'] == user]
         total_dir_used = sum(d['user_usage'] for d in dirs)
         dir_path = self._get_user_detail_filename('detail_report_dir', user)
+        
+        # Ensure target directory exists
+        os.makedirs(os.path.dirname(dir_path), exist_ok=True)
+        
         with open(dir_path, 'w', encoding='utf-8') as out:
             meta = {
                 "_meta": {

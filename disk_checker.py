@@ -81,12 +81,12 @@ def main():
         config_manager.initialize_config(args.dir)
         print(f"Configuration initialized with directory: {args.dir}")
     
-    # Handle directory change without init
-    elif args.dir:
+    # Handle directory change
+    elif args.dir and not args.run:
         config_manager.update_directory(args.dir)
         print(f"Directory in configuration updated to: {args.dir}")
     
-    elif args.add_team:
+    if args.add_team:
         config_manager.add_team(args.add_team)
         print(f"Team '{args.add_team}' added successfully")
     
@@ -136,6 +136,8 @@ def main():
 
 
     elif args.run:
+        run_started_at = time.time()
+
         # Load configuration
         config = config_manager.get_config()
         if not config:
@@ -189,6 +191,11 @@ def main():
             report_generator.generate_report(scan_results)
             print(f"Main report: {config.get('output_file', 'disk_usage_report.json')}")
 
+            # TreeMap report
+            if getattr(args, 'tree_map', False):
+                level = getattr(args, 'level', 3)
+                report_generator.generate_tree_map(scan_results, level=level)
+
             # Per-user detail reports (dir + file) - runs with same
             # concurrency level as the scanner (Phase 1 workers reused)
             created = report_generator.generate_detail_reports(
@@ -197,6 +204,8 @@ def main():
             )
 
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
+            total_elapsed = time.time() - run_started_at
+            print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 
             if getattr(args, 'sync', False):
                 out_dir = os.path.dirname(config.get('output_file', ''))

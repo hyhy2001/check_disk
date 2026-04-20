@@ -55,6 +55,8 @@ class CLIInterface:
         scan_group.add_argument("--output", metavar="FILE", help="Output file for report (full path including filename)")
         scan_group.add_argument("--output-dir", metavar="DIR", help="Directory to store output reports (will use default filename)")
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
+        scan_group.add_argument("--tree-map", action="store_true", help="Generate a TreeMap JSON for directory visualization")
+        scan_group.add_argument("--level", type=int, default=3, help="Maximum depth level for TreeMap generation (default: 3)")
         
         # Report commands
         report_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")
