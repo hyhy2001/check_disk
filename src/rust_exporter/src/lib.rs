@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -50,6 +51,64 @@ fn parse_file_items(file_path: &str, kind: &'static str, entries: &mut Vec<Expor
     if !Path::new(file_path).exists() {
         return;
     }
+
+    if file_path.ends_with(".db") {
+        let conn = match Connection::open_with_flags(file_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  [rust-warn] Failed to open sqlite {}: {}", file_path, e);
+                return;
+            }
+        };
+
+        if kind == "dir " {
+            let mut stmt = match conn.prepare("SELECT path, used FROM dirs ORDER BY used DESC") {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  [rust-warn] Failed to query dirs in {}: {}", file_path, e);
+                    return;
+                }
+            };
+            let rows = match stmt.query_map([], |row| {
+                let path: String = row.get(0)?;
+                let size: u64 = row.get(1)?;
+                Ok((path, size))
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [rust-warn] Failed to iterate dirs in {}: {}", file_path, e);
+                    return;
+                }
+            };
+            for r in rows.flatten() {
+                entries.push(ExportEntry { kind, path: r.0, size: r.1 });
+            }
+        } else {
+            let mut stmt = match conn.prepare("SELECT path, size FROM files ORDER BY size DESC") {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  [rust-warn] Failed to query files in {}: {}", file_path, e);
+                    return;
+                }
+            };
+            let rows = match stmt.query_map([], |row| {
+                let path: String = row.get(0)?;
+                let size: u64 = row.get(1)?;
+                Ok((path, size))
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [rust-warn] Failed to iterate files in {}: {}", file_path, e);
+                    return;
+                }
+            };
+            for r in rows.flatten() {
+                entries.push(ExportEntry { kind, path: r.0, size: r.1 });
+            }
+        }
+        return;
+    }
+
     let f = match File::open(file_path) {
         Ok(file) => file,
         Err(e) => {
@@ -97,12 +156,12 @@ fn parse_file_items(file_path: &str, kind: &'static str, entries: &mut Vec<Expor
 fn process(user: String, dir_path: String, file_path: String, out_path: String) -> PyResult<String> {
     let mut entries = Vec::new();
 
-    // 1. Read dir JSON/NDJSON if exists
+    // 1. Read dir JSON/NDJSON/DB if exists
     if !dir_path.is_empty() {
         parse_file_items(&dir_path, "dir ", &mut entries);
     }
 
-    // 2. Read file JSON/NDJSON if exists
+    // 2. Read file JSON/NDJSON/DB if exists
     if !file_path.is_empty() {
         parse_file_items(&file_path, "file", &mut entries);
     }

@@ -7,6 +7,7 @@ Handles generating and saving disk usage reports.
 import os
 import json
 import heapq
+import sqlite3
 import glob as glob_module
 import time
 import threading
@@ -20,9 +21,11 @@ from src.tree_map_generator import TreeMapGenerator
 try:
     from src import fast_scanner as _fast_scanner
     HAS_RUST_PHASE2 = hasattr(_fast_scanner, 'merge_write_user_report')
+    HAS_RUST_PHASE2_DB = hasattr(_fast_scanner, 'merge_write_user_report_db')
 except ImportError:
     _fast_scanner = None  # type: ignore
     HAS_RUST_PHASE2 = False
+    HAS_RUST_PHASE2_DB = False
 
 
 class ReportGenerator:
@@ -61,7 +64,7 @@ class ReportGenerator:
 
         return os.path.join(dir_part, new_filename) if dir_part else new_filename
 
-    def _get_user_detail_filename(self, base: str, user: str) -> str:
+    def _get_user_detail_filename(self, base: str, user: str, ext: str = "ndjson") -> str:
         """
         Build path for a per-user detail report inside the detail_users/ subdir.
         Never includes a date suffix.
@@ -77,7 +80,8 @@ class ReportGenerator:
         detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
         prefix = self.config.get("output_prefix", "")
         parts = [p for p in [prefix, base, user] if p]
-        fname = "_".join(parts) + ".ndjson"
+        ext = (ext or "ndjson").lstrip(".")
+        fname = "_".join(parts) + "." + ext
         return os.path.join(detail_dir, fname)
 
     def clear_old_detail_reports(self) -> None:
@@ -88,9 +92,13 @@ class ReportGenerator:
         detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
         if os.path.exists(detail_dir):
             import glob
-            old_files = glob.glob(os.path.join(detail_dir, "*.json")) + glob.glob(os.path.join(detail_dir, "*.ndjson"))
+            old_files = (
+                glob.glob(os.path.join(detail_dir, "*.json")) +
+                glob.glob(os.path.join(detail_dir, "*.ndjson")) +
+                glob.glob(os.path.join(detail_dir, "*.db"))
+            )
             if old_files:
-                print(f"Cleaning up {len(old_files)} old JSON files in {detail_dir}...")
+                print(f"Cleaning up {len(old_files)} old output files in {detail_dir}...")
                 for fpath in old_files:
                     try:
                         os.remove(fpath)
@@ -384,6 +392,173 @@ class ReportGenerator:
 
         return output_path
 
+    def _write_dir_report_db(
+        self,
+        user: str,
+        scan_result: ScanResult,
+        dirs: List[Dict[str, Any]],
+        output_path: str,
+        total_dir_used: int,
+    ) -> str:
+        """Write per-user directory detail report as SQLite DB."""
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        conn = sqlite3.connect(output_path)
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
+        conn.execute(
+            "CREATE TABLE dirs ("
+            "id INTEGER PRIMARY KEY, "
+            "path TEXT, "
+            "used INTEGER)"
+        )
+        conn.execute("CREATE INDEX idx_dirs_used ON dirs(used DESC)")
+        conn.execute(
+            "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
+            (scan_result.timestamp, user, len(dirs), int(total_dir_used)),
+        )
+
+        rows = []
+        for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True):
+            p = d['dir']
+            rows.append((
+                p,
+                int(d['user_usage']),
+            ))
+        if rows:
+            conn.executemany(
+                "INSERT INTO dirs(path, used) VALUES (?, ?)",
+                rows
+            )
+        conn.commit()
+        conn.close()
+        return output_path
+
+    def _write_file_report_db_streaming(
+        self,
+        user: str,
+        scan_result: ScanResult,
+        output_path: str,
+        uids: List[int],
+    ) -> str:
+        """Write per-user file detail report as SQLite DB from streaming temp chunks."""
+        if HAS_RUST_PHASE2_DB:
+            try:
+                _fast_scanner.merge_write_user_report_db(
+                    scan_result.detail_tmpdir,
+                    uids,
+                    user,
+                    output_path,
+                    scan_result.timestamp,
+                    5000,
+                )
+                return output_path
+            except Exception as e:
+                print(f"  [warn] Rust Phase 2 DB failed for {user!r}, falling back to Python: {e}")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        conn = sqlite3.connect(output_path)
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
+        conn.execute(
+            "CREATE TABLE files ("
+            "id INTEGER PRIMARY KEY, "
+            "path TEXT, "
+            "size INTEGER, "
+            "xt TEXT)"
+        )
+        conn.execute("CREATE INDEX idx_files_size ON files(size DESC)")
+        conn.execute("CREATE INDEX idx_files_xt_size ON files(xt, size DESC)")
+        total_files = 0
+        total_used = 0
+        batch = []
+        batch_size = 5000
+
+        for size, path in self._iter_uid_tsv(scan_result.detail_tmpdir, uids):
+            xt = os.path.splitext(path)[1][1:]
+            xt = xt.lower()
+            batch.append((
+                path,
+                int(size),
+                xt,
+            ))
+            total_files += 1
+            total_used += int(size)
+            if len(batch) >= batch_size:
+                conn.executemany(
+                    "INSERT INTO files(path, size, xt) VALUES (?, ?, ?)",
+                    batch
+                )
+                batch = []
+
+        if batch:
+            conn.executemany(
+                "INSERT INTO files(path, size, xt) VALUES (?, ?, ?)",
+                batch
+            )
+        conn.execute(
+            "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
+            (scan_result.timestamp, user, int(total_files), int(total_used)),
+        )
+        conn.commit()
+        conn.close()
+        return output_path
+
+    def _write_file_report_db_legacy(
+        self,
+        user: str,
+        scan_result: ScanResult,
+        output_path: str,
+        user_files: List[Tuple[str, int]],
+    ) -> str:
+        """Write per-user file detail report as SQLite DB from in-memory file list."""
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        conn = sqlite3.connect(output_path)
+        conn.execute("PRAGMA journal_mode = OFF")
+        conn.execute("PRAGMA synchronous = OFF")
+        conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
+        conn.execute(
+            "CREATE TABLE files ("
+            "id INTEGER PRIMARY KEY, "
+            "path TEXT, "
+            "size INTEGER, "
+            "xt TEXT)"
+        )
+        conn.execute("CREATE INDEX idx_files_size ON files(size DESC)")
+        conn.execute("CREATE INDEX idx_files_xt_size ON files(xt, size DESC)")
+        total_used = sum(s for _, s in user_files)
+        rows = []
+        for p, s in user_files:
+            xt = os.path.splitext(p)[1][1:]
+            xt = xt.lower()
+            rows.append((
+                p,
+                int(s),
+                xt,
+            ))
+        if rows:
+            conn.executemany(
+                "INSERT INTO files(path, size, xt) VALUES (?, ?, ?)",
+                rows
+            )
+        conn.execute(
+            "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
+            (scan_result.timestamp, user, len(user_files), int(total_used)),
+        )
+        conn.commit()
+        conn.close()
+        return output_path
+
     # ------------------------------------------------------------------ #
     # Per-user detail reports (parallel)                                   #
     # ------------------------------------------------------------------ #
@@ -408,63 +583,24 @@ class ReportGenerator:
         # ── Directory detail report (always in-memory — bounded by dir count) ──
         dirs = [e for e in scan_result.top_dir if e['user'] == user]
         total_dir_used = sum(d['user_usage'] for d in dirs)
-        dir_path = self._get_user_detail_filename('detail_report_dir', user)
-        
-        # Ensure target directory exists
-        os.makedirs(os.path.dirname(dir_path), exist_ok=True)
-        
-        with open(dir_path, 'w', encoding='utf-8') as out:
-            meta = {
-                "_meta": {
-                    "date": scan_result.timestamp,
-                    "user": user,
-                    "total_dirs": len(dirs),
-                    "total_used": total_dir_used
-                }
-            }
-            out.write(json.dumps(meta, separators=(',', ':')) + '\n')
-            for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True):
-                line = {
-                    "path": d['dir'],
-                    "used": d['user_usage']
-                }
-                out.write(json.dumps(line, separators=(',', ':')) + '\n')
+        dir_path = self._get_user_detail_filename('detail_report_dir', user, ext='db')
+        self._write_dir_report_db(user, scan_result, dirs, dir_path, total_dir_used)
 
         # ── File detail report ────────────────────────────────────────────────
-        file_path = self._get_user_detail_filename('detail_report_file', user)
+        file_path = self._get_user_detail_filename('detail_report_file', user, ext='db')
 
         streaming = bool(scan_result.detail_tmpdir)
         if streaming:
             uids = [u for u, n in scan_result.detail_uid_username.items() if n == user]
             if uids:
-                self._stream_write_file_report(
-                    scan_result.detail_tmpdir, uids, user, file_path,
-                    scan_result.timestamp,
-                )
+                self._write_file_report_db_streaming(user, scan_result, file_path, uids)
             else:
                 print(f"  [warn] No UIDs found for user {user!r}, skipping file report")
                 file_path = ""
         else:
             # Legacy in-memory path
             user_files = scan_result.detail_files.get(user, [])
-            with open(file_path, 'w', encoding='utf-8') as out:
-                meta = {
-                    "_meta": {
-                        "date": scan_result.timestamp,
-                        "user": user,
-                        "total_files": len(user_files),
-                        "total_used": sum(s for _, s in user_files)
-                    }
-                }
-                out.write(json.dumps(meta, separators=(',', ':')) + '\n')
-                for p, s in user_files:
-                    xt = os.path.splitext(p)[1][1:]
-                    line = {
-                        "path": p,
-                        "size": s,
-                        "xt": xt
-                    }
-                    out.write(json.dumps(line, separators=(',', ':')) + '\n')
+            self._write_file_report_db_legacy(user, scan_result, file_path, user_files)
 
         return dir_path, file_path
 

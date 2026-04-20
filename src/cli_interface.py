@@ -68,7 +68,7 @@ class CLIInterface:
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
         report_group.add_argument("--check-users", metavar="USER", nargs="+",
-                                help="Display detail reports for specific user(s). Reads detail_report_dir and detail_report_file JSON files.")
+                                help="Display detail reports for specific user(s). Supports detail_report_dir/file in DB, NDJSON, or JSON.")
 
         # Report filtering options
         filter_group = parser.add_argument_group('Report Filtering Options')
@@ -233,16 +233,20 @@ class CLIInterface:
     ) -> None:
         """Display per-user detail reports (dir + file breakdown).
 
-        Locates JSON files inside the detail_users/ subdirectory:
-            {output_dir}/detail_users/{prefix}_detail_report_dir_{user}.json
-            {output_dir}/detail_users/{prefix}_detail_report_file_{user}.json
+        Locates detail files inside the detail_users/ subdirectory:
+            {output_dir}/detail_users/{prefix}_detail_report_dir_{user}.db|.ndjson|.json
+            {output_dir}/detail_users/{prefix}_detail_report_file_{user}.db|.ndjson|.json
         """
         detail_dir = os.path.join(output_dir, "detail_users")
 
         def _build_path(base: str, user: str) -> str:
             parts = [p for p in [prefix, base, user] if p]
-            fname = "_".join(parts) + ".json"
-            return os.path.join(detail_dir, fname)
+            stem = os.path.join(detail_dir, "_".join(parts))
+            for ext in [".db", ".ndjson", ".json"]:
+                candidate = stem + ext
+                if os.path.exists(candidate):
+                    return candidate
+            return ""
 
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}
@@ -251,13 +255,13 @@ class CLIInterface:
             dp = _build_path("detail_report_dir",  user)
             fp = _build_path("detail_report_file", user)
 
-            dir_files[user]  = dp if os.path.exists(dp) else None
-            file_files[user] = fp if os.path.exists(fp) else None
+            dir_files[user]  = dp if dp else None
+            file_files[user] = fp if fp else None
 
             if dir_files[user] is None:
-                print(f"Warning: dir detail not found for '{user}': {dp}")
+                print(f"Warning: dir detail not found for '{user}' in: {detail_dir}")
             if file_files[user] is None:
-                print(f"Warning: file detail not found for '{user}': {fp}")
+                print(f"Warning: file detail not found for '{user}' in: {detail_dir}")
 
         self.report_formatter.display_user_detail_reports(
             users, dir_files, file_files, top_files

@@ -620,6 +620,138 @@ fn merge_write_user_report(
     Ok((total_files, total_used))
 }
 
+fn _insert_user_file_batch(
+    conn: &mut Connection,
+    batch: &[(String, u64, String)]
+) -> Result<(), rusqlite::Error> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO files (path, size, xt) VALUES (?1, ?2, ?3)"
+        )?;
+        for (path, size, xt) in batch.iter() {
+            stmt.execute(params![path, size, xt])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[pyfunction]
+fn merge_write_user_report_db(
+    tmpdir: String,
+    uids: Vec<u32>,
+    username: String,
+    output_path: String,
+    timestamp: i64,
+    batch_size: Option<usize>,
+) -> PyResult<(u64, u64)> {
+    let bs = batch_size.unwrap_or(5000).max(1);
+
+    let mut chunk_files: Vec<String> = Vec::new();
+    for uid in uids {
+        chunk_files.extend(glob_module_rust(&tmpdir, uid)?);
+    }
+    chunk_files.sort();
+
+    if let Some(parent) = std::path::Path::new(&output_path).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", parent.display(), e)))?;
+    }
+
+    let mut conn = Connection::open(&output_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("open sqlite {}: {}", output_path, e)))?;
+
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = OFF;
+         PRAGMA cache_size = -20000;
+         PRAGMA temp_store = MEMORY;
+         DROP TABLE IF EXISTS meta;
+         DROP TABLE IF EXISTS files;
+         CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER);
+         CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            path TEXT,
+            size INTEGER,
+            xt TEXT
+         );"
+    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite setup failed: {}", e)))?;
+    let mut total_files: u64 = 0;
+    let mut total_used: u64 = 0;
+    let mut batch: Vec<(String, u64, String)> = Vec::with_capacity(bs);
+
+    if !chunk_files.is_empty() {
+        let mut readers: Vec<std::io::Lines<BufReader<fs::File>>> = Vec::new();
+        for path in &chunk_files {
+            let f = fs::File::open(path)
+                .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path, e)))?;
+            readers.push(BufReader::new(f).lines());
+        }
+
+        let mut heap: std::collections::BinaryHeap<(u64, String, usize)> =
+            std::collections::BinaryHeap::new();
+        for (idx, reader) in readers.iter_mut().enumerate() {
+            if let Some(Ok(line)) = reader.next() {
+                if let Some((size, path)) = parse_tsv_line(&line) {
+                    heap.push((size, path, idx));
+                }
+            }
+        }
+
+        while let Some((size, raw_path, idx)) = heap.pop() {
+            let safe = sanitise_path(&raw_path);
+            let xt = std::path::Path::new(&safe)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let xt = xt.to_ascii_lowercase();
+
+            batch.push((safe, size, xt));
+            total_files += 1;
+            total_used += size;
+
+            if batch.len() >= bs {
+                _insert_user_file_batch(&mut conn, &batch)
+                    .map_err(|e| PyRuntimeError::new_err(format!("sqlite batch insert failed: {}", e)))?;
+                batch.clear();
+            }
+
+            if let Some(Ok(line)) = readers[idx].next() {
+                if let Some((sz2, p2)) = parse_tsv_line(&line) {
+                    heap.push((sz2, p2, idx));
+                }
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        _insert_user_file_batch(&mut conn, &batch)
+            .map_err(|e| PyRuntimeError::new_err(format!("sqlite final insert failed: {}", e)))?;
+    }
+
+    conn.execute(
+        "INSERT INTO meta(date, user, total_items, total_used) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            timestamp,
+            sanitise_path(&username),
+            total_files as i64,
+            total_used as i64
+        ],
+    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite meta insert failed: {}", e)))?;
+
+    conn.execute_batch(
+        "CREATE INDEX idx_files_size ON files(size DESC);
+         CREATE INDEX idx_files_xt_size ON files(xt, size DESC);"
+    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite index creation failed: {}", e)))?;
+    Ok((total_files, total_used))
+}
+
 fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     let tab = line.find('\t')?;
     let size: u64 = line[..tab].trim().parse().ok()?;
@@ -735,6 +867,7 @@ fn write_shards_tsv_to_sqlite(tsv_path: String, db_path: String, batch_size: Opt
 fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_disk, m)?)?;
     m.add_function(wrap_pyfunction!(merge_write_user_report, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_write_user_report_db, m)?)?;
     m.add_function(wrap_pyfunction!(write_shards_tsv_to_sqlite, m)?)?;
     Ok(())
 }

@@ -4,6 +4,8 @@ Report Formatter Module
 Contains the ReportFormatter class for formatting and displaying reports.
 """
 
+import json
+import sqlite3
 from typing import Dict, Any, List, Optional, Tuple
 from src.utils import format_size, format_timestamp
 from src.formatters.base_formatter import BaseFormatter
@@ -238,10 +240,85 @@ class ReportFormatter(BaseFormatter):
         top_files: int = 30,
     ) -> None:
         """Load and render detail reports for multiple users."""
-        from src.utils import load_json_report
         for user in users:
             dir_path  = dir_files.get(user)
             file_path = file_files.get(user)
-            dir_data  = load_json_report(dir_path)  if dir_path  else None
-            file_data = load_json_report(file_path) if file_path else None
+            dir_data  = self._load_detail_report(dir_path, is_dir=True) if dir_path else None
+            file_data = self._load_detail_report(file_path, is_dir=False) if file_path else None
             self.display_user_detail_report(user, dir_data, file_data, top_files)
+
+    def _load_detail_report(self, path: str, is_dir: bool) -> Dict[str, Any]:
+        """Load detail report from DB, NDJSON, or legacy JSON and normalize shape."""
+        if path.endswith('.db'):
+            return self._load_detail_from_db(path, is_dir)
+        if path.endswith('.ndjson'):
+            return self._load_detail_from_ndjson(path, is_dir)
+
+        from src.utils import load_json_report
+        return load_json_report(path)
+
+    def _load_detail_from_db(self, path: str, is_dir: bool) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute(
+                "SELECT date, user, total_items, total_used FROM meta LIMIT 1"
+            ).fetchone()
+            if row:
+                data["date"] = int(row[0] or 0)
+                data["user"] = row[1] or ""
+                data["total_used"] = int(row[3] or 0)
+                if is_dir:
+                    data["total_dirs"] = int(row[2] or 0)
+                else:
+                    data["total_files"] = int(row[2] or 0)
+
+            if is_dir:
+                rows = conn.execute("SELECT path, used FROM dirs ORDER BY used DESC").fetchall()
+                data["dirs"] = [{"path": r[0], "used": int(r[1] or 0)} for r in rows]
+            else:
+                rows = conn.execute("SELECT path, size FROM files ORDER BY size DESC").fetchall()
+                data["files"] = [{"path": r[0], "size": int(r[1] or 0)} for r in rows]
+        finally:
+            conn.close()
+        return data
+
+    def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+
+                if "_meta" in obj:
+                    meta = obj.get("_meta") or {}
+                    data["date"] = int(meta.get("date", 0) or 0)
+                    data["user"] = meta.get("user", "")
+                    if is_dir:
+                        data["total_dirs"] = int(meta.get("total_dirs", 0) or 0)
+                        data["total_used"] = int(meta.get("total_used", 0) or 0)
+                    else:
+                        data["total_files"] = int(meta.get("total_files", 0) or 0)
+                        data["total_used"] = int(meta.get("total_used", 0) or 0)
+                    continue
+
+                if is_dir:
+                    p = obj.get("path")
+                    if p is not None:
+                        data.setdefault("dirs", []).append({
+                            "path": p,
+                            "used": int(obj.get("used", 0) or 0),
+                        })
+                else:
+                    p = obj.get("path")
+                    if p is not None:
+                        data.setdefault("files", []).append({
+                            "path": p,
+                            "size": int(obj.get("size", 0) or 0),
+                        })
+        return data
