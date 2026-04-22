@@ -201,7 +201,11 @@ def main():
             # TreeMap report runs after detail export (Phase 3)
             if getattr(args, 'tree_map', False):
                 level = getattr(args, 'level', 3)
-                report_generator.generate_tree_map(scan_results, level=level)
+                report_generator.generate_tree_map(
+                    scan_results,
+                    level=level,
+                    max_workers=scanner.max_workers,
+                )
 
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             total_elapsed = time.time() - run_started_at

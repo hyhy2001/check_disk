@@ -52,6 +52,8 @@ class ScanResult:
     # Streaming mode: temp dir + uid mapping populated instead of detail_files
     detail_tmpdir: str = ""
     detail_uid_username: Dict[int, str] = field(default_factory=dict)  # uid -> username
+    # TreeMap fast-path: dir -> {username -> direct_size}
+    dir_sizes_map: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 class DiskScanner:
@@ -103,7 +105,12 @@ class DiskScanner:
 
         print("Calling fast_scanner.scan_disk()...")
         start = time.time()
-        result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
+        # New Rust ABI supports max_workers as the 4th arg.
+        # Keep backward compatibility with old prebuilt .so.
+        try:
+            result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers)
+        except TypeError:
+            result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
         duration = time.time() - start
         
         from src.utils import get_username_from_uid, get_general_system_info, ScanHelper, format_time_duration, format_size
@@ -171,22 +178,67 @@ class DiskScanner:
         
         relevant_users = set(valid_users.keys()) | set(other_usage_results.keys())
 
-        # Merge by (dir_path, username) to avoid duplicate paths when multiple
-        # UIDs map to the same username (e.g. after UID rename/migration).
-        dir_by_user: dict = {}
-        for dir_path, user_sizes in result.get("dir_sizes", {}).items():
-            for uid_str, size in user_sizes.items():
-                uid = int(uid_str)
-                username = uid_cache[uid]
-                if username in relevant_users and size > 0:
-                    key = (dir_path, username)
-                    dir_by_user[key] = dir_by_user.get(key, 0) + size
+        # ── dir_sizes: read from streaming TSV files written by Rust scanner ──
+        # Each line: "<path>\t<uid>\t<size>"
+        # Multiple entries with same (path, uid) are aggregated via dir_sizes_map.
+        # dir_by_user and top_dir_list are intentionally removed: report_generator
+        # derives per-user directory lists directly from dir_sizes_map, saving ~2 GB RAM.
+        dir_tmpdir = result.get("dir_tmpdir", "") or result.get("detail_tmpdir", "")
+        dir_sizes_map: Dict[str, Dict[str, int]] = {}
 
-        top_dir_list = [
-            {"dir": dp, "user": un, "user_usage": sz}
-            for (dp, un), sz in dir_by_user.items()
-        ]
-        top_dir_list.sort(key=lambda x: x["user_usage"], reverse=True)
+        if dir_tmpdir:
+            dir_tsv_files = sorted(glob_module.glob(os.path.join(dir_tmpdir, "dirs_t*.tsv")))
+            for tsv_file in dir_tsv_files:
+                try:
+                    with open(tsv_file, encoding="utf-8", errors="surrogateescape") as fh:
+                        for line in fh:
+                            line = line.rstrip("\n")
+                            if not line:
+                                continue
+                            parts = line.split("\t", 2)
+                            if len(parts) != 3:
+                                continue
+                            dir_path, uid_raw, size_raw = parts
+                            try:
+                                uid = int(uid_raw)
+                                size = int(size_raw)
+                            except ValueError:
+                                continue
+                            if uid not in uid_cache:
+                                uid_cache[uid] = get_username_from_uid(uid)
+                            username = uid_cache[uid]
+                            if size > 0:
+                                by_user = dir_sizes_map.setdefault(dir_path, {})
+                                by_user[username] = by_user.get(username, 0) + size
+                except OSError:
+                    pass
+        else:
+            # Backward-compatible fallback: old Rust build returns dir_sizes_flat PyList
+            raw_dir_sizes_flat = result.pop("dir_sizes_flat", None)
+            raw_dir_sizes = result.pop("dir_sizes", {}) or {}
+            if raw_dir_sizes_flat is not None:
+                for row in raw_dir_sizes_flat:
+                    if not row or len(row) != 3:
+                        continue
+                    dir_path, uid_raw, size = row
+                    uid = int(uid_raw)
+                    if uid not in uid_cache:
+                        uid_cache[uid] = get_username_from_uid(uid)
+                    username = uid_cache[uid]
+                    if size > 0:
+                        by_user = dir_sizes_map.setdefault(dir_path, {})
+                        by_user[username] = by_user.get(username, 0) + size
+            else:
+                for dir_path, user_sizes in raw_dir_sizes.items():
+                    by_user = dir_sizes_map.setdefault(dir_path, {})
+                    for uid_str, size in user_sizes.items():
+                        uid = int(uid_str)
+                        if uid not in uid_cache:
+                            uid_cache[uid] = get_username_from_uid(uid)
+                        username = uid_cache[uid]
+                        if size > 0:
+                            by_user[username] = by_user.get(username, 0) + size
+
         
         # Build permission_issues in the same nested format as Python legacy
         rust_perm_flat = result.get("permission_issues", [])
@@ -245,11 +297,12 @@ class DiskScanner:
             user_usage=user_list,
             other_usage=other_list,
             timestamp=int(time.time()),
-            top_dir=top_dir_list,
+            top_dir=[],  # deprecated — derive from dir_sizes_map instead
             permission_issues=perm_formatted,
             user_inodes=user_inode_list,
             detail_tmpdir=result.get("detail_tmpdir", ""),
-            detail_uid_username=uid_cache
+            detail_uid_username=uid_cache,
+            dir_sizes_map=dir_sizes_map,
         )
 
 

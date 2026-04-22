@@ -256,7 +256,12 @@ class ReportGenerator:
     # TreeMap report                                                       #
     # ------------------------------------------------------------------ #
 
-    def generate_tree_map(self, scan_result: ScanResult, level: int = 3) -> str:
+    def generate_tree_map(
+        self,
+        scan_result: ScanResult,
+        level: int = 3,
+        max_workers: Optional[int] = None,
+    ) -> str:
         """
         Generate a TreeMap JSON report for directory visualization.
 
@@ -269,25 +274,37 @@ class ReportGenerator:
         """
         # Resolve output path
         output_path = self._get_output_filename("tree_map_report")
-        
-        # Build dir_sizes map from top_dir if not directly available in scan_result
-        # TreeMapGenerator expects Dict[str, Dict[str, int]]
-        dir_sizes_map = {}
-        for entry in scan_result.top_dir:
-            d = entry['dir']
-            u = entry['user']
-            s = entry['user_usage']
-            if d not in dir_sizes_map:
-                dir_sizes_map[d] = {}
-            dir_sizes_map[d][u] = s
+
+        # Prefer direct map produced by scanner to avoid re-materializing
+        # from top_dir (saves Phase-3 memory/CPU on very large scans).
+        dir_sizes_map = scan_result.dir_sizes_map if scan_result.dir_sizes_map else {}
+        if not dir_sizes_map:
+            # Backward-compatible fallback path
+            for entry in scan_result.top_dir:
+                d = entry['dir']
+                u = entry['user']
+                s = entry['user_usage']
+                if d not in dir_sizes_map:
+                    dir_sizes_map[d] = {}
+                dir_sizes_map[d][u] = dir_sizes_map[d].get(u, 0) + s
+
+        # Build dir_owner_map: path -> dominant user (by size) from Phase 1 data.
+        # This lets Phase 3 skip os.stat() syscalls entirely.
+        dir_owner_map: Dict[str, str] = {}
+        for dpath, user_sizes in dir_sizes_map.items():
+            if user_sizes:
+                dir_owner_map[os.path.abspath(dpath)] = max(user_sizes, key=user_sizes.get)
+
+        tree_workers = int(max_workers if max_workers is not None else self.config.get("workers", 4))
 
         generator = TreeMapGenerator(
             root_dir=self.config.get("directory", "/"),
             dir_sizes=dir_sizes_map,
             max_level=level,
-            max_workers=self.config.get("workers", 4)
+            max_workers=max(1, tree_workers),
+            dir_owner_map=dir_owner_map,
         )
-        
+
         generator.save(output_path)
         return output_path
 
@@ -400,42 +417,160 @@ class ReportGenerator:
         output_path: str,
         total_dir_used: int,
     ) -> str:
-        """Write per-user directory detail report as SQLite DB."""
+        """Write per-user directory detail.
+
+        Preferred (combined) path: appends dirs_data + VIEW dirs + meta_dirs
+        into the sibling file_db, reusing its dirs_index — no redundant paths.
+
+        Fallback (standalone) path: legacy separate DB with full paths stored.
+        Returns '' when combined mode succeeds (no standalone file created).
+        """
+        # Try combined mode: append dirs into the sibling file_db.
+        sibling = output_path.replace("detail_report_dir_", "detail_report_file_", 1)
+        if sibling != output_path and os.path.isfile(sibling):
+            try:
+                if self._write_dirs_into_file_db(user, scan_result, dirs, sibling, total_dir_used):
+                    return ""  # combined success — no standalone dir file needed
+            except Exception as e:
+                print(f"  [warn] Combined dir merge failed for {user!r}: {e}")
+
+        # Fallback: standalone dirs DB with full paths (legacy schema).
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         if os.path.exists(output_path):
             os.remove(output_path)
-
         conn = sqlite3.connect(output_path)
+        conn.execute("PRAGMA page_size = 8192")
         conn.execute("PRAGMA journal_mode = OFF")
         conn.execute("PRAGMA synchronous = OFF")
         conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
-        conn.execute(
-            "CREATE TABLE dirs ("
-            "id INTEGER PRIMARY KEY, "
-            "path TEXT, "
-            "used INTEGER)"
-        )
-        conn.execute("CREATE INDEX idx_dirs_used ON dirs(used DESC)")
+        conn.execute("CREATE TABLE dirs (id INTEGER PRIMARY KEY, path TEXT, used INTEGER)")
         conn.execute(
             "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
             (scan_result.timestamp, user, len(dirs), int(total_dir_used)),
         )
-
-        rows = []
-        for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True):
-            p = d['dir']
-            rows.append((
-                p,
-                int(d['user_usage']),
-            ))
+        rows = [(d['dir'], int(d['user_usage'])) for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True)]
         if rows:
-            conn.executemany(
-                "INSERT INTO dirs(path, used) VALUES (?, ?)",
-                rows
-            )
+            conn.executemany("INSERT INTO dirs(path, used) VALUES (?, ?)", rows)
         conn.commit()
         conn.close()
         return output_path
+
+    def _write_dirs_into_file_db(
+        self,
+        user: str,
+        scan_result: ScanResult,
+        dirs: List[Dict[str, Any]],
+        file_db_path: str,
+        total_dir_used: int,
+    ) -> bool:
+        """Append dirs_data + VIEW dirs + meta_dirs to the existing combined file_db.
+
+        The combined file_db (written by Rust) contains a dirs_index table mapping
+        id → path.  dirs_data stores only (dir_id, used) integer pairs, sharing
+        that index — zero redundant path strings for dir entries.
+
+        Returns True on success; False when file_db lacks dirs_index (old schema).
+        """
+        conn = sqlite3.connect(file_db_path)
+        try:
+            # Only proceed when Rust/new-schema file_db has dirs_index.
+            has_idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dirs_index'"
+            ).fetchone() is not None
+            if not has_idx:
+                return False
+
+            conn.execute("PRAGMA journal_mode = OFF")
+            conn.execute("PRAGMA synchronous = OFF")
+
+            # dirs_data: integer-only table sharing dirs_index for path storage.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS dirs_data "
+                "(dir_id INTEGER PRIMARY KEY, used INTEGER NOT NULL)"
+            )
+
+            # VIEW dirs: exposes (path, used) for backward-compat PHP queries.
+            conn.execute(
+                "CREATE VIEW IF NOT EXISTS dirs AS "
+                "SELECT di.path AS path, dd.used AS used "
+                "FROM dirs_data dd "
+                "JOIN dirs_index di ON dd.dir_id = di.id"
+            )
+
+            # meta_dirs: dirs-specific metadata, separate from files meta.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS meta_dirs "
+                "(date INTEGER, user TEXT, total_dirs INTEGER, total_used INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO meta_dirs(date, user, total_dirs, total_used) VALUES (?, ?, ?, ?)",
+                (scan_result.timestamp, user, len(dirs), int(total_dir_used)),
+            )
+
+            # Sort by used DESC (consistent with old standalone schema ordering).
+            dir_rows = [
+                (d['dir'], int(d['user_usage']))
+                for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True)
+            ]
+
+            # Ensure all dir paths exist in dirs_index (covers empty dirs).
+            conn.executemany(
+                "INSERT OR IGNORE INTO dirs_index(path) VALUES (?)",
+                [(p,) for p, _ in dir_rows],
+            )
+
+            # Bulk insert via temp table JOIN — avoids N individual path lookups.
+            conn.execute("CREATE TEMP TABLE _dt (path TEXT, used INTEGER)")
+            conn.executemany("INSERT INTO _dt VALUES (?, ?)", dir_rows)
+            conn.execute(
+                "INSERT OR REPLACE INTO dirs_data(dir_id, used) "
+                "SELECT di.id, t.used FROM _dt t "
+                "JOIN dirs_index di ON di.path = t.path"
+            )
+            conn.execute("DROP TABLE _dt")
+            conn.commit()
+
+            # ── Critical performance indexes ──────────────────────────────────
+            # Built AFTER bulk insert (much faster than maintaining during inserts).
+            # idx_dirs_data_used: ORDER BY dd.used DESC → only reads N rows, no temp sort.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dirs_data_used ON dirs_data(used DESC)"
+            )
+            # idx_files_data_size: ORDER BY fd.size DESC → only reads N rows, no temp sort.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_data_size ON files_data(size DESC)"
+            )
+            conn.commit()
+
+            # ── FTS4 full-text search indexes ─────────────────────────────────
+            # Use FTS4 (not FTS5) so PHP's bundled SQLite 3.8.x can read the tables.
+            # Both versions share the same FTS4 segment format (verified compatible).
+            #
+            # fts_dirs: content-table mode → inverted index only, no path duplication.
+            # fts_files: stores di.path || '/' || fd.basename for full-path search.
+            try:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS fts_dirs USING fts4("
+                    "path, content='dirs_index', tokenize='unicode61')"
+                )
+                conn.execute(
+                    "INSERT INTO fts_dirs(docid, path) SELECT id, path FROM dirs_index"
+                )
+                conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS fts_files USING fts4("
+                    "fullpath, tokenize='unicode61')"
+                )
+                conn.execute(
+                    "INSERT INTO fts_files(docid, fullpath) "
+                    "SELECT fd.id, di.path || '/' || fd.basename "
+                    "FROM files_data fd JOIN dirs_index di ON fd.dir_id = di.id"
+                )
+                conn.commit()
+            except Exception:
+                pass  # FTS4 unavailable → PHP falls back to LIKE automatically
+            return True
+        finally:
+            conn.close()
 
     def _write_file_report_db_streaming(
         self,
@@ -464,6 +599,7 @@ class ReportGenerator:
             os.remove(output_path)
 
         conn = sqlite3.connect(output_path)
+        conn.execute("PRAGMA page_size = 8192")  # Fix 2: fresh file, set before any DDL
         conn.execute("PRAGMA journal_mode = OFF")
         conn.execute("PRAGMA synchronous = OFF")
         conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
@@ -474,7 +610,7 @@ class ReportGenerator:
             "size INTEGER, "
             "xt TEXT)"
         )
-        conn.execute("CREATE INDEX idx_files_size ON files(size DESC)")
+        # Fix 1: idx_files_size removed; rows merge in size DESC order
         conn.execute("CREATE INDEX idx_files_xt_size ON files(xt, size DESC)")
         total_files = 0
         total_used = 0
@@ -524,6 +660,7 @@ class ReportGenerator:
             os.remove(output_path)
 
         conn = sqlite3.connect(output_path)
+        conn.execute("PRAGMA page_size = 8192")  # Fix 2
         conn.execute("PRAGMA journal_mode = OFF")
         conn.execute("PRAGMA synchronous = OFF")
         conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
@@ -534,7 +671,7 @@ class ReportGenerator:
             "size INTEGER, "
             "xt TEXT)"
         )
-        conn.execute("CREATE INDEX idx_files_size ON files(size DESC)")
+        # Fix 1: idx_files_size removed; legacy list is pre-sorted by size DESC
         conn.execute("CREATE INDEX idx_files_xt_size ON files(xt, size DESC)")
         total_used = sum(s for _, s in user_files)
         rows = []
@@ -563,7 +700,12 @@ class ReportGenerator:
     # Per-user detail reports (parallel)                                   #
     # ------------------------------------------------------------------ #
 
-    def _write_user_detail(self, user: str, scan_result: ScanResult) -> Tuple[str, str]:
+    def _write_user_detail(
+        self,
+        user: str,
+        scan_result: ScanResult,
+        user_dirs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, str]:
         """
         Write directory + file detail JSON reports for a single user.
 
@@ -580,18 +722,21 @@ class ReportGenerator:
             Tuple (dir_path, file_path) of written files.
             Either element may be empty-string if that report was skipped.
         """
-        # ── Directory detail report (always in-memory — bounded by dir count) ──
-        dirs = [e for e in scan_result.top_dir if e['user'] == user]
+        # ── Gather dir data (collected before writing; used after file_db exists) ─
+        dirs = user_dirs if user_dirs is not None else [e for e in scan_result.top_dir if e['user'] == user]
         total_dir_used = sum(d['user_usage'] for d in dirs)
-        dir_path = self._get_user_detail_filename('detail_report_dir', user, ext='db')
-        self._write_dir_report_db(user, scan_result, dirs, dir_path, total_dir_used)
 
-        # ── File detail report ────────────────────────────────────────────────
+        # ── File detail report FIRST — combined mode appends dirs into this DB ─
         file_path = self._get_user_detail_filename('detail_report_file', user, ext='db')
-
         streaming = bool(scan_result.detail_tmpdir)
         if streaming:
-            uids = [u for u, n in scan_result.detail_uid_username.items() if n == user]
+            # user key is either a real username ('nobody', 'mysql') or 'uid-{num}' for unknowns.
+            # Fast path: uid-{num} format → parse directly.
+            # Slow path: real username → reverse-scan uid_cache.
+            if user.startswith("uid-") and user[4:].isdigit():
+                uids = [int(user[4:])]
+            else:
+                uids = [u for u, n in scan_result.detail_uid_username.items() if n == user]
             if uids:
                 self._write_file_report_db_streaming(user, scan_result, file_path, uids)
             else:
@@ -601,6 +746,10 @@ class ReportGenerator:
             # Legacy in-memory path
             user_files = scan_result.detail_files.get(user, [])
             self._write_file_report_db_legacy(user, scan_result, file_path, user_files)
+
+        # ── Directory detail report — tries combined append into file_db first ─
+        dir_path = self._get_user_detail_filename('detail_report_dir', user, ext='db')
+        self._write_dir_report_db(user, scan_result, dirs, dir_path, total_dir_used)
 
         return dir_path, file_path
 
@@ -628,7 +777,13 @@ class ReportGenerator:
         Returns:
             Sorted list of created file paths.
         """
-        users = sorted({entry['user'] for entry in scan_result.top_dir})
+        # Build per-user dir list from dir_sizes_map (top_dir is deprecated).
+        # This avoids a redundant data structure that cost ~2 GB RAM.
+        user_dirs_map: Dict[str, List[Dict[str, Any]]] = {}
+        for dpath, user_sizes in scan_result.dir_sizes_map.items():
+            for user, size in user_sizes.items():
+                user_dirs_map.setdefault(user, []).append({'dir': dpath, 'user_usage': size})
+        users = sorted(user_dirs_map.keys())
 
         if not users:
             print("No users found in scan results — nothing to generate.")
@@ -645,9 +800,12 @@ class ReportGenerator:
         total_users = len(users)
         completed = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Phase 2 is I/O-bound (reading TSV chunks + writing SQLite).
+        # Capping at 4 threads avoids disk thrashing when max_workers is high.
+        effective_workers = max(1, min(int(max_workers), 4))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = {
-                executor.submit(self._write_user_detail, u, scan_result): u
+                executor.submit(self._write_user_detail, u, scan_result, user_dirs_map.get(u, [])): u
                 for u in users
             }
             for fut in as_completed(futures):

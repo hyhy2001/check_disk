@@ -3,7 +3,8 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::exceptions::PyRuntimeError;
 use ignore::{WalkBuilder, WalkState};
 use rusqlite::{Connection, params};
-use std::collections::{HashMap, HashSet};
+use dashmap::DashSet;
+use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::fs;
 use std::io::{Write, BufWriter};
@@ -11,6 +12,9 @@ use std::time::{Instant, Duration};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use rayon::prelude::*;
 
 // Same list as Python's critical_skip_dirs
 const CRITICAL_SKIP_NAMES: &[&str] = &[
@@ -18,6 +22,10 @@ const CRITICAL_SKIP_NAMES: &[&str] = &[
     "proc", "sys", "dev",
     ".nfs",
 ];
+/// Max in-memory file entries per UID buffer before flushing to disk.
+const DETAIL_FLUSH_THRESHOLD: usize = 50_000;
+/// Max in-memory dir-size entries per thread buffer before flushing to disk.
+const DIR_FLUSH_THRESHOLD: usize = 50_000;
 
 fn format_num(mut n: u64) -> String {
     if n == 0 { return "0".to_string(); }
@@ -77,7 +85,7 @@ struct GlobalStats {
     total_size: u64,
     uid_sizes: HashMap<u32, u64>,
     uid_files: HashMap<u32, u64>,
-    dir_sizes: HashMap<String, HashMap<u32, u64>>,
+    // dir_sizes removed — streamed to per-thread TSV files to bound peak RAM
     permission_issues: Vec<(String, String, String, Option<u32>)>, // (path, kind, error, uid)
 }
 
@@ -91,7 +99,9 @@ struct ThreadLocalState {
     t_size: u64,
     t_uid_sizes: HashMap<u32, u64>,
     t_uid_files: HashMap<u32, u64>,
-    t_dir_sizes: HashMap<String, HashMap<u32, u64>>,
+    /// Streaming dir-size buffer: (path, uid, size) flushed to TSV when full
+    t_dir_buf: Vec<(String, u32, u64)>,
+    t_dir_flush_count: u32,
     t_uid_buffers: HashMap<u32, Vec<(String, u64)>>,
     t_flush_counts: HashMap<u32, u32>,
     t_perm_issues: Vec<(String, String, String, Option<u32>)>,
@@ -106,7 +116,7 @@ struct ThreadLocalState {
 
 impl Drop for ThreadLocalState {
     fn drop(&mut self) {
-        // 1. Flush remaining buffers
+        // 1. Flush remaining file-detail buffers
         for (uid, buf) in self.t_uid_buffers.iter_mut() {
             if buf.is_empty() { continue; }
             let count = self.t_flush_counts.entry(*uid).or_insert(0);
@@ -120,9 +130,26 @@ impl Drop for ThreadLocalState {
                 }
             }
             buf.clear();
+            if buf.capacity() > DETAIL_FLUSH_THRESHOLD * 2 {
+                buf.shrink_to_fit();
+            }
         }
 
-        // 2. Merge into global state
+        // 2. Flush remaining dir-size buffer to TSV (streaming — avoids keeping in GlobalStats)
+        if !self.t_dir_buf.is_empty() {
+            self.t_dir_flush_count += 1;
+            let fp = format!("{}/dirs_t{}_c{}.tsv", self.tmpdir, self.thread_id, self.t_dir_flush_count);
+            if let Ok(f) = fs::File::create(&fp) {
+                let mut w = BufWriter::new(f);
+                for (path, uid, size) in self.t_dir_buf.iter() {
+                    let _ = writeln!(w, "{}\t{}\t{}", path, uid, size);
+                }
+            }
+            self.t_dir_buf.clear();
+            self.t_dir_buf.shrink_to_fit();
+        }
+
+        // 3. Merge scalar stats into global state
         if let Ok(mut g) = self.global_stats.lock() {
             g.total_files += self.t_files;
             g.total_dirs  += self.t_dirs;
@@ -134,29 +161,30 @@ impl Drop for ThreadLocalState {
             for (uid, files) in &self.t_uid_files {
                 *g.uid_files.entry(*uid).or_insert(0) += files;
             }
-            for (dir, user_map) in &self.t_dir_sizes {
-                let gm = g.dir_sizes.entry(dir.clone()).or_insert_with(HashMap::new);
-                for (uid, size) in user_map {
-                    *gm.entry(*uid).or_insert(0) += size;
-                }
-            }
             g.permission_issues.extend(self.t_perm_issues.drain(..));
         }
     }
 }
 
 #[pyfunction]
-fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids: Option<Vec<u32>>) -> PyResult<PyObject> {
+fn scan_disk(
+    py: Python,
+    directory: String,
+    skip_dirs: Vec<String>,
+    target_uids: Option<Vec<u32>>,
+    max_workers: Option<usize>,
+) -> PyResult<PyObject> {
     let _tmpdir = tempfile::Builder::new()
         .prefix("checkdisk_rust_")
         .tempdir()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let tmpdir_str = _tmpdir.path().to_string_lossy().to_string();
-    let _ = _tmpdir.into_path(); // leak — Python cleans up later
+    let _ = _tmpdir.keep(); // persist tmp dir; Python side cleans up later
 
     let global_stats = Arc::new(Mutex::new(GlobalStats {
         total_files: 0, total_dirs: 0, total_inodes: 0, total_size: 0,
-        uid_sizes: HashMap::new(), uid_files: HashMap::new(), dir_sizes: HashMap::new(),
+        uid_sizes: HashMap::new(), uid_files: HashMap::new(),
+        // dir_sizes removed — streamed to per-thread TSV files
         permission_issues: Vec::new(),
     }));
     let prog_files = Arc::new(AtomicU64::new(0));
@@ -177,13 +205,15 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     let tmpdir_clone = tmpdir_str.clone();
 
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let threads_count = 16.max(cpus * 4);
+    // Keep a sane default and let CLI max_workers override explicitly.
+    let default_threads = (cpus * 2).clamp(4, 32);
+    let threads_count = max_workers.unwrap_or(default_threads).max(1);
     let thread_counter = Arc::new(AtomicUsize::new(0));
     let target_uids_shared = Arc::new(target_uids);
-    // Shared cross-worker hard-link deduplication (equivalent to Python's inode_lock + hardlink_inodes)
-    let hardlink_inodes: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
-    // Shared directory loop/bind-mount deduplication
-    let visited_dirs: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Shared cross-worker hard-link deduplication — DashSet avoids Mutex bottleneck
+    let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
+    // Shared directory loop/bind-mount deduplication — DashSet (16 shards by default)
+    let visited_dirs: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
 
     let _walk_thread = thread::spawn(move || {
         WalkBuilder::new(&dir_clone)
@@ -200,7 +230,8 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                     t_files: 0, t_dirs: 0, t_inodes: 0, t_size: 0,
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
-                    t_dir_sizes: HashMap::new(),
+                    t_dir_buf: Vec::new(),
+                    t_dir_flush_count: 0,
                     t_uid_buffers: HashMap::new(),
                     t_flush_counts: HashMap::new(),
                     t_perm_issues: Vec::new(),
@@ -245,11 +276,10 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                     };
 
                     let path = entry.path();
-                    let path_str = path.to_string_lossy().into_owned();
 
                     // --- Configured skip_dirs (prefix match — prunes whole subtree) ---
                     for s in &skips {
-                        if path_str.starts_with(s.as_str()) {
+                        if path.starts_with(s) {
                             return WalkState::Skip;
                         }
                     }
@@ -295,7 +325,8 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             }
 
                             let key = (meta.ino(), meta.dev());
-                            if !visited_dirs_shared.lock().unwrap().insert(key) {
+                            // DashSet.insert() returns false when key already exists
+                            if !visited_dirs_shared.insert(key) {
                                 return WalkState::Skip;
                             }
 
@@ -316,7 +347,7 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             Err(e) => {
                                 let uid_opt = fs::symlink_metadata(path).map(|m| m.uid()).ok();
                                 state.t_perm_issues.push((
-                                    path_str,
+                                    path.to_string_lossy().into_owned(),
                                     "file".to_string(),
                                     e.to_string(),
                                     uid_opt,
@@ -325,11 +356,10 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             }
                         };
 
-                        // --- Hard-link deduplication (shared across all workers, like Python inode_lock) ---
+                        // --- Hard-link deduplication ---
                         if meta.nlink() > 1 {
                             let key = (meta.ino(), meta.dev());
-                            let mut seen = hardlinks_shared.lock().unwrap();
-                            if !seen.insert(key) { return WalkState::Continue; }
+                            if !hardlinks_shared.insert(key) { return WalkState::Continue; }
                         }
 
                         // st_blocks * 512 = actual on-disk bytes, same as Python legacy
@@ -349,20 +379,33 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                             *state.t_uid_files.entry(uid).or_insert(0) += 1;
 
                             // Attribute size to direct parent dir only (flat, matches Python legacy)
-                            // Python: dir_sizes[current_dir] = sizes of files DIRECTLY inside it
+                            // Stream to TSV file: (path, uid, size) — never accumulate in GlobalStats
                             if let Some(parent) = path.parent() {
                                 if parent.starts_with(&dir) {
                                     let parent_str = parent.to_string_lossy().into_owned();
-                                    *state.t_dir_sizes
-                                        .entry(parent_str).or_insert_with(HashMap::new)
-                                        .entry(uid).or_insert(0) += size;
+                                    state.t_dir_buf.push((parent_str, uid, size));
+                                    if state.t_dir_buf.len() >= DIR_FLUSH_THRESHOLD {
+                                        state.t_dir_flush_count += 1;
+                                        let fp = format!("{}/dirs_t{}_c{}.tsv",
+                                            state.tmpdir, state.thread_id, state.t_dir_flush_count);
+                                        if let Ok(f) = fs::File::create(&fp) {
+                                            let mut w = BufWriter::new(f);
+                                            for (dp, du, ds) in state.t_dir_buf.iter() {
+                                                let _ = writeln!(w, "{}\t{}\t{}", dp, du, ds);
+                                            }
+                                        }
+                                        state.t_dir_buf.clear();
+                                        if state.t_dir_buf.capacity() > DIR_FLUSH_THRESHOLD * 2 {
+                                            state.t_dir_buf.shrink_to_fit();
+                                        }
+                                    }
                                 }
                             }
 
                             // Streaming TSV buffer (same as Python's DETAIL_FLUSH_THRESHOLD)
                             let buf = state.t_uid_buffers.entry(uid).or_insert_with(Vec::new);
-                            buf.push((path_str, size));
-                            if buf.len() >= 500_000 {
+                            buf.push((path.to_string_lossy().into_owned(), size));
+                            if buf.len() >= DETAIL_FLUSH_THRESHOLD {
                                 let count = state.t_flush_counts.entry(uid).or_insert(0);
                                 *count += 1;
                                 buf.sort_by(|a, b| b.1.cmp(&a.1));
@@ -375,6 +418,9 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
                                     }
                                 }
                                 buf.clear();
+                                if buf.capacity() > DETAIL_FLUSH_THRESHOLD * 2 {
+                                    buf.shrink_to_fit();
+                                }
                             }
                         }
 
@@ -429,6 +475,9 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     result.set_item("total_inodes", g.total_inodes)?;
     result.set_item("total_size",   g.total_size)?;
     result.set_item("detail_tmpdir", &tmpdir_str)?;
+    // dir_sizes are streamed to dirs_t*.tsv files inside detail_tmpdir
+    // Python reads them directly — no huge PyList copy needed
+    result.set_item("dir_tmpdir", &tmpdir_str)?;
 
     let py_uid = PyDict::new(py);
     for (uid, size) in &g.uid_sizes { py_uid.set_item(uid, size)?; }
@@ -437,14 +486,6 @@ fn scan_disk(py: Python, directory: String, skip_dirs: Vec<String>, target_uids:
     let py_uid_files = PyDict::new(py);
     for (uid, files) in &g.uid_files { py_uid_files.set_item(uid, files)?; }
     result.set_item("uid_files", py_uid_files)?;
-
-    let py_dir = PyDict::new(py);
-    for (dir, user_map) in &g.dir_sizes {
-        let m = PyDict::new(py);
-        for (uid, size) in user_map { m.set_item(uid, size)?; }
-        py_dir.set_item(dir, m)?;
-    }
-    result.set_item("dir_sizes", py_dir)?;
 
     // permission_issues as list of dicts (path, type, error, uid)
     let py_perms = PyList::empty(py);
@@ -620,42 +661,36 @@ fn merge_write_user_report(
     Ok((total_files, total_used))
 }
 
-fn _insert_user_file_batch(
-    conn: &mut Connection,
-    batch: &[(String, u64, String)]
-) -> Result<(), rusqlite::Error> {
-    if batch.is_empty() {
-        return Ok(());
-    }
 
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO files (path, size, xt) VALUES (?1, ?2, ?3)"
-        )?;
-        for (path, size, xt) in batch.iter() {
-            stmt.execute(params![path, size, xt])?;
-        }
+/// Insert a batch of (dir_id, basename, size, xt) rows into files_data.
+/// Called within an explicit BEGIN...COMMIT transaction for bulk performance.
+fn _insert_file_batch_compressed(
+    conn: &Connection,
+    batch: &[(i64, String, u64, String)],
+) -> Result<(), rusqlite::Error> {
+    if batch.is_empty() { return Ok(()); }
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO files_data (dir_id, basename, size, xt) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (dir_id, basename, size, xt) in batch.iter() {
+        stmt.execute(params![dir_id, basename, *size as i64, xt])?;
     }
-    tx.commit()?;
     Ok(())
 }
 
 #[pyfunction]
 fn merge_write_user_report_db(
-    tmpdir: String,
-    uids: Vec<u32>,
-    username: String,
+    tmpdir:      String,
+    uids:        Vec<u32>,
+    username:    String,
     output_path: String,
-    timestamp: i64,
-    batch_size: Option<usize>,
+    timestamp:   i64,
+    batch_size:  Option<usize>,
 ) -> PyResult<(u64, u64)> {
     let bs = batch_size.unwrap_or(5000).max(1);
 
     let mut chunk_files: Vec<String> = Vec::new();
-    for uid in uids {
-        chunk_files.extend(glob_module_rust(&tmpdir, uid)?);
-    }
+    for uid in uids { chunk_files.extend(glob_module_rust(&tmpdir, uid)?); }
     chunk_files.sort();
 
     if let Some(parent) = std::path::Path::new(&output_path).parent() {
@@ -663,27 +698,42 @@ fn merge_write_user_report_db(
             .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", parent.display(), e)))?;
     }
 
-    let mut conn = Connection::open(&output_path)
+    // PRAGMA page_size only applies to a brand-new file — delete before open.
+    let _ = fs::remove_file(&output_path);
+
+    let conn = Connection::open(&output_path)
         .map_err(|e| PyRuntimeError::new_err(format!("open sqlite {}: {}", output_path, e)))?;
 
+    // Fix 2: page_size=8192 on fresh file — better B-tree fit for long TEXT paths.
+    // Fix 3: dirs_index deduplicates path prefixes; VIEW 'files' keeps frontend compat.
     conn.execute_batch(
-        "PRAGMA journal_mode = OFF;
+        "PRAGMA page_size = 8192;
+         PRAGMA journal_mode = OFF;
          PRAGMA synchronous = OFF;
          PRAGMA cache_size = -20000;
          PRAGMA temp_store = MEMORY;
-         DROP TABLE IF EXISTS meta;
-         DROP TABLE IF EXISTS files;
          CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER);
-         CREATE TABLE files (
-            id INTEGER PRIMARY KEY,
-            path TEXT,
-            size INTEGER,
-            xt TEXT
-         );"
-    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite setup failed: {}", e)))?;
+         CREATE TABLE dirs_index (
+             id   INTEGER PRIMARY KEY,
+             path TEXT UNIQUE
+         );
+         CREATE TABLE files_data (
+             id       INTEGER PRIMARY KEY,
+             dir_id   INTEGER NOT NULL,
+             basename TEXT    NOT NULL,
+             size     INTEGER NOT NULL,
+             xt       TEXT
+         );
+         CREATE VIEW files AS
+             SELECT f.id, d.path || '/' || f.basename AS path, f.size, f.xt
+             FROM   files_data f JOIN dirs_index d ON f.dir_id = d.id;",
+    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite setup: {}", e)))?;
+
     let mut total_files: u64 = 0;
-    let mut total_used: u64 = 0;
-    let mut batch: Vec<(String, u64, String)> = Vec::with_capacity(bs);
+    let mut total_used:  u64 = 0;
+    // dir path → rowid cache: avoids re-INSERT + re-SELECT for the same directory
+    let mut dir_cache: HashMap<String, i64> = HashMap::with_capacity(50_000);
+    let mut file_batch: Vec<(i64, String, u64, String)> = Vec::with_capacity(bs);
 
     if !chunk_files.is_empty() {
         let mut readers: Vec<std::io::Lines<BufReader<fs::File>>> = Vec::new();
@@ -703,54 +753,71 @@ fn merge_write_user_report_db(
             }
         }
 
+        // Single ongoing transaction; commit every `bs` rows to bound in-memory usage.
+        conn.execute_batch("BEGIN")
+            .map_err(|e| PyRuntimeError::new_err(format!("BEGIN: {}", e)))?;
+
         while let Some((size, raw_path, idx)) = heap.pop() {
-            let safe = sanitise_path(&raw_path);
-            let xt = std::path::Path::new(&safe)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let xt = xt.to_ascii_lowercase();
+            let safe     = sanitise_path(&raw_path);
+            let path_ref = std::path::Path::new(&safe);
 
-            batch.push((safe, size, xt));
+            let dir_str  = path_ref.parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
+            let basename = path_ref.file_name().and_then(|n| n.to_str()).unwrap_or(&safe).to_string();
+            let xt       = path_ref.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+
+            // Get or create dir_id — only INSERT on cache miss; use last_insert_rowid() for speed.
+            let dir_id = match dir_cache.get(&dir_str) {
+                Some(&id) => id,
+                None => {
+                    conn.execute("INSERT INTO dirs_index (path) VALUES (?1)", params![&dir_str])
+                        .map_err(|e| PyRuntimeError::new_err(format!("dir insert: {}", e)))?;
+                    let id = conn.last_insert_rowid();
+                    dir_cache.insert(dir_str, id);
+                    id
+                }
+            };
+
+            file_batch.push((dir_id, basename, size, xt));
             total_files += 1;
-            total_used += size;
+            total_used  += size;
 
-            if batch.len() >= bs {
-                _insert_user_file_batch(&mut conn, &batch)
-                    .map_err(|e| PyRuntimeError::new_err(format!("sqlite batch insert failed: {}", e)))?;
-                batch.clear();
+            if file_batch.len() >= bs {
+                _insert_file_batch_compressed(&conn, &file_batch)
+                    .map_err(|e| PyRuntimeError::new_err(format!("file batch insert: {}", e)))?;
+                file_batch.clear();
+                // Periodic commit keeps memory bounded; immediately reopen transaction.
+                conn.execute_batch("COMMIT; BEGIN")
+                    .map_err(|e| PyRuntimeError::new_err(format!("COMMIT/BEGIN: {}", e)))?;
             }
 
             if let Some(Ok(line)) = readers[idx].next() {
-                if let Some((sz2, p2)) = parse_tsv_line(&line) {
-                    heap.push((sz2, p2, idx));
-                }
+                if let Some((sz2, p2)) = parse_tsv_line(&line) { heap.push((sz2, p2, idx)); }
             }
         }
-    }
 
-    if !batch.is_empty() {
-        _insert_user_file_batch(&mut conn, &batch)
-            .map_err(|e| PyRuntimeError::new_err(format!("sqlite final insert failed: {}", e)))?;
+        if !file_batch.is_empty() {
+            _insert_file_batch_compressed(&conn, &file_batch)
+                .map_err(|e| PyRuntimeError::new_err(format!("final file batch: {}", e)))?;
+        }
+        conn.execute_batch("COMMIT")
+            .map_err(|e| PyRuntimeError::new_err(format!("COMMIT final: {}", e)))?;
     }
 
     conn.execute(
         "INSERT INTO meta(date, user, total_items, total_used) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            timestamp,
-            sanitise_path(&username),
-            total_files as i64,
-            total_used as i64
-        ],
-    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite meta insert failed: {}", e)))?;
+        params![timestamp, sanitise_path(&username), total_files as i64, total_used as i64],
+    ).map_err(|e| PyRuntimeError::new_err(format!("meta insert: {}", e)))?;
 
+    // Fix 1: idx_files_size removed — K-way merge already writes rows in size DESC order.
+    // xt+size index retained for extension-filter queries from the frontend.
     conn.execute_batch(
-        "CREATE INDEX idx_files_size ON files(size DESC);
-         CREATE INDEX idx_files_xt_size ON files(xt, size DESC);"
-    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite index creation failed: {}", e)))?;
+        "CREATE INDEX idx_files_data_xt_size ON files_data(xt, size DESC);",
+    ).map_err(|e| PyRuntimeError::new_err(format!("index creation: {}", e)))?;
+
     Ok((total_files, total_used))
 }
+
+
 
 fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     let tab = line.find('\t')?;
@@ -787,6 +854,353 @@ fn _write_empty_report(output_path: &str, username: &str, timestamp: i64) -> PyR
         timestamp, json_escape(username))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 3 Full Rust Pipeline: TreeMap hierarchy → parallel JSON/compress → SQLite
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Intern a path string: return its integer ID, creating one if necessary.
+fn tm_intern(
+    path: &str,
+    id_to_path: &mut Vec<String>,
+    path_to_id: &mut HashMap<String, usize>,
+) -> usize {
+    if let Some(&id) = path_to_id.get(path) {
+        return id;
+    }
+    let id = id_to_path.len();
+    id_to_path.push(path.to_string());
+    path_to_id.insert(path.to_string(), id);
+    id
+}
+
+/// Count extra '/' separators in `path` relative to `root` (= depth level).
+fn tm_depth(path: &str, root: &str) -> usize {
+    let suffix = if path.len() >= root.len() { &path[root.len()..] } else { return 0 };
+    suffix.chars().filter(|&c| c == '/').count()
+}
+
+/// Return the ancestor of `path` that is exactly `level` levels below `root`.
+fn tm_clamp(path: &str, root: &str, level: usize) -> String {
+    let suffix = path[root.len()..].trim_start_matches('/');
+    let parts: Vec<&str> = suffix.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= level {
+        return path.to_string();
+    }
+    format!("{}/{}", root.trim_end_matches('/'), parts[..level].join("/"))
+}
+
+/// Parent directory of `path` (pure string, no I/O).
+fn tm_parent(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(pos) => &path[..pos],
+        None => path,
+    }
+}
+
+/// Filename component of `path`.
+#[inline]
+fn tm_basename(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(pos) => &path[pos + 1..],
+        None => path,
+    }
+}
+
+/// Full Phase 3 pipeline implemented entirely in Rust.
+///
+/// Accepts raw scan data from Python and:
+///   1. Builds the integer-ID directory hierarchy (single-threaded, O(n))
+///   2. Computes bottom-up recursive sizes (single-threaded, O(n))
+///   3. Generates shard JSON + zlib compress in **parallel** (Rayon, all cores)
+///   4. Writes to SQLite with a single transaction (minimum fsync overhead)
+///
+/// The GIL is released for the **entire** computation after Python inputs are
+/// converted to Rust types, so Python threads are free to run concurrently.
+///
+/// # Arguments
+/// * `root_dir`       – Absolute path to the scanned root directory
+/// * `dir_sizes`      – `{path: {uid_str: used_bytes}}` from Phase 1
+/// * `dir_owner_map`  – `{path: username}` from Phase 1
+/// * `json_path`       – Output path for root JSON (tree_map_report.json)
+/// * `db_path`         – Output SQLite file path (tree_map_data.db)
+/// * `max_level`       – Maximum tree depth (deeper paths are clamped)
+/// * `min_size_bytes`  – Children smaller than this are omitted from shards
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn generate_treemap_sqlite(
+    py: Python<'_>,
+    root_dir: String,
+    dir_sizes: HashMap<String, HashMap<String, i64>>,
+    dir_owner_map: HashMap<String, String>,
+    json_path: String,   // tree_map_report.json  (root index)
+    db_path: String,     // tree_map_data.db     (shard store)
+    max_level: usize,
+    min_size_bytes: i64,
+) -> PyResult<u64> {
+    // Convert Python objects → Rust types (GIL held, fast for typical dir counts).
+    // After this point the GIL is fully released.
+    py.allow_threads(move || -> Result<u64, String> {
+        // Guard: "/".trim_end_matches('/') == "" in Rust → keep "/" for fs-root.
+        let root = {
+            let t = root_dir.trim_end_matches('/');
+            if t.is_empty() { "/".to_string() } else { t.to_string() }
+        };
+
+        // ── 3.1a: String interning + direct sizes + ancestor traces ──────────
+        let mut id_to_path: Vec<String> = Vec::new();
+        let mut path_to_id: HashMap<String, usize> = HashMap::new();
+        let mut direct_sizes: HashMap<usize, i64> = HashMap::new();
+        let mut all_dirs: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+
+        let root_id = tm_intern(&root, &mut id_to_path, &mut path_to_id);
+        all_dirs.insert(root_id);
+
+        for (dpath, uid_sizes) in &dir_sizes {
+            let total: i64 = uid_sizes.values().sum();
+            if total <= 0 {
+                continue;
+            }
+
+            // Clamp path that exceeds max_level to its ancestor at max_level.
+            let depth = tm_depth(dpath, &root);
+            let target = if depth > max_level {
+                tm_clamp(dpath, &root, max_level)
+            } else {
+                dpath.clone()
+            };
+
+            let tid = tm_intern(&target, &mut id_to_path, &mut path_to_id);
+            *direct_sizes.entry(tid).or_insert(0) += total;
+
+            // Walk up to root, interning every ancestor dir.
+            let mut curr = target;
+            loop {
+                let cid = tm_intern(&curr, &mut id_to_path, &mut path_to_id);
+                all_dirs.insert(cid);
+                if curr == root {
+                    break;
+                }
+                let parent = tm_parent(&curr).to_string();
+                if parent == curr {
+                    break; // shouldn't happen, guards against infinite loop
+                }
+                curr = parent;
+            }
+        }
+
+        // ── 3.1b: Parent → children map ──────────────────────────────────────
+        let mut parent_to_children: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &rid in &all_dirs {
+            if rid == root_id {
+                continue;
+            }
+            let path = &id_to_path[rid];
+            let parent_str = tm_parent(path);
+            let pid = path_to_id.get(parent_str).copied().unwrap_or(root_id);
+            parent_to_children.entry(pid).or_default().push(rid);
+        }
+
+        // ── 3.1c: Bottom-up recursive sizes (deepest dirs first) ─────────────
+        let mut sorted_ids: Vec<usize> = all_dirs.iter().copied().collect();
+        sorted_ids.sort_by(|&a, &b| id_to_path[b].len().cmp(&id_to_path[a].len()));
+
+        // Save root's direct contribution before consuming direct_sizes.
+        let root_direct_size = direct_sizes.get(&root_id).copied().unwrap_or(0);
+
+        let mut recursive_sizes: HashMap<usize, i64> = direct_sizes;
+        for &rid in &sorted_ids {
+            if rid == root_id {
+                continue;
+            }
+            let path = &id_to_path[rid];
+            let parent_str = tm_parent(path);
+            if let Some(&pid) = path_to_id.get(parent_str) {
+                let s = recursive_sizes.get(&rid).copied().unwrap_or(0);
+                *recursive_sizes.entry(pid).or_insert(0) += s;
+            }
+        }
+
+        // ── 3.1d: Assign stable shard IDs (alphabetical by path) ─────────────
+        let mut shard_order: Vec<usize> = all_dirs.iter().copied().collect();
+        shard_order.sort_by_key(|&id| &id_to_path[id]);
+
+        let path_to_shard: HashMap<usize, usize> = shard_order
+            .iter()
+            .enumerate()
+            .map(|(i, &rid)| (rid, i))
+            .collect();
+
+        // ── 3.1e: Root node JSON ──────────────────────────────────────────────
+        {
+            let empty = Vec::new();
+            let mut root_children: Vec<serde_json::Value> = parent_to_children
+                .get(&root_id)
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|&cid| {
+                    let size = recursive_sizes.get(&cid).copied().unwrap_or(0);
+                    if size <= 0 { return None; }
+                    let cp = &id_to_path[cid];
+                    Some(serde_json::json!({
+                        "name":         tm_basename(cp),
+                        "path":         cp,
+                        "value":        size,
+                        "type":         "directory",
+                        "owner":        dir_owner_map.get(cp.as_str())
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("unknown"),
+                        "shard_id":     path_to_shard[&cid].to_string(),
+                        "has_children": parent_to_children.contains_key(&cid) && max_level > 1,
+                    }))
+                })
+                .collect();
+
+            // Add "file group" for direct files / clamped dirs at root level.
+            if root_direct_size > 0 {
+                let rb = tm_basename(&root);
+                let label = if rb.is_empty() { root.clone() } else { rb.to_string() };
+                root_children.push(serde_json::json!({
+                    "name":         format!("[Files in {}]", label),
+                    "path":         format!("{}/{}", root.trim_end_matches('/'), "__files__"),
+                    "value":        root_direct_size,
+                    "type":         "file_group",
+                    "owner":        dir_owner_map.get(root.as_str()).map(|s| s.as_str()).unwrap_or("unknown"),
+                    "has_children": false,
+                }));
+            }
+
+            root_children.sort_by(|a, b| {
+                let va = a["value"].as_i64().unwrap_or(0);
+                let vb = b["value"].as_i64().unwrap_or(0);
+                vb.cmp(&va)
+            });
+
+            let root_total = recursive_sizes.get(&root_id).copied().unwrap_or(0);
+            let rb = tm_basename(&root);
+            let root_name = if rb.is_empty() { &root as &str } else { rb };
+            let has_children = !root_children.is_empty();
+
+            let root_node = serde_json::json!({
+                "name":         root_name,
+                "path":         &root,
+                "value":        root_total,
+                "type":         "directory",
+                "owner":        dir_owner_map.get(root.as_str()).map(|s| s.as_str()).unwrap_or("unknown"),
+                "shard_id":     path_to_shard[&root_id].to_string(),
+                "has_children": has_children,
+                "children":     root_children,
+            });
+
+            let json_str = serde_json::to_string(&root_node).expect("root json");
+            std::fs::write(&json_path, json_str.as_bytes())
+                .map_err(|e| format!("write root json '{}': {}", json_path, e))?;
+        }
+
+        // ── 3.2: Parallel shard generation: JSON → zlib (Rayon) ──────────────
+        // All maps are read-only here → safe for parallel access.
+        let shards: Vec<(String, String, Vec<u8>)> = shard_order
+            .par_iter()
+            .map(|&rid| {
+                let path = &id_to_path[rid];
+                let shard_id_str = path_to_shard[&rid].to_string();
+
+                let empty = Vec::new();
+                let children_ids = parent_to_children.get(&rid).unwrap_or(&empty);
+
+                let mut items: Vec<serde_json::Value> =
+                    Vec::with_capacity(children_ids.len());
+
+                for &cid in children_ids {
+                    let size = recursive_sizes.get(&cid).copied().unwrap_or(0);
+                    if size < min_size_bytes {
+                        continue;
+                    }
+                    let cp = &id_to_path[cid];
+                    items.push(serde_json::json!({
+                        "id":             path_to_shard[&cid],
+                        "name":           tm_basename(cp),
+                        "size":           size,
+                        "owner":          dir_owner_map.get(cp.as_str())
+                                              .map(|s| s.as_str())
+                                              .unwrap_or("unknown"),
+                        "children_count": parent_to_children
+                                              .get(&cid)
+                                              .map(|v| v.len())
+                                              .unwrap_or(0),
+                    }));
+                }
+                // Add [Files in <dir>] entry for direct file bytes (not subdirs).
+                // d_direct = this dir's total size minus the sum of all children dir sizes.
+                let children_total: i64 = children_ids
+                    .iter()
+                    .map(|&cid| recursive_sizes.get(&cid).copied().unwrap_or(0))
+                    .sum();
+                let d_direct = recursive_sizes.get(&rid).copied().unwrap_or(0) - children_total;
+                if d_direct > 0 && d_direct >= min_size_bytes {
+                    let base = tm_basename(path);
+                    let label = if base.is_empty() { path.as_str() } else { base };
+                    items.push(serde_json::json!({
+                        "name":           format!("[Files in {}]", label),
+                        "size":           d_direct,
+                        "type":           "file_group",
+                        "owner":          dir_owner_map.get(path.as_str())
+                                              .map(|s| s.as_str())
+                                              .unwrap_or("unknown"),
+                        "children_count": 0_u64,
+                    }));
+                }
+
+                // Compact JSON (no extra spaces) then zlib level-6
+                let json_bytes = serde_json::to_vec(&items).expect("json");
+                let mut enc = ZlibEncoder::new(
+                    Vec::with_capacity(json_bytes.len() / 2 + 32),
+                    Compression::new(6),
+                );
+                enc.write_all(&json_bytes).expect("zlib write");
+                let compressed = enc.finish().expect("zlib finish");
+
+                (shard_id_str, path.clone(), compressed)
+            })
+            .collect();
+
+        // ── 3.3: Single-transaction SQLite write ──────────────────────────────
+        let mut conn = Connection::open(&db_path)
+            .map_err(|e| format!("open db '{}': {}", db_path, e))?;
+
+        conn.execute_batch(
+            "PRAGMA page_size   = 8192; \
+             PRAGMA journal_mode = OFF; \
+             PRAGMA synchronous  = OFF; \
+             PRAGMA cache_size   = -65536; \
+             CREATE TABLE shards ( \
+                 id   TEXT PRIMARY KEY, \
+                 path TEXT NOT NULL, \
+                 data BLOB NOT NULL \
+             );",
+        )
+        .map_err(|e| format!("sqlite setup: {}", e))?;
+
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin tx: {}", e))?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO shards VALUES (?1, ?2, ?3)")
+                .map_err(|e| format!("prepare: {}", e))?;
+            for (id, path, blob) in &shards {
+                stmt.execute(rusqlite::params![id, path, blob.as_slice()])
+                    .map_err(|e| format!("insert '{}': {}", id, e))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit: {}", e))?;
+
+        Ok(shards.len() as u64)
+    })
+    .map_err(PyRuntimeError::new_err)
 }
 
 fn _insert_shard_batch(conn: &mut Connection, batch: &[(String, String)]) -> Result<(), rusqlite::Error> {
@@ -863,11 +1277,82 @@ fn write_shards_tsv_to_sqlite(tsv_path: String, db_path: String, batch_size: Opt
     Ok(total)
 }
 
+/// Receive shard data from Python, compress in parallel with Rayon, write to SQLite.
+///
+/// - `items`: Python list of `(shard_id, path, json_str)` tuples
+/// - GIL is released for the entire compression + write pipeline
+/// - Phase 1: Rayon `par_iter` → zlib compress each JSON payload (all CPU cores)
+/// - Phase 2: Single SQLite transaction → zero per-row commit overhead
+/// - Schema: `shards(id TEXT PRIMARY KEY, path TEXT NOT NULL, data BLOB NOT NULL)`
+/// - PRAGMAs: page_size=8192, journal_mode=OFF, synchronous=OFF
+#[pyfunction]
+fn compress_and_write_shards(
+    py: Python<'_>,
+    items: Vec<(String, String, String)>, // (shard_id, path, json_data)
+    db_path: String,
+    _batch_size: Option<usize>, // reserved; single-tx is faster for this workload
+) -> PyResult<u64> {
+    let total = items.len() as u64;
+
+    // Release GIL: the entire compression + write runs on Rust threads.
+    py.allow_threads(move || -> Result<u64, String> {
+        // ── Phase 1: Parallel zlib compression (rayon thread pool, no GIL) ──
+        let compressed: Vec<(String, String, Vec<u8>)> = items
+            .into_par_iter()
+            .map(|(id, path, json)| {
+                let mut enc = ZlibEncoder::new(
+                    Vec::with_capacity(json.len() / 2 + 32),
+                    Compression::new(6),
+                );
+                enc.write_all(json.as_bytes()).expect("zlib write");
+                (id, path, enc.finish().expect("zlib finish"))
+            })
+            .collect();
+
+        // ── Phase 2: Single-transaction SQLite write ──
+        let mut conn = Connection::open(&db_path)
+            .map_err(|e| format!("open db '{}': {}", db_path, e))?;
+
+        conn.execute_batch(
+            "PRAGMA page_size   = 8192; \
+             PRAGMA journal_mode = OFF; \
+             PRAGMA synchronous  = OFF; \
+             PRAGMA cache_size   = -65536; \
+             CREATE TABLE shards ( \
+                 id   TEXT PRIMARY KEY, \
+                 path TEXT NOT NULL, \
+                 data BLOB NOT NULL \
+             );",
+        )
+        .map_err(|e| format!("sqlite setup: {}", e))?;
+
+        // One transaction for all rows → minimum fsync + B-tree overhead.
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin tx: {}", e))?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO shards VALUES (?1, ?2, ?3)")
+                .map_err(|e| format!("prepare: {}", e))?;
+            for (id, path, blob) in &compressed {
+                stmt.execute(rusqlite::params![id, path, blob.as_slice()])
+                    .map_err(|e| format!("insert '{}': {}", id, e))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit: {}", e))?;
+
+        Ok(total)
+    })
+    .map_err(PyRuntimeError::new_err)
+}
+
 #[pymodule]
 fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_disk, m)?)?;
     m.add_function(wrap_pyfunction!(merge_write_user_report, m)?)?;
     m.add_function(wrap_pyfunction!(merge_write_user_report_db, m)?)?;
     m.add_function(wrap_pyfunction!(write_shards_tsv_to_sqlite, m)?)?;
+    m.add_function(wrap_pyfunction!(compress_and_write_shards, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_treemap_sqlite, m)?)?;
     Ok(())
 }
