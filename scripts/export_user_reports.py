@@ -14,6 +14,7 @@ Output contract note:
 import os
 import sys
 import glob
+import sqlite3
 import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,6 +77,16 @@ def find_users(input_dir: str, prefix: str) -> list:
                 if name.startswith(strip_legacy) and name.endswith(ext):
                     user = name[len(strip_legacy):-len(ext)]
                     users.add(user)
+
+        # New combined schema can store only detail_report_file_<user>.* with dirs in same DB.
+        if not users:
+            file_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_file_*{ext}")
+            strip_file = f"{pat_prefix}detail_report_file_"
+            for path in glob.glob(file_pattern):
+                name = os.path.basename(path)
+                if name.startswith(strip_file) and name.endswith(ext):
+                    user = name[len(strip_file):-len(ext)]
+                    users.add(user)
                     
         if users:
             break
@@ -90,6 +101,24 @@ def _pick_existing_path(detail_dir: str, base_name: str) -> str:
         if os.path.exists(p):
             return p
     return ""
+
+
+def _sqlite_has_dirs(path: str) -> bool:
+    """True when SQLite DB contains a dirs table/view (combined schema)."""
+    if not path or not path.endswith(".db") or not os.path.exists(path):
+        return False
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE (type='table' OR type='view') AND name='dirs' LIMIT 1"
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 
 def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
@@ -123,6 +152,7 @@ def export_user(user: str,
     has_unified = os.path.exists(unified_path)
     has_dir = os.path.exists(dir_path)
     has_file = os.path.exists(file_path)
+    has_combined_file_db = (not has_unified and not has_dir and has_file and _sqlite_has_dirs(file_path))
 
     if not has_unified and not has_dir and not has_file:
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
@@ -139,16 +169,17 @@ def export_user(user: str,
 
     with sem:
         try:
-            if has_unified:
-                # If we only have a unified file, produce separate dir/file TXT views from the same source.
+            if has_unified or has_combined_file_db:
+                # Unified schema (detail_report_<user>.*) or combined file DB that contains dirs+files.
+                source_path = unified_path if has_unified else file_path
                 out_dir_fname = "_".join(base_parts + ["dir", user]) + ".txt"
                 out_dir_path = os.path.join(output_dir, out_dir_fname)
-                dir_result = export_rust.process(user, unified_path, "", out_dir_path)
+                dir_result = export_rust.process(user, source_path, "", out_dir_path)
                 _collect_output(out_dir_path, dir_result)
 
                 out_file_fname = "_".join(base_parts + ["file", user]) + ".txt"
                 out_file_path = os.path.join(output_dir, out_file_fname)
-                file_result = export_rust.process(user, "", unified_path, out_file_path)
+                file_result = export_rust.process(user, "", source_path, out_file_path)
                 _collect_output(out_file_path, file_result)
             else:
                 if has_dir:

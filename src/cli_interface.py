@@ -8,6 +8,7 @@ import argparse
 import os
 import sys
 import glob
+import sqlite3
 from typing import Dict, Any, List
 
 from src.utils import parse_size, load_json_report
@@ -57,6 +58,18 @@ class CLIInterface:
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
         scan_group.add_argument("--tree-map", action="store_true", help="Generate a TreeMap JSON for directory visualization")
         scan_group.add_argument("--level", type=int, default=3, help="Maximum depth level for TreeMap generation (default: 3)")
+        scan_group.add_argument(
+            "--detail-fts",
+            choices=["on", "off"],
+            default="off",
+            help="Enable/disable FTS4 indexes in detail user SQLite DBs (default: off).",
+        )
+        scan_group.add_argument(
+            "--detail-size-index",
+            choices=["on", "off"],
+            default="off",
+            help="Enable/disable idx_files_data_size index in detail user DBs (default: off).",
+        )
         
         # Report commands
         report_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")
@@ -67,8 +80,10 @@ class CLIInterface:
 
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
-        report_group.add_argument("--check-users", metavar="USER", nargs="+",
+        report_group.add_argument("--check-users", "--check-user", metavar="USER", nargs="+",
                                 help="Display detail reports for specific user(s). Supports detail_report_dir/file in DB, NDJSON, or JSON.")
+        report_group.add_argument("--top", type=int, default=30,
+                                help="Top N rows to display for both directory and file breakdown in --check-user(s) (default: 30).")
 
         # Report filtering options
         filter_group = parser.add_argument_group('Report Filtering Options')
@@ -229,7 +244,7 @@ class CLIInterface:
         users: List[str],
         prefix: str = "",
         output_dir: str = ".",
-        top_files: int = 30,
+        top: int = 30,
     ) -> None:
         """Display per-user detail reports (dir + file breakdown).
 
@@ -248,12 +263,33 @@ class CLIInterface:
                     return candidate
             return ""
 
+        def _db_has_dirs(path: str) -> bool:
+            """True if SQLite file contains a dirs table/view (combined schema support)."""
+            if not path or not path.endswith(".db"):
+                return False
+            try:
+                conn = sqlite3.connect(path)
+                try:
+                    row = conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE (type='table' OR type='view') AND name='dirs' LIMIT 1"
+                    ).fetchone()
+                    return row is not None
+                finally:
+                    conn.close()
+            except Exception:
+                return False
+
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}
 
         for user in users:
             dp = _build_path("detail_report_dir",  user)
             fp = _build_path("detail_report_file", user)
+
+            # New combined schema may store both dir+file data in detail_report_file_<user>.db.
+            if not dp and fp and _db_has_dirs(fp):
+                dp = fp
 
             dir_files[user]  = dp if dp else None
             file_files[user] = fp if fp else None
@@ -264,5 +300,5 @@ class CLIInterface:
                 print(f"Warning: file detail not found for '{user}' in: {detail_dir}")
 
         self.report_formatter.display_user_detail_reports(
-            users, dir_files, file_files, top_files
+            users, dir_files, file_files, top
         )

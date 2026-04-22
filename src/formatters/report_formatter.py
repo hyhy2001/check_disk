@@ -187,7 +187,7 @@ class ReportFormatter(BaseFormatter):
         user: str,
         dir_report: Optional[Dict[str, Any]],
         file_report: Optional[Dict[str, Any]],
-        top_files: int = 30,
+        top: int = 30,
     ) -> None:
         """Render dir + file detail reports for a single user."""
         print("\n" + "=" * 60)
@@ -203,10 +203,13 @@ class ReportFormatter(BaseFormatter):
             print(f"Total used: {format_size(dir_report.get('total_used', 0))}")
 
             dirs = dir_report.get('dirs', [])
-            if dirs:
+            total_dirs = dir_report.get('total_dirs', len(dirs))
+            display_dirs = dirs[:top]
+            if display_dirs:
                 headers = ["Directory", "Used"]
-                rows = [[d['path'], format_size(d['used'])] for d in dirs]
-                table = self.table_formatter.format_table(headers, rows, title="Directory Breakdown")
+                rows = [[d['path'], format_size(d['used'])] for d in display_dirs]
+                title = f"Directory Breakdown (top {len(display_dirs)} of {total_dirs:,})"
+                table = self.table_formatter.format_table(headers, rows, title=title)
                 print("\n" + table)
             else:
                 print("  (no directory data)")
@@ -220,7 +223,7 @@ class ReportFormatter(BaseFormatter):
             total_used  = file_report.get('total_used', 0)
             print(f"\nTotal files: {total_files:,}  |  Total size: {format_size(total_used)}")
 
-            display = files[:top_files]
+            display = files[:top]
             if display:
                 headers = ["File", "Size"]
                 rows = [[f['path'], format_size(f['size'])] for f in display]
@@ -237,7 +240,7 @@ class ReportFormatter(BaseFormatter):
         users: List[str],
         dir_files: Dict[str, Optional[str]],
         file_files: Dict[str, Optional[str]],
-        top_files: int = 30,
+        top: int = 30,
     ) -> None:
         """Load and render detail reports for multiple users."""
         for user in users:
@@ -245,7 +248,7 @@ class ReportFormatter(BaseFormatter):
             file_path = file_files.get(user)
             dir_data  = self._load_detail_report(dir_path, is_dir=True) if dir_path else None
             file_data = self._load_detail_report(file_path, is_dir=False) if file_path else None
-            self.display_user_detail_report(user, dir_data, file_data, top_files)
+            self.display_user_detail_report(user, dir_data, file_data, top)
 
     def _load_detail_report(self, path: str, is_dir: bool) -> Dict[str, Any]:
         """Load detail report from DB, NDJSON, or legacy JSON and normalize shape."""

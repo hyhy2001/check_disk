@@ -132,7 +132,8 @@ def main():
         if len(users) == 1 and " " in users[0]:
             users = users[0].split()
 
-        cli.display_check_users(users, prefix=prefix, output_dir=output_dir)
+        top = max(1, int(getattr(args, 'top', 30) or 30))
+        cli.display_check_users(users, prefix=prefix, output_dir=output_dir, top=top)
 
 
     elif args.run:
@@ -157,6 +158,8 @@ def main():
         config['output_file'] = output_file
         config['output_prefix'] = output_prefix
         config['output_date_suffix'] = output_date
+        config['detail_fts'] = getattr(args, 'detail_fts', 'off')
+        config['detail_size_index'] = getattr(args, 'detail_size_index', 'off')
 
         target_users = getattr(args, 'user', None)
         if target_users:

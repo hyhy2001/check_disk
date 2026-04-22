@@ -40,6 +40,10 @@ class ReportGenerator:
         """
         self.config = config
         self.output_file = config.get("output_file", "disk_usage_report.json")
+        detail_fts = str(config.get("detail_fts", "off")).strip().lower()
+        self.enable_detail_fts = detail_fts not in ("off", "0", "false", "no")
+        detail_size_index = str(config.get("detail_size_index", "off")).strip().lower()
+        self.enable_detail_size_index = detail_size_index not in ("off", "0", "false", "no")
 
     # ------------------------------------------------------------------ #
     # Path helpers                                                         #
@@ -537,37 +541,36 @@ class ReportGenerator:
                 "CREATE INDEX IF NOT EXISTS idx_dirs_data_used ON dirs_data(used DESC)"
             )
             # idx_files_data_size: ORDER BY fd.size DESC → only reads N rows, no temp sort.
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_files_data_size ON files_data(size DESC)"
-            )
+            if self.enable_detail_size_index:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_files_data_size ON files_data(size DESC)"
+                )
             conn.commit()
 
-            # ── FTS4 full-text search indexes ─────────────────────────────────
-            # Use FTS4 (not FTS5) so PHP's bundled SQLite 3.8.x can read the tables.
-            # Both versions share the same FTS4 segment format (verified compatible).
-            #
-            # fts_dirs: content-table mode → inverted index only, no path duplication.
-            # fts_files: stores di.path || '/' || fd.basename for full-path search.
-            try:
-                conn.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS fts_dirs USING fts4("
-                    "path, content='dirs_index', tokenize='unicode61')"
-                )
-                conn.execute(
-                    "INSERT INTO fts_dirs(docid, path) SELECT id, path FROM dirs_index"
-                )
-                conn.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS fts_files USING fts4("
-                    "fullpath, tokenize='unicode61')"
-                )
-                conn.execute(
-                    "INSERT INTO fts_files(docid, fullpath) "
-                    "SELECT fd.id, di.path || '/' || fd.basename "
-                    "FROM files_data fd JOIN dirs_index di ON fd.dir_id = di.id"
-                )
-                conn.commit()
-            except Exception:
-                pass  # FTS4 unavailable → PHP falls back to LIKE automatically
+            # ── Optional FTS4 full-text search indexes ────────────────────────
+            # Use FTS4 (not FTS5) so PHP's bundled SQLite 3.8.x can read tables.
+            # When disabled, frontend search falls back to LIKE queries.
+            if self.enable_detail_fts:
+                try:
+                    conn.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_dirs USING fts4("
+                        "path, content='dirs_index', tokenize='unicode61')"
+                    )
+                    conn.execute(
+                        "INSERT INTO fts_dirs(docid, path) SELECT id, path FROM dirs_index"
+                    )
+                    conn.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_files USING fts4("
+                        "fullpath, tokenize='unicode61')"
+                    )
+                    conn.execute(
+                        "INSERT INTO fts_files(docid, fullpath) "
+                        "SELECT fd.id, di.path || '/' || fd.basename "
+                        "FROM files_data fd JOIN dirs_index di ON fd.dir_id = di.id"
+                    )
+                    conn.commit()
+                except Exception:
+                    pass  # FTS4 unavailable → PHP falls back to LIKE automatically
             return True
         finally:
             conn.close()

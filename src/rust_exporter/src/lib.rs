@@ -33,17 +33,25 @@ struct ExportEntry {
     size: u64,
 }
 
-fn format_size(mut n: f64) -> String {
-    let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
-    let mut i = 0;
-    while n >= 1024.0 && i < units.len() - 1 {
-        n /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{} {}", n as u64, units[0])
+fn format_size(size_bytes: f64) -> String {
+    // Keep TXT output consistent with Python check-disk formatter:
+    // SI/decimal units (1 KB = 1,000 B), not binary 1,024.
+    let n = if size_bytes.is_sign_negative() { 0.0 } else { size_bytes };
+    const KB: f64 = 1_000.0;
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    const TB: f64 = 1_000_000_000_000.0;
+
+    if n >= TB {
+        format!("{:.2} TB", n / TB)
+    } else if n >= GB {
+        format!("{:.1} GB", n / GB)
+    } else if n >= MB {
+        format!("{:.0} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.0} KB", n / KB)
     } else {
-        format!("{:.2} {}", n, units[i])
+        format!("{} B", n as u64)
     }
 }
 
