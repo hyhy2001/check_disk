@@ -5,14 +5,11 @@ Handles generating and saving disk usage reports.
 """
 
 import os
-import json
-import heapq
 import sqlite3
-import glob as glob_module
+import tempfile
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, Optional, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from typing import Dict, Any, Optional, List, Tuple, Sequence, Iterable, Union, Callable
 
 from src.disk_scanner import ScanResult
 from src.utils import format_size, save_json_report, ScanHelper
@@ -20,11 +17,9 @@ from src.tree_map_generator import TreeMapGenerator
 
 try:
     from src import fast_scanner as _fast_scanner
-    HAS_RUST_PHASE2 = hasattr(_fast_scanner, 'merge_write_user_report')
     HAS_RUST_PHASE2_DB = hasattr(_fast_scanner, 'merge_write_user_report_db')
 except ImportError:
     _fast_scanner = None  # type: ignore
-    HAS_RUST_PHASE2 = False
     HAS_RUST_PHASE2_DB = False
 
 
@@ -108,6 +103,48 @@ class ReportGenerator:
                         os.remove(fpath)
                     except OSError:
                         pass
+
+    def cleanup_stale_detail_reports(self, keep_paths: List[str]) -> None:
+        """
+        Remove stale files in detail_users/ that were not regenerated in this run.
+
+        This keeps sync incremental-friendly (we don't wipe all files up front),
+        while still preventing orphan reports from users that no longer exist.
+        """
+        dir_part = os.path.dirname(self.output_file)
+        detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
+        if not os.path.isdir(detail_dir):
+            return
+
+        keep_abs = {os.path.abspath(p) for p in keep_paths if p}
+        # Keep sidecar files for current DBs too.
+        keep_with_sidecars = set(keep_abs)
+        for p in list(keep_abs):
+            if p.endswith(".db"):
+                keep_with_sidecars.add(p + "-wal")
+                keep_with_sidecars.add(p + "-shm")
+
+        removed = 0
+        for name in os.listdir(detail_dir):
+            if not (
+                name.endswith(".json")
+                or name.endswith(".ndjson")
+                or name.endswith(".db")
+                or name.endswith(".db-wal")
+                or name.endswith(".db-shm")
+            ):
+                continue
+            fp = os.path.abspath(os.path.join(detail_dir, name))
+            if fp in keep_with_sidecars:
+                continue
+            try:
+                os.remove(fp)
+                removed += 1
+            except OSError:
+                pass
+
+        if removed > 0:
+            print(f"Cleaned up {removed} stale detail file(s) in {detail_dir}.")
 
     # ------------------------------------------------------------------ #
     # Legacy helpers                                                       #
@@ -309,7 +346,16 @@ class ReportGenerator:
             dir_owner_map=dir_owner_map,
         )
 
+        phase3_start = time.time()
+        phase3_mem_start = self._get_rss_mb()
+        print(f"[Phase 3] RAM before TreeMap: {phase3_mem_start:.1f} MB")
         generator.save(output_path)
+        phase3_mem_end = self._get_rss_mb()
+        phase3_elapsed = time.time() - phase3_start
+        print(
+            f"[Phase 3] RAM after TreeMap: {phase3_mem_end:.1f} MB "
+            f"(delta: {phase3_mem_end - phase3_mem_start:+.1f} MB, elapsed: {phase3_elapsed:.2f}s)"
+        )
         return output_path
 
     # ------------------------------------------------------------------ #
@@ -317,109 +363,55 @@ class ReportGenerator:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _iter_uid_tsv(tmpdir: str, uids: List[int]):
-        """Yield (size, path) tuples from all temp TSV chunks for all *uids*.
+    def _iter_batched_pairs(
+        dirs: Iterable[Union[Dict[str, Any], Tuple[str, int]]],
+        batch_size: int = 5000,
+    ):
+        """Yield batched (path, used) tuples to keep peak memory bounded."""
+        batch: List[Tuple[str, int]] = []
+        for d in dirs:
+            if isinstance(d, dict):
+                path = d.get("dir")
+                if not path:
+                    continue
+                used = int(d.get("user_usage", 0))
+            else:
+                if len(d) != 2:
+                    continue
+                path = d[0]
+                if not path:
+                    continue
+                used = int(d[1])
+            batch.append((path, used))
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
-        Each chunk is sorted descending (written that way by _flush_thread_paths).
-        Using ``heapq.merge(..., reverse=True)`` over these iterators gives a
-        globally sorted descending stream with O(num_chunks) RAM.
-
-        Opens files with ``errors='surrogateescape'`` to handle paths that
-        contain non-UTF-8 byte sequences (common on Linux filesystems).
-        """
-        def _read_chunk(fpath: str):
-            with open(fpath, encoding='utf-8', errors='surrogateescape') as fh:
+    @staticmethod
+    def _get_rss_mb() -> float:
+        """Return current process RSS in MB (Linux)."""
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as fh:
                 for line in fh:
-                    line = line.rstrip('\n')
-                    if not line:
-                        continue
-                    tab = line.find('\t')
-                    if tab < 0:
-                        continue  # skip malformed lines
-                    yield int(line[:tab]), line[tab + 1:]
-
-        chunk_files = []
-        for uid in uids:
-            chunk_files.extend(glob_module.glob(os.path.join(tmpdir, f'uid_{uid}_t*.tsv')))
-        chunk_files.sort()
-        
-        if not chunk_files:
-            return
-
-        yield from heapq.merge(*[_read_chunk(f) for f in chunk_files], reverse=True)
-
-    def _stream_write_file_report(
-        self,
-        tmpdir: str,
-        uids: List[int],
-        username: str,
-        output_path: str,
-        timestamp: int,
-    ) -> str:
-        """Write a complete per-user file detail JSON by streaming from temp files.
-
-        Tries the native Rust merge_write_user_report() for maximum performance
-        (single BufRead pass, no GIL). Falls back to Python heapq.merge path
-        if the Rust extension is unavailable.
-
-        Returns:
-            The output path that was written.
-        """
-        # ── Rust fast path ────────────────────────────────────────────────────
-        if HAS_RUST_PHASE2:
-            try:
-                _fast_scanner.merge_write_user_report(
-                    tmpdir, uids, username, output_path, timestamp
-                )
-                return output_path
-            except Exception as e:
-                print(f"  [warn] Rust Phase 2 failed for {username!r}, falling back to Python: {e}")
-
-        # ── Python fallback ───────────────────────────────────────────────────
-        def _safe_path(p: str) -> str:
-            """Replace surrogate chars with U+FFFD so json.dumps never raises."""
-            return p.encode('utf-8', errors='replace').decode('utf-8')
-
-        # Pass 1: totals
-        total_files = 0
-        total_used = 0
-        for size, _ in self._iter_uid_tsv(tmpdir, uids):
-            total_files += 1
-            total_used += size
-
-        # Pass 2: stream write
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-        with open(output_path, 'w', encoding='utf-8') as out:
-            meta = {
-                "_meta": {
-                    "date": timestamp,
-                    "user": _safe_path(username),
-                    "total_files": total_files,
-                    "total_used": total_used
-                }
-            }
-            out.write(json.dumps(meta, separators=(',', ':')) + '\n')
-
-            for size, path in self._iter_uid_tsv(tmpdir, uids):
-                safe_path = _safe_path(path)
-                xt = os.path.splitext(safe_path)[1][1:]
-                line = {
-                    "path": safe_path,
-                    "size": size,
-                    "xt": xt
-                }
-                out.write(json.dumps(line, separators=(',', ':')) + '\n')
-
-        return output_path
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            return int(parts[1]) / 1024.0
+        except OSError:
+            pass
+        return 0.0
 
     def _write_dir_report_db(
         self,
         user: str,
         scan_result: ScanResult,
-        dirs: List[Dict[str, Any]],
+        dirs: Iterable[Tuple[str, int]],
         output_path: str,
         total_dir_used: int,
+        total_dir_count: int,
+        dirs_factory: Optional[Callable[[], Iterable[Tuple[str, int]]]] = None,
     ) -> str:
         """Write per-user directory detail.
 
@@ -433,12 +425,21 @@ class ReportGenerator:
         sibling = output_path.replace("detail_report_dir_", "detail_report_file_", 1)
         if sibling != output_path and os.path.isfile(sibling):
             try:
-                if self._write_dirs_into_file_db(user, scan_result, dirs, sibling, total_dir_used):
+                combined_dirs = dirs_factory() if dirs_factory is not None else dirs
+                if self._write_dirs_into_file_db(
+                    user,
+                    scan_result,
+                    combined_dirs,
+                    sibling,
+                    total_dir_used,
+                    total_dir_count,
+                ):
                     return ""  # combined success — no standalone dir file needed
             except Exception as e:
                 print(f"  [warn] Combined dir merge failed for {user!r}: {e}")
 
         # Fallback: standalone dirs DB with full paths (legacy schema).
+        fallback_dirs = dirs_factory() if dirs_factory is not None else dirs
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         if os.path.exists(output_path):
             os.remove(output_path)
@@ -450,11 +451,10 @@ class ReportGenerator:
         conn.execute("CREATE TABLE dirs (id INTEGER PRIMARY KEY, path TEXT, used INTEGER)")
         conn.execute(
             "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
-            (scan_result.timestamp, user, len(dirs), int(total_dir_used)),
+            (scan_result.timestamp, user, int(total_dir_count), int(total_dir_used)),
         )
-        rows = [(d['dir'], int(d['user_usage'])) for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True)]
-        if rows:
-            conn.executemany("INSERT INTO dirs(path, used) VALUES (?, ?)", rows)
+        for batch in self._iter_batched_pairs(fallback_dirs):
+            conn.executemany("INSERT INTO dirs(path, used) VALUES (?, ?)", batch)
         conn.commit()
         conn.close()
         return output_path
@@ -463,9 +463,10 @@ class ReportGenerator:
         self,
         user: str,
         scan_result: ScanResult,
-        dirs: List[Dict[str, Any]],
+        dirs: Iterable[Tuple[str, int]],
         file_db_path: str,
         total_dir_used: int,
+        total_dir_count: int,
     ) -> bool:
         """Append dirs_data + VIEW dirs + meta_dirs to the existing combined file_db.
 
@@ -506,26 +507,22 @@ class ReportGenerator:
                 "CREATE TABLE IF NOT EXISTS meta_dirs "
                 "(date INTEGER, user TEXT, total_dirs INTEGER, total_used INTEGER)"
             )
+            # Keep a single dirs metadata row per run/user DB (avoid unbounded append).
+            conn.execute("DELETE FROM meta_dirs")
             conn.execute(
                 "INSERT INTO meta_dirs(date, user, total_dirs, total_used) VALUES (?, ?, ?, ?)",
-                (scan_result.timestamp, user, len(dirs), int(total_dir_used)),
+                (scan_result.timestamp, user, int(total_dir_count), int(total_dir_used)),
             )
 
-            # Sort by used DESC (consistent with old standalone schema ordering).
-            dir_rows = [
-                (d['dir'], int(d['user_usage']))
-                for d in sorted(dirs, key=lambda x: x['user_usage'], reverse=True)
-            ]
-
-            # Ensure all dir paths exist in dirs_index (covers empty dirs).
-            conn.executemany(
-                "INSERT OR IGNORE INTO dirs_index(path) VALUES (?)",
-                [(p,) for p, _ in dir_rows],
-            )
-
-            # Bulk insert via temp table JOIN — avoids N individual path lookups.
+            # Chunked inserts keep per-user RAM bounded with very large dir sets.
             conn.execute("CREATE TEMP TABLE _dt (path TEXT, used INTEGER)")
-            conn.executemany("INSERT INTO _dt VALUES (?, ?)", dir_rows)
+            for batch in self._iter_batched_pairs(dirs):
+                conn.executemany(
+                    "INSERT OR IGNORE INTO dirs_index(path) VALUES (?)",
+                    [(p,) for p, _ in batch],
+                )
+                conn.executemany("INSERT INTO _dt VALUES (?, ?)", batch)
+
             conn.execute(
                 "INSERT OR REPLACE INTO dirs_data(dir_id, used) "
                 "SELECT di.id, t.used FROM _dt t "
@@ -540,6 +537,12 @@ class ReportGenerator:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dirs_data_used ON dirs_data(used DESC)"
             )
+            files_data_cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(files_data)").fetchall()
+                if len(row) >= 2
+            }
+            files_data_has_ids = {"basename_id", "xt_id"}.issubset(files_data_cols)
             # idx_files_data_size: ORDER BY fd.size DESC → only reads N rows, no temp sort.
             if self.enable_detail_size_index:
                 conn.execute(
@@ -563,17 +566,100 @@ class ReportGenerator:
                         "CREATE VIRTUAL TABLE IF NOT EXISTS fts_files USING fts4("
                         "fullpath, tokenize='unicode61')"
                     )
-                    conn.execute(
-                        "INSERT INTO fts_files(docid, fullpath) "
-                        "SELECT fd.id, di.path || '/' || fd.basename "
-                        "FROM files_data fd JOIN dirs_index di ON fd.dir_id = di.id"
-                    )
+                    if files_data_has_ids:
+                        conn.execute(
+                            "INSERT INTO fts_files(docid, fullpath) "
+                            "SELECT fd.id, di.path || '/' || bi.basename "
+                            "FROM files_data fd "
+                            "JOIN dirs_index di ON fd.dir_id = di.id "
+                            "JOIN basename_index bi ON bi.id = fd.basename_id"
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO fts_files(docid, fullpath) "
+                            "SELECT fd.id, di.path || '/' || fd.basename "
+                            "FROM files_data fd JOIN dirs_index di ON fd.dir_id = di.id"
+                        )
                     conn.commit()
                 except Exception:
                     pass  # FTS4 unavailable → PHP falls back to LIKE automatically
             return True
         finally:
             conn.close()
+
+    @staticmethod
+    def _iter_user_dirs_from_spool_db(
+        spool_db_path: str,
+        user: str,
+        batch_size: int = 5000,
+    ) -> Iterable[Tuple[str, int]]:
+        """Yield (path, used) rows for one user from the Phase-2 spool DB."""
+        conn = sqlite3.connect(f"file:{spool_db_path}?mode=ro", uri=True, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA cache_size = -2000")
+            cur = conn.execute(
+                "SELECT path, used FROM dirs_spool WHERE user = ?",
+                (user,),
+            )
+            while True:
+                rows = cur.fetchmany(batch_size)
+                if not rows:
+                    break
+                for path, used in rows:
+                    yield path, int(used)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _build_dirs_spool_db(
+        scan_result: ScanResult,
+        spool_db_path: str,
+        batch_size: int = 10_000,
+    ) -> Tuple[List[str], Dict[str, int], Dict[str, int]]:
+        """Build an on-disk user->dirs spool DB to keep Phase-2 RAM flat."""
+        user_dir_count: Dict[str, int] = {}
+        user_dir_used: Dict[str, int] = {}
+
+        conn = sqlite3.connect(spool_db_path)
+        try:
+            conn.execute("PRAGMA journal_mode = OFF")
+            conn.execute("PRAGMA synchronous = OFF")
+            conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute("PRAGMA cache_size = -8000")
+            conn.execute(
+                "CREATE TABLE dirs_spool ("
+                "user TEXT NOT NULL, "
+                "path TEXT NOT NULL, "
+                "used INTEGER NOT NULL)"
+            )
+            conn.execute("BEGIN")
+            rows: List[Tuple[str, str, int]] = []
+            for dpath, user_sizes in scan_result.dir_sizes_map.items():
+                if not dpath:
+                    continue
+                for user, size in user_sizes.items():
+                    used = int(size)
+                    rows.append((user, dpath, used))
+                    user_dir_count[user] = user_dir_count.get(user, 0) + 1
+                    user_dir_used[user] = user_dir_used.get(user, 0) + used
+                    if len(rows) >= batch_size:
+                        conn.executemany(
+                            "INSERT INTO dirs_spool(user, path, used) VALUES (?, ?, ?)",
+                            rows,
+                        )
+                        rows.clear()
+            if rows:
+                conn.executemany(
+                    "INSERT INTO dirs_spool(user, path, used) VALUES (?, ?, ?)",
+                    rows,
+                )
+            conn.execute("COMMIT")
+            conn.execute("CREATE INDEX idx_dirs_spool_user ON dirs_spool(user)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        return sorted(user_dir_count.keys()), user_dir_count, user_dir_used
 
     def _write_file_report_db_streaming(
         self,
@@ -582,122 +668,24 @@ class ReportGenerator:
         output_path: str,
         uids: List[int],
     ) -> str:
-        """Write per-user file detail report as SQLite DB from streaming temp chunks."""
-        if HAS_RUST_PHASE2_DB:
-            try:
-                _fast_scanner.merge_write_user_report_db(
-                    scan_result.detail_tmpdir,
-                    uids,
-                    user,
-                    output_path,
-                    scan_result.timestamp,
-                    5000,
-                )
-                return output_path
-            except Exception as e:
-                print(f"  [warn] Rust Phase 2 DB failed for {user!r}, falling back to Python: {e}")
-
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-        conn = sqlite3.connect(output_path)
-        conn.execute("PRAGMA page_size = 8192")  # Fix 2: fresh file, set before any DDL
-        conn.execute("PRAGMA journal_mode = OFF")
-        conn.execute("PRAGMA synchronous = OFF")
-        conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
-        conn.execute(
-            "CREATE TABLE files ("
-            "id INTEGER PRIMARY KEY, "
-            "path TEXT, "
-            "size INTEGER, "
-            "xt TEXT)"
-        )
-        # Fix 1: idx_files_size removed; rows merge in size DESC order
-        conn.execute("CREATE INDEX idx_files_xt_size ON files(xt, size DESC)")
-        total_files = 0
-        total_used = 0
-        batch = []
-        batch_size = 5000
-
-        for size, path in self._iter_uid_tsv(scan_result.detail_tmpdir, uids):
-            xt = os.path.splitext(path)[1][1:]
-            xt = xt.lower()
-            batch.append((
-                path,
-                int(size),
-                xt,
-            ))
-            total_files += 1
-            total_used += int(size)
-            if len(batch) >= batch_size:
-                conn.executemany(
-                    "INSERT INTO files(path, size, xt) VALUES (?, ?, ?)",
-                    batch
-                )
-                batch = []
-
-        if batch:
-            conn.executemany(
-                "INSERT INTO files(path, size, xt) VALUES (?, ?, ?)",
-                batch
+        """Write per-user file detail report via Rust core only."""
+        if not HAS_RUST_PHASE2_DB:
+            raise RuntimeError(
+                "Rust Phase 2 DB core is required. "
+                "Please build/install fast_scanner with merge_write_user_report_db."
             )
-        conn.execute(
-            "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
-            (scan_result.timestamp, user, int(total_files), int(total_used)),
-        )
-        conn.commit()
-        conn.close()
-        return output_path
-
-    def _write_file_report_db_legacy(
-        self,
-        user: str,
-        scan_result: ScanResult,
-        output_path: str,
-        user_files: List[Tuple[str, int]],
-    ) -> str:
-        """Write per-user file detail report as SQLite DB from in-memory file list."""
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-        conn = sqlite3.connect(output_path)
-        conn.execute("PRAGMA page_size = 8192")  # Fix 2
-        conn.execute("PRAGMA journal_mode = OFF")
-        conn.execute("PRAGMA synchronous = OFF")
-        conn.execute("CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER)")
-        conn.execute(
-            "CREATE TABLE files ("
-            "id INTEGER PRIMARY KEY, "
-            "path TEXT, "
-            "size INTEGER, "
-            "xt TEXT)"
-        )
-        # Fix 1: idx_files_size removed; legacy list is pre-sorted by size DESC
-        conn.execute("CREATE INDEX idx_files_xt_size ON files(xt, size DESC)")
-        total_used = sum(s for _, s in user_files)
-        rows = []
-        for p, s in user_files:
-            xt = os.path.splitext(p)[1][1:]
-            xt = xt.lower()
-            rows.append((
-                p,
-                int(s),
-                xt,
-            ))
-        if rows:
-            conn.executemany(
-                "INSERT INTO files(path, size, xt) VALUES (?, ?, ?)",
-                rows
+        try:
+            _fast_scanner.merge_write_user_report_db(
+                scan_result.detail_tmpdir,
+                uids,
+                user,
+                output_path,
+                scan_result.timestamp,
+                5000,
             )
-        conn.execute(
-            "INSERT INTO meta(date, user, total_items, total_used) VALUES (?, ?, ?, ?)",
-            (scan_result.timestamp, user, len(user_files), int(total_used)),
-        )
-        conn.commit()
-        conn.close()
-        return output_path
+            return output_path
+        except Exception as e:
+            raise RuntimeError(f"Rust Phase 2 DB failed for {user!r}: {e}") from e
 
     # ------------------------------------------------------------------ #
     # Per-user detail reports (parallel)                                   #
@@ -707,7 +695,11 @@ class ReportGenerator:
         self,
         user: str,
         scan_result: ScanResult,
-        user_dirs: Optional[List[Dict[str, Any]]] = None,
+        user_dirs: Optional[Sequence[Tuple[str, int]]] = None,
+        user_uids_map: Optional[Dict[str, List[int]]] = None,
+        user_dirs_spool_db: Optional[str] = None,
+        user_dir_count: int = 0,
+        user_dir_total: int = 0,
     ) -> Tuple[str, str]:
         """
         Write directory + file detail JSON reports for a single user.
@@ -726,33 +718,63 @@ class ReportGenerator:
             Either element may be empty-string if that report was skipped.
         """
         # ── Gather dir data (collected before writing; used after file_db exists) ─
-        dirs = user_dirs if user_dirs is not None else [e for e in scan_result.top_dir if e['user'] == user]
-        total_dir_used = sum(d['user_usage'] for d in dirs)
+        dirs_factory: Optional[Callable[[], Iterable[Tuple[str, int]]]] = None
+        if user_dirs_spool_db:
+            dirs_factory = lambda: self._iter_user_dirs_from_spool_db(user_dirs_spool_db, user)
+            dirs: Iterable[Tuple[str, int]] = dirs_factory()
+            total_dir_used = int(user_dir_total)
+            total_dir_count = int(user_dir_count)
+        elif user_dirs is not None:
+            dirs = list(user_dirs)
+            total_dir_count = len(dirs)
+            total_dir_used = sum(used for _, used in dirs)
+        else:
+            dirs = [
+                (e["dir"], int(e["user_usage"]))
+                for e in scan_result.top_dir
+                if e["user"] == user and e.get("dir")
+            ]
+            total_dir_count = len(dirs)
+            total_dir_used = sum(used for _, used in dirs)
 
         # ── File detail report FIRST — combined mode appends dirs into this DB ─
         file_path = self._get_user_detail_filename('detail_report_file', user, ext='db')
         streaming = bool(scan_result.detail_tmpdir)
         if streaming:
-            # user key is either a real username ('nobody', 'mysql') or 'uid-{num}' for unknowns.
-            # Fast path: uid-{num} format → parse directly.
-            # Slow path: real username → reverse-scan uid_cache.
-            if user.startswith("uid-") and user[4:].isdigit():
-                uids = [int(user[4:])]
+            if user_uids_map is not None:
+                uids = user_uids_map.get(user, [])
             else:
-                uids = [u for u, n in scan_result.detail_uid_username.items() if n == user]
+                if user.startswith("uid-") and user[4:].isdigit():
+                    uids = [int(user[4:])]
+                else:
+                    uids = [u for u, n in scan_result.detail_uid_username.items() if n == user]
             if uids:
-                self._write_file_report_db_streaming(user, scan_result, file_path, uids)
+                self._write_file_report_db_streaming(
+                    user,
+                    scan_result,
+                    file_path,
+                    uids,
+                )
             else:
                 print(f"  [warn] No UIDs found for user {user!r}, skipping file report")
                 file_path = ""
         else:
-            # Legacy in-memory path
-            user_files = scan_result.detail_files.get(user, [])
-            self._write_file_report_db_legacy(user, scan_result, file_path, user_files)
+            raise RuntimeError(
+                "Phase 2 requires Rust streaming outputs (detail_tmpdir). "
+                "Python in-memory fallback has been removed."
+            )
 
         # ── Directory detail report — tries combined append into file_db first ─
         dir_path = self._get_user_detail_filename('detail_report_dir', user, ext='db')
-        self._write_dir_report_db(user, scan_result, dirs, dir_path, total_dir_used)
+        self._write_dir_report_db(
+            user,
+            scan_result,
+            dirs,
+            dir_path,
+            total_dir_used,
+            total_dir_count,
+            dirs_factory=dirs_factory,
+        )
 
         return dir_path, file_path
 
@@ -780,59 +802,166 @@ class ReportGenerator:
         Returns:
             Sorted list of created file paths.
         """
-        # Build per-user dir list from dir_sizes_map (top_dir is deprecated).
-        # This avoids a redundant data structure that cost ~2 GB RAM.
-        user_dirs_map: Dict[str, List[Dict[str, Any]]] = {}
-        for dpath, user_sizes in scan_result.dir_sizes_map.items():
-            for user, size in user_sizes.items():
-                user_dirs_map.setdefault(user, []).append({'dir': dpath, 'user_usage': size})
-        users = sorted(user_dirs_map.keys())
+        spool_min_dirs = 200_000
+        use_spool = len(scan_result.dir_sizes_map) >= spool_min_dirs
+        user_dirs_map: Dict[str, List[Tuple[str, int]]] = {}
+        user_dir_count_map: Dict[str, int] = {}
+        user_dir_used_map: Dict[str, int] = {}
+        dirs_spool_db_path: Optional[str] = None
+        spool_tmpdir_ctx: Optional[tempfile.TemporaryDirectory[str]] = None
 
-        if not users:
-            print("No users found in scan results — nothing to generate.")
-            return []
+        if use_spool:
+            spool_tmpdir_ctx = tempfile.TemporaryDirectory(prefix="checkdisk_phase2_dirs_")
+            dirs_spool_db_path = os.path.join(spool_tmpdir_ctx.name, "dirs_spool.db")
+            print("  [Phase 2] Preparing directory spool...")
+            spool_start = time.time()
+            users, user_dir_count_map, user_dir_used_map = self._build_dirs_spool_db(
+                scan_result,
+                dirs_spool_db_path,
+            )
+            print(
+                f"  [Phase 2] Directory spool ready for {len(users)} users "
+                f"({time.time() - spool_start:.2f}s)"
+            )
+        else:
+            for dpath, user_sizes in scan_result.dir_sizes_map.items():
+                for user, size in user_sizes.items():
+                    used = int(size)
+                    user_dirs_map.setdefault(user, []).append((dpath, used))
+                    user_dir_count_map[user] = user_dir_count_map.get(user, 0) + 1
+                    user_dir_used_map[user] = user_dir_used_map.get(user, 0) + used
+            users = sorted(user_dirs_map.keys())
+            print(
+                f"  [Phase 2] Using in-memory directory map "
+                f"({len(scan_result.dir_sizes_map):,} dirs < {spool_min_dirs:,} threshold)"
+            )
 
-        streaming = bool(scan_result.detail_tmpdir)
-        mode_label = "streaming" if streaming else "in-memory"
-        workers_label = f"parallel {max_workers}w" if max_workers > 1 else "sequential"
-        print(f"Phase 2: Writing {len(users)} user detail reports "
-              f"[{mode_label}, {workers_label}]...")
+        try:
+            if not users:
+                print("No users found in scan results — nothing to generate.")
+                return []
 
-        created: List[str] = []
-        failed: List[str] = []
-        total_users = len(users)
-        completed = 0
+            streaming = bool(scan_result.detail_tmpdir)
+            mode_label = "streaming" if streaming else "in-memory"
+            workers_label = f"parallel {max_workers}w" if max_workers > 1 else "sequential"
+            print(f"Phase 2: Writing {len(users)} user detail reports "
+                  f"[{mode_label}, {workers_label}]...")
+            phase2_start = time.time()
+            phase2_mem_start = self._get_rss_mb()
+            phase2_peak_mb = phase2_mem_start
+            print(f"[Phase 2] RAM at start: {phase2_mem_start:.1f} MB")
 
-        # Phase 2 is I/O-bound (reading TSV chunks + writing SQLite).
-        # Capping at 4 threads avoids disk thrashing when max_workers is high.
-        effective_workers = max(1, min(int(max_workers), 4))
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            futures = {
-                executor.submit(self._write_user_detail, u, scan_result, user_dirs_map.get(u, [])): u
-                for u in users
-            }
-            for fut in as_completed(futures):
-                user = futures[fut]
-                completed += 1
-                
-                try:
-                    dir_p, file_p = fut.result()
-                    if dir_p:
-                        created.append(dir_p)
-                    if file_p:
-                        created.append(file_p)
-                except Exception as exc:
-                    failed.append(user)
-                    print(f"  [warn] Failed report for {user!r}: {exc}")
-                
-                if completed % 20 == 0 or completed == total_users:
-                    print(f"  [Phase 2] Progress: {completed}/{total_users} users completed...")
+            created: List[str] = []
+            failed: List[str] = []
+            total_users = len(users)
+            completed = 0
 
-        if failed:
-            print(f"  [warn] {len(failed)} user report(s) failed: {failed}")
+            if not streaming:
+                raise RuntimeError(
+                    "Phase 2 requires Rust streaming outputs (detail_tmpdir). "
+                    "Python in-memory fallback has been removed."
+                )
+            if not HAS_RUST_PHASE2_DB:
+                raise RuntimeError(
+                    "Rust Phase 2 DB core is required. "
+                    "Please build/install fast_scanner with merge_write_user_report_db."
+                )
 
-        output_dir = os.path.dirname(created[0]) if created else '.'
-        print(f"Generated {len(users)} user detail report(s) "
-              f"[{mode_label}, {workers_label}] -> {output_dir}")
+            user_uids_map: Dict[str, List[int]] = {}
+            for uid, uname in scan_result.detail_uid_username.items():
+                user_uids_map.setdefault(uname, []).append(uid)
+            for user in users:
+                if user.startswith("uid-") and user[4:].isdigit() and user not in user_uids_map:
+                    user_uids_map[user] = [int(user[4:])]
 
-        return sorted(created)
+            # Phase 2 is primarily I/O bound. Keep conservative defaults for unstable
+            # storage, but allow wider parallelism on large runs so fast disks are used.
+            requested_workers = max(1, int(max_workers))
+            cpu_cap = max(1, os.cpu_count() or 1)
+            if total_users >= 256:
+                io_cap = 16
+            elif total_users >= 64:
+                io_cap = 12
+            elif total_users >= 16:
+                io_cap = 8
+            else:
+                io_cap = 4
+            effective_workers = max(1, min(requested_workers, io_cap, cpu_cap))
+
+            if effective_workers != requested_workers:
+                print(
+                    f"  [Phase 2] Worker tuning: requested={requested_workers}, "
+                    f"using={effective_workers} (users={total_users}, streaming={streaming})"
+                )
+
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                user_iter = iter(users)
+                inflight = {}
+                max_inflight = max(effective_workers, effective_workers * 3)
+
+                def _submit_next() -> bool:
+                    try:
+                        u = next(user_iter)
+                    except StopIteration:
+                        return False
+                    fut = executor.submit(
+                        self._write_user_detail,
+                        u,
+                        scan_result,
+                        user_dirs_map.get(u, []) if not use_spool else None,
+                        user_uids_map,
+                        dirs_spool_db_path if use_spool else None,
+                        user_dir_count_map.get(u, 0),
+                        user_dir_used_map.get(u, 0),
+                    )
+                    inflight[fut] = u
+                    return True
+
+                for _ in range(min(max_inflight, total_users)):
+                    _submit_next()
+
+                while inflight:
+                    done, _ = wait(tuple(inflight.keys()), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        user = inflight.pop(fut)
+                        completed += 1
+                        try:
+                            dir_p, file_p = fut.result()
+                            if dir_p:
+                                created.append(dir_p)
+                            if file_p:
+                                created.append(file_p)
+                        except Exception as exc:
+                            failed.append(user)
+                            print(f"  [warn] Failed report for {user!r}: {exc}")
+                        _submit_next()
+
+                        if completed % 20 == 0 or completed == total_users:
+                            current_mb = self._get_rss_mb()
+                            if current_mb > phase2_peak_mb:
+                                phase2_peak_mb = current_mb
+                            print(
+                                f"  [Phase 2] Progress: {completed}/{total_users} users completed... "
+                                f"RAM: {current_mb:.1f} MB (peak: {phase2_peak_mb:.1f} MB)"
+                            )
+
+            if failed:
+                print(f"  [warn] {len(failed)} user report(s) failed: {failed}")
+
+            output_dir = os.path.dirname(created[0]) if created else '.'
+            print(f"Generated {len(users)} user detail report(s) "
+                  f"[{mode_label}, {workers_label}] -> {output_dir}")
+            phase2_mem_end = self._get_rss_mb()
+            if phase2_mem_end > phase2_peak_mb:
+                phase2_peak_mb = phase2_mem_end
+            phase2_elapsed = time.time() - phase2_start
+            print(
+                f"[Phase 2] RAM end: {phase2_mem_end:.1f} MB "
+                f"(peak: {phase2_peak_mb:.1f} MB, delta: {phase2_mem_end - phase2_mem_start:+.1f} MB, "
+                f"elapsed: {phase2_elapsed:.2f}s)"
+            )
+
+            return sorted(created)
+        finally:
+            if spool_tmpdir_ctx is not None:
+                spool_tmpdir_ctx.cleanup()

@@ -4,7 +4,7 @@ use pyo3::exceptions::PyRuntimeError;
 use ignore::{WalkBuilder, WalkState};
 use rusqlite::{Connection, params};
 use dashmap::DashSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::fs;
 use std::io::{Write, BufWriter};
@@ -26,6 +26,8 @@ const CRITICAL_SKIP_NAMES: &[&str] = &[
 const DETAIL_FLUSH_THRESHOLD: usize = 50_000;
 /// Max in-memory dir-size entries per thread buffer before flushing to disk.
 const DIR_FLUSH_THRESHOLD: usize = 50_000;
+/// Keep balanced compression level for treemap shards.
+const TREEMAP_ZLIB_LEVEL: u32 = 6;
 
 fn format_num(mut n: u64) -> String {
     if n == 0 { return "0".to_string(); }
@@ -110,7 +112,7 @@ struct ThreadLocalState {
     prog_dirs:  Arc<AtomicU64>,
     prog_size:  Arc<AtomicU64>,
     tmpdir: String,
-    target_uids: Option<Vec<u32>>,
+    target_uids: Option<HashSet<u32>>,
     thread_id: usize,
 }
 
@@ -209,7 +211,9 @@ fn scan_disk(
     let default_threads = (cpus * 2).clamp(4, 32);
     let threads_count = max_workers.unwrap_or(default_threads).max(1);
     let thread_counter = Arc::new(AtomicUsize::new(0));
-    let target_uids_shared = Arc::new(target_uids);
+    let target_uids_shared = Arc::new(
+        target_uids.map(|uids| uids.into_iter().collect::<HashSet<u32>>())
+    );
     // Shared cross-worker hard-link deduplication — DashSet avoids Mutex bottleneck
     let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     // Shared directory loop/bind-mount deduplication — DashSet (16 shards by default)
@@ -294,7 +298,7 @@ fn scan_disk(
                         if let Ok(meta) = fs::symlink_metadata(path) {
                             let uid = meta.uid();
                             let is_target = match &state.target_uids {
-                                Some(vec) => vec.contains(&uid),
+                                Some(set) => set.contains(&uid),
                                 None => true,
                             };
                             if is_target {
@@ -317,7 +321,7 @@ fn scan_disk(
                         if let Ok(meta) = entry.metadata() {
                             let uid = meta.uid();
                             let is_target = match &state.target_uids {
-                                Some(vec) => vec.contains(&uid),
+                                Some(set) => set.contains(&uid),
                                 None => true,
                             };
                             if is_target {
@@ -366,7 +370,7 @@ fn scan_disk(
                         let size = meta.blocks() * 512;
                         let uid  = meta.uid();
                         let is_target = match &state.target_uids {
-                            Some(vec) => vec.contains(&uid),
+                            Some(set) => set.contains(&uid),
                             None => true,
                         };
 
@@ -561,12 +565,8 @@ fn merge_write_user_report(
     output_path: String,
     timestamp:   i64,
 ) -> PyResult<(u64, u64)> {
-    // 1. Glob chunk files sorted (uid_{uid}_t*.tsv) for all uids
-    let mut chunk_files: Vec<String> = Vec::new();
-    for uid in uids {
-        chunk_files.extend(glob_module_rust(&tmpdir, uid)?);
-    }
-    chunk_files.sort();
+    // 1. Glob chunk files sorted for all uids in a single readdir pass.
+    let chunk_files = glob_module_rust_many(&tmpdir, &uids)?;
 
     if chunk_files.is_empty() {
         // Write empty report — same structure Python would write
@@ -662,20 +662,77 @@ fn merge_write_user_report(
 }
 
 
-/// Insert a batch of (dir_id, basename, size, xt) rows into files_data.
-/// Called within an explicit BEGIN...COMMIT transaction for bulk performance.
-fn _insert_file_batch_compressed(
+/// Insert a batch of staged rows into TEMP stage_files.
+/// Called within an explicit transaction for bulk performance.
+fn _insert_stage_batch(
     conn: &Connection,
-    batch: &[(i64, String, u64, String)],
+    batch: &[(i64, i64, u64, i64)],
 ) -> Result<(), rusqlite::Error> {
     if batch.is_empty() { return Ok(()); }
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO files_data (dir_id, basename, size, xt) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO stage_files (dir_id, basename_id, size, xt_id) VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for (dir_id, basename, size, xt) in batch.iter() {
-        stmt.execute(params![dir_id, basename, *size as i64, xt])?;
+    for (dir_id, basename_id, size, xt_id) in batch.iter() {
+        stmt.execute(params![dir_id, basename_id, *size as i64, xt_id])?;
     }
     Ok(())
+}
+
+fn _intern_dir_id(
+    conn: &Connection,
+    dir_cache: &mut HashMap<String, i64>,
+    dir_path: &str,
+) -> Result<i64, rusqlite::Error> {
+    if let Some(&id) = dir_cache.get(dir_path) {
+        return Ok(id);
+    }
+    conn.execute("INSERT OR IGNORE INTO dirs_index(path) VALUES (?1)", params![dir_path])?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM dirs_index WHERE path = ?1",
+        params![dir_path],
+        |r| r.get(0),
+    )?;
+    dir_cache.insert(dir_path.to_string(), id);
+    Ok(id)
+}
+
+fn _intern_basename_id(
+    conn: &Connection,
+    basename_cache: &mut HashMap<String, i64>,
+    basename: &str,
+) -> Result<i64, rusqlite::Error> {
+    if let Some(&id) = basename_cache.get(basename) {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO basename_index(basename) VALUES (?1)",
+        params![basename],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM basename_index WHERE basename = ?1",
+        params![basename],
+        |r| r.get(0),
+    )?;
+    basename_cache.insert(basename.to_string(), id);
+    Ok(id)
+}
+
+fn _intern_xt_id(
+    conn: &Connection,
+    xt_cache: &mut HashMap<String, i64>,
+    xt: &str,
+) -> Result<i64, rusqlite::Error> {
+    if let Some(&id) = xt_cache.get(xt) {
+        return Ok(id);
+    }
+    conn.execute("INSERT OR IGNORE INTO xt_index(xt) VALUES (?1)", params![xt])?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM xt_index WHERE xt = ?1",
+        params![xt],
+        |r| r.get(0),
+    )?;
+    xt_cache.insert(xt.to_string(), id);
+    Ok(id)
 }
 
 #[pyfunction]
@@ -689,51 +746,102 @@ fn merge_write_user_report_db(
 ) -> PyResult<(u64, u64)> {
     let bs = batch_size.unwrap_or(5000).max(1);
 
-    let mut chunk_files: Vec<String> = Vec::new();
-    for uid in uids { chunk_files.extend(glob_module_rust(&tmpdir, uid)?); }
-    chunk_files.sort();
+    let chunk_files = glob_module_rust_many(&tmpdir, &uids)?;
 
     if let Some(parent) = std::path::Path::new(&output_path).parent() {
         fs::create_dir_all(parent)
             .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", parent.display(), e)))?;
     }
 
-    // PRAGMA page_size only applies to a brand-new file — delete before open.
-    let _ = fs::remove_file(&output_path);
-
     let conn = Connection::open(&output_path)
         .map_err(|e| PyRuntimeError::new_err(format!("open sqlite {}: {}", output_path, e)))?;
 
-    // Fix 2: page_size=8192 on fresh file — better B-tree fit for long TEXT paths.
-    // Fix 3: dirs_index deduplicates path prefixes; VIEW 'files' keeps frontend compat.
     conn.execute_batch(
-        "PRAGMA page_size = 8192;
-         PRAGMA journal_mode = OFF;
+        "PRAGMA journal_mode = OFF;
          PRAGMA synchronous = OFF;
          PRAGMA cache_size = -20000;
-         PRAGMA temp_store = MEMORY;
-         CREATE TABLE meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER);
-         CREATE TABLE dirs_index (
+         PRAGMA temp_store = FILE;",
+    ).map_err(|e| PyRuntimeError::new_err(format!("sqlite pragmas: {}", e)))?;
+
+    let files_data_cols: HashSet<String> = conn
+        .prepare("PRAGMA table_info(files_data)")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut cols = HashSet::new();
+            for col in rows.flatten() {
+                cols.insert(col);
+            }
+            Ok(cols)
+        })
+        .unwrap_or_default();
+
+    let is_legacy_schema = files_data_cols.contains("basename") || files_data_cols.contains("xt");
+    if is_legacy_schema {
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS files;
+             DROP INDEX IF EXISTS idx_files_data_xt_size;
+             DROP TABLE IF EXISTS files_data;
+             DROP TABLE IF EXISTS basename_index;
+             DROP TABLE IF EXISTS xt_index;",
+        ).map_err(|e| PyRuntimeError::new_err(format!("sqlite legacy migration: {}", e)))?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (date INTEGER, user TEXT, total_items INTEGER, total_used INTEGER);
+         CREATE TABLE IF NOT EXISTS dirs_index (
              id   INTEGER PRIMARY KEY,
              path TEXT UNIQUE
          );
-         CREATE TABLE files_data (
+         CREATE TABLE IF NOT EXISTS basename_index (
              id       INTEGER PRIMARY KEY,
-             dir_id   INTEGER NOT NULL,
-             basename TEXT    NOT NULL,
-             size     INTEGER NOT NULL,
-             xt       TEXT
+             basename TEXT UNIQUE
          );
-         CREATE VIEW files AS
-             SELECT f.id, d.path || '/' || f.basename AS path, f.size, f.xt
-             FROM   files_data f JOIN dirs_index d ON f.dir_id = d.id;",
+         CREATE TABLE IF NOT EXISTS xt_index (
+             id INTEGER PRIMARY KEY,
+             xt TEXT UNIQUE
+         );
+         CREATE TABLE IF NOT EXISTS files_data (
+             id          INTEGER PRIMARY KEY,
+             dir_id      INTEGER NOT NULL,
+             basename_id INTEGER NOT NULL,
+             size        INTEGER NOT NULL,
+             xt_id       INTEGER
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS uq_files_data_dir_base
+             ON files_data(dir_id, basename_id);
+         CREATE INDEX IF NOT EXISTS idx_files_data_xt_size
+             ON files_data(xt_id, size DESC);
+         CREATE VIEW IF NOT EXISTS files AS
+             SELECT f.id,
+                    d.path || '/' || b.basename AS path,
+                    f.size,
+                    COALESCE(x.xt, '') AS xt
+             FROM files_data f
+             JOIN dirs_index d ON f.dir_id = d.id
+             JOIN basename_index b ON f.basename_id = b.id
+             LEFT JOIN xt_index x ON x.id = f.xt_id;",
     ).map_err(|e| PyRuntimeError::new_err(format!("sqlite setup: {}", e)))?;
 
     let mut total_files: u64 = 0;
     let mut total_used:  u64 = 0;
-    // dir path → rowid cache: avoids re-INSERT + re-SELECT for the same directory
     let mut dir_cache: HashMap<String, i64> = HashMap::with_capacity(50_000);
-    let mut file_batch: Vec<(i64, String, u64, String)> = Vec::with_capacity(bs);
+    let mut basename_cache: HashMap<String, i64> = HashMap::with_capacity(50_000);
+    let mut xt_cache: HashMap<String, i64> = HashMap::with_capacity(2_000);
+    let mut stage_batch: Vec<(i64, i64, u64, i64)> = Vec::with_capacity(bs);
+
+    // Keep cache growth bounded on very large scans (millions of unique names/dirs).
+    let cache_soft_cap = 300_000usize;
+
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TEMP TABLE stage_files (
+             dir_id      INTEGER NOT NULL,
+             basename_id INTEGER NOT NULL,
+             size        INTEGER NOT NULL,
+             xt_id       INTEGER,
+             PRIMARY KEY(dir_id, basename_id)
+         );",
+    ).map_err(|e| PyRuntimeError::new_err(format!("stage setup: {}", e)))?;
 
     if !chunk_files.is_empty() {
         let mut readers: Vec<std::io::Lines<BufReader<fs::File>>> = Vec::new();
@@ -753,66 +861,108 @@ fn merge_write_user_report_db(
             }
         }
 
-        // Single ongoing transaction; commit every `bs` rows to bound in-memory usage.
-        conn.execute_batch("BEGIN")
-            .map_err(|e| PyRuntimeError::new_err(format!("BEGIN: {}", e)))?;
-
         while let Some((size, raw_path, idx)) = heap.pop() {
-            let safe     = sanitise_path(&raw_path);
+            let safe = sanitise_path(&raw_path);
             let path_ref = std::path::Path::new(&safe);
 
-            let dir_str  = path_ref.parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
-            let basename = path_ref.file_name().and_then(|n| n.to_str()).unwrap_or(&safe).to_string();
-            let xt       = path_ref.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            let dir_str = path_ref.parent().and_then(|p| p.to_str()).unwrap_or("");
+            let basename = path_ref.file_name().and_then(|n| n.to_str()).unwrap_or(&safe);
+            let xt = path_ref.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
 
-            // Get or create dir_id — only INSERT on cache miss; use last_insert_rowid() for speed.
-            let dir_id = match dir_cache.get(&dir_str) {
-                Some(&id) => id,
-                None => {
-                    conn.execute("INSERT INTO dirs_index (path) VALUES (?1)", params![&dir_str])
-                        .map_err(|e| PyRuntimeError::new_err(format!("dir insert: {}", e)))?;
-                    let id = conn.last_insert_rowid();
-                    dir_cache.insert(dir_str, id);
-                    id
-                }
-            };
+            let dir_id = _intern_dir_id(&conn, &mut dir_cache, dir_str)
+                .map_err(|e| PyRuntimeError::new_err(format!("dir intern: {}", e)))?;
+            let basename_id = _intern_basename_id(&conn, &mut basename_cache, basename)
+                .map_err(|e| PyRuntimeError::new_err(format!("basename intern: {}", e)))?;
+            let xt_id = _intern_xt_id(&conn, &mut xt_cache, &xt)
+                .map_err(|e| PyRuntimeError::new_err(format!("xt intern: {}", e)))?;
 
-            file_batch.push((dir_id, basename, size, xt));
+            stage_batch.push((dir_id, basename_id, size, xt_id));
             total_files += 1;
-            total_used  += size;
+            total_used += size;
 
-            if file_batch.len() >= bs {
-                _insert_file_batch_compressed(&conn, &file_batch)
-                    .map_err(|e| PyRuntimeError::new_err(format!("file batch insert: {}", e)))?;
-                file_batch.clear();
-                // Periodic commit keeps memory bounded; immediately reopen transaction.
-                conn.execute_batch("COMMIT; BEGIN")
-                    .map_err(|e| PyRuntimeError::new_err(format!("COMMIT/BEGIN: {}", e)))?;
+            if stage_batch.len() >= bs {
+                _insert_stage_batch(&conn, &stage_batch)
+                    .map_err(|e| PyRuntimeError::new_err(format!("stage batch insert: {}", e)))?;
+                stage_batch.clear();
+            }
+
+            if dir_cache.len() > cache_soft_cap {
+                dir_cache.clear();
+            }
+            if basename_cache.len() > cache_soft_cap {
+                basename_cache.clear();
+            }
+            if xt_cache.len() > 16_384 {
+                xt_cache.clear();
             }
 
             if let Some(Ok(line)) = readers[idx].next() {
-                if let Some((sz2, p2)) = parse_tsv_line(&line) { heap.push((sz2, p2, idx)); }
+                if let Some((sz2, p2)) = parse_tsv_line(&line) {
+                    heap.push((sz2, p2, idx));
+                }
             }
         }
-
-        if !file_batch.is_empty() {
-            _insert_file_batch_compressed(&conn, &file_batch)
-                .map_err(|e| PyRuntimeError::new_err(format!("final file batch: {}", e)))?;
-        }
-        conn.execute_batch("COMMIT")
-            .map_err(|e| PyRuntimeError::new_err(format!("COMMIT final: {}", e)))?;
     }
 
+    if !stage_batch.is_empty() {
+        _insert_stage_batch(&conn, &stage_batch)
+            .map_err(|e| PyRuntimeError::new_err(format!("final stage insert: {}", e)))?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO files_data (dir_id, basename_id, size, xt_id)
+         SELECT sf.dir_id, sf.basename_id, sf.size, sf.xt_id
+         FROM stage_files sf",
+        [],
+    ).map_err(|e| PyRuntimeError::new_err(format!("insert new files_data: {}", e)))?;
+
+    conn.execute(
+        "UPDATE files_data
+         SET size = (
+                 SELECT sf.size
+                 FROM stage_files sf
+                 WHERE sf.dir_id = files_data.dir_id
+                   AND sf.basename_id = files_data.basename_id
+             ),
+             xt_id = (
+                 SELECT sf.xt_id
+                 FROM stage_files sf
+                 WHERE sf.dir_id = files_data.dir_id
+                   AND sf.basename_id = files_data.basename_id
+             )
+         WHERE EXISTS (
+             SELECT 1
+             FROM stage_files sf
+             WHERE sf.dir_id = files_data.dir_id
+               AND sf.basename_id = files_data.basename_id
+               AND (
+                   files_data.size != sf.size
+                   OR IFNULL(files_data.xt_id, -1) != IFNULL(sf.xt_id, -1)
+               )
+         )",
+        [],
+    ).map_err(|e| PyRuntimeError::new_err(format!("update changed files_data: {}", e)))?;
+
+    conn.execute(
+        "DELETE FROM files_data
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM stage_files sf
+             WHERE sf.dir_id = files_data.dir_id
+               AND sf.basename_id = files_data.basename_id
+         )",
+        [],
+    ).map_err(|e| PyRuntimeError::new_err(format!("delete stale files_data: {}", e)))?;
+
+    conn.execute("DELETE FROM meta", [])
+        .map_err(|e| PyRuntimeError::new_err(format!("meta reset: {}", e)))?;
     conn.execute(
         "INSERT INTO meta(date, user, total_items, total_used) VALUES (?1, ?2, ?3, ?4)",
         params![timestamp, sanitise_path(&username), total_files as i64, total_used as i64],
     ).map_err(|e| PyRuntimeError::new_err(format!("meta insert: {}", e)))?;
 
-    // Fix 1: idx_files_size removed — K-way merge already writes rows in size DESC order.
-    // xt+size index retained for extension-filter queries from the frontend.
-    conn.execute_batch(
-        "CREATE INDEX idx_files_data_xt_size ON files_data(xt, size DESC);",
-    ).map_err(|e| PyRuntimeError::new_err(format!("index creation: {}", e)))?;
+    conn.execute_batch("DROP TABLE stage_files; COMMIT")
+        .map_err(|e| PyRuntimeError::new_err(format!("stage commit: {}", e)))?;
 
     Ok((total_files, total_used))
 }
@@ -826,18 +976,36 @@ fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     Some((size, path))
 }
 
-fn glob_module_rust(tmpdir: &str, uid: u32) -> PyResult<Vec<String>> {
-    let prefix = format!("uid_{}_t", uid);
-    let suffix = ".tsv";
+fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<String>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let wanted: HashSet<u32> = uids.iter().copied().collect();
     let mut files = Vec::new();
     let dir = fs::read_dir(tmpdir)
         .map_err(|e| PyRuntimeError::new_err(format!("readdir {}: {}", tmpdir, e)))?;
+
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && name.ends_with(suffix) {
+        if !name.starts_with("uid_") || !name.ends_with(".tsv") {
+            continue;
+        }
+
+        // Expected: uid_{uid}_t{thread}_c{chunk}.tsv
+        let rest = &name[4..];
+        let Some(pivot) = rest.find("_t") else { continue };
+        if pivot == 0 {
+            continue;
+        }
+        let uid_raw = &rest[..pivot];
+        let Ok(uid) = uid_raw.parse::<u32>() else { continue };
+        if wanted.contains(&uid) {
             files.push(entry.path().to_string_lossy().to_string());
         }
     }
+
+    files.sort();
     Ok(files)
 }
 
@@ -907,6 +1075,32 @@ fn tm_basename(path: &str) -> &str {
         Some(pos) => &path[pos + 1..],
         None => path,
     }
+}
+
+#[derive(serde::Serialize)]
+struct ShardDirectoryItem {
+    id: usize,
+    name: String,
+    size: i64,
+    owner: String,
+    children_count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ShardFileGroupItem {
+    name: String,
+    size: i64,
+    #[serde(rename = "type")]
+    item_type: &'static str,
+    owner: String,
+    children_count: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ShardItem {
+    Directory(ShardDirectoryItem),
+    FileGroup(ShardFileGroupItem),
 }
 
 /// Full Phase 3 pipeline implemented entirely in Rust.
@@ -1102,71 +1296,6 @@ fn generate_treemap_sqlite(
 
         // ── 3.2: Parallel shard generation: JSON → zlib (Rayon) ──────────────
         // All maps are read-only here → safe for parallel access.
-        let shards: Vec<(String, String, Vec<u8>)> = shard_order
-            .par_iter()
-            .map(|&rid| {
-                let path = &id_to_path[rid];
-                let shard_id_str = path_to_shard[&rid].to_string();
-
-                let empty = Vec::new();
-                let children_ids = parent_to_children.get(&rid).unwrap_or(&empty);
-
-                let mut items: Vec<serde_json::Value> =
-                    Vec::with_capacity(children_ids.len());
-
-                for &cid in children_ids {
-                    let size = recursive_sizes.get(&cid).copied().unwrap_or(0);
-                    if size < min_size_bytes {
-                        continue;
-                    }
-                    let cp = &id_to_path[cid];
-                    items.push(serde_json::json!({
-                        "id":             path_to_shard[&cid],
-                        "name":           tm_basename(cp),
-                        "size":           size,
-                        "owner":          dir_owner_map.get(cp.as_str())
-                                              .map(|s| s.as_str())
-                                              .unwrap_or("unknown"),
-                        "children_count": parent_to_children
-                                              .get(&cid)
-                                              .map(|v| v.len())
-                                              .unwrap_or(0),
-                    }));
-                }
-                // Add [Files in <dir>] entry for direct file bytes (not subdirs).
-                // d_direct = this dir's total size minus the sum of all children dir sizes.
-                let children_total: i64 = children_ids
-                    .iter()
-                    .map(|&cid| recursive_sizes.get(&cid).copied().unwrap_or(0))
-                    .sum();
-                let d_direct = recursive_sizes.get(&rid).copied().unwrap_or(0) - children_total;
-                if d_direct > 0 && d_direct >= min_size_bytes {
-                    let base = tm_basename(path);
-                    let label = if base.is_empty() { path.as_str() } else { base };
-                    items.push(serde_json::json!({
-                        "name":           format!("[Files in {}]", label),
-                        "size":           d_direct,
-                        "type":           "file_group",
-                        "owner":          dir_owner_map.get(path.as_str())
-                                              .map(|s| s.as_str())
-                                              .unwrap_or("unknown"),
-                        "children_count": 0_u64,
-                    }));
-                }
-
-                // Compact JSON (no extra spaces) then zlib level-6
-                let json_bytes = serde_json::to_vec(&items).expect("json");
-                let mut enc = ZlibEncoder::new(
-                    Vec::with_capacity(json_bytes.len() / 2 + 32),
-                    Compression::new(6),
-                );
-                enc.write_all(&json_bytes).expect("zlib write");
-                let compressed = enc.finish().expect("zlib finish");
-
-                (shard_id_str, path.clone(), compressed)
-            })
-            .collect();
-
         // ── 3.3: Single-transaction SQLite write ──────────────────────────────
         let mut conn = Connection::open(&db_path)
             .map_err(|e| format!("open db '{}': {}", db_path, e))?;
@@ -1187,18 +1316,99 @@ fn generate_treemap_sqlite(
         let tx = conn
             .transaction()
             .map_err(|e| format!("begin tx: {}", e))?;
+        let mut inserted_count: u64 = 0;
+        // Build shard payloads in bounded parallel chunks to reduce peak RSS.
+        let shard_chunk_size: usize = if shard_order.len() > 200_000 {
+            256
+        } else if shard_order.len() > 80_000 {
+            512
+        } else if shard_order.len() > 20_000 {
+            1024
+        } else {
+            2048
+        };
         {
             let mut stmt = tx
                 .prepare("INSERT INTO shards VALUES (?1, ?2, ?3)")
                 .map_err(|e| format!("prepare: {}", e))?;
-            for (id, path, blob) in &shards {
-                stmt.execute(rusqlite::params![id, path, blob.as_slice()])
-                    .map_err(|e| format!("insert '{}': {}", id, e))?;
+            for chunk in shard_order.chunks(shard_chunk_size) {
+                let rows: Vec<(String, String, Vec<u8>)> = chunk
+                    .par_iter()
+                    .map(|&rid| {
+                        let path = &id_to_path[rid];
+                        let shard_id_str = path_to_shard[&rid].to_string();
+
+                        let empty = Vec::new();
+                        let children_ids = parent_to_children.get(&rid).unwrap_or(&empty);
+
+                        let mut items: Vec<ShardItem> =
+                            Vec::with_capacity(children_ids.len() + 1);
+
+                        for &cid in children_ids {
+                            let size = recursive_sizes.get(&cid).copied().unwrap_or(0);
+                            if size < min_size_bytes {
+                                continue;
+                            }
+                            let cp = &id_to_path[cid];
+                            items.push(ShardItem::Directory(ShardDirectoryItem {
+                                id: path_to_shard[&cid],
+                                name: tm_basename(cp).to_string(),
+                                size,
+                                owner: dir_owner_map
+                                    .get(cp.as_str())
+                                    .cloned()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                                children_count: parent_to_children
+                                    .get(&cid)
+                                    .map(|v| v.len())
+                                    .unwrap_or(0),
+                            }));
+                        }
+                        // Add [Files in <dir>] entry for direct file bytes (not subdirs).
+                        // d_direct = this dir's total size minus the sum of all children dir sizes.
+                        let children_total: i64 = children_ids
+                            .iter()
+                            .map(|&cid| recursive_sizes.get(&cid).copied().unwrap_or(0))
+                            .sum();
+                        let d_direct = recursive_sizes.get(&rid).copied().unwrap_or(0) - children_total;
+                        if d_direct > 0 && d_direct >= min_size_bytes {
+                            let base = tm_basename(path);
+                            let label = if base.is_empty() { path.as_str() } else { base };
+                            items.push(ShardItem::FileGroup(ShardFileGroupItem {
+                                name: format!("[Files in {}]", label),
+                                size: d_direct,
+                                item_type: "file_group",
+                                owner: dir_owner_map
+                                    .get(path.as_str())
+                                    .cloned()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                                children_count: 0,
+                            }));
+                        }
+
+                        // Compact JSON (no extra spaces) then zlib level-6
+                        let json_bytes = serde_json::to_vec(&items).expect("json");
+                        let mut enc = ZlibEncoder::new(
+                            Vec::with_capacity(json_bytes.len() / 2 + 32),
+                            Compression::new(TREEMAP_ZLIB_LEVEL),
+                        );
+                        enc.write_all(&json_bytes).expect("zlib write");
+                        let compressed = enc.finish().expect("zlib finish");
+
+                        (shard_id_str, path.clone(), compressed)
+                    })
+                    .collect();
+
+                for (id, path, blob) in rows {
+                    stmt.execute(rusqlite::params![&id, &path, blob.as_slice()])
+                        .map_err(|e| format!("insert '{}': {}", id, e))?;
+                    inserted_count += 1;
+                }
             }
         }
         tx.commit().map_err(|e| format!("commit: {}", e))?;
 
-        Ok(shards.len() as u64)
+        Ok(inserted_count)
     })
     .map_err(PyRuntimeError::new_err)
 }
@@ -1302,7 +1512,7 @@ fn compress_and_write_shards(
             .map(|(id, path, json)| {
                 let mut enc = ZlibEncoder::new(
                     Vec::with_capacity(json.len() / 2 + 32),
-                    Compression::new(6),
+                    Compression::new(TREEMAP_ZLIB_LEVEL),
                 );
                 enc.write_all(json.as_bytes()).expect("zlib write");
                 (id, path, enc.finish().expect("zlib finish"))

@@ -226,7 +226,7 @@ class TreeMapGenerator:
                 self.db_queue.task_done()
                 break
             shard_id, shard_path, json_data = item
-            compressed = sqlite3.Binary(zlib.compress(json_data.encode(), level=6))
+            compressed = sqlite3.Binary(zlib.compress(json_data.encode(), level=9))
             batch.append((shard_id, shard_path, compressed))
             count += 1
             if len(batch) >= 5000:
@@ -264,7 +264,7 @@ class TreeMapGenerator:
                 if len(parts) != 3:
                     continue
                 shard_id, shard_path, json_data = parts
-                compressed = sqlite3.Binary(zlib.compress(json_data.encode(), level=6))
+                compressed = sqlite3.Binary(zlib.compress(json_data.encode(), level=9))
                 batch.append((shard_id, shard_path, compressed))
                 count += 1
                 if len(batch) >= 5000:
@@ -315,7 +315,7 @@ class TreeMapGenerator:
         )
         batch: list = []
         for shard_id, shard_path, json_data in items:
-            compressed = sqlite3.Binary(zlib.compress(json_data.encode(), level=6))
+            compressed = sqlite3.Binary(zlib.compress(json_data.encode(), level=9))
             batch.append((shard_id, shard_path, compressed))
             if len(batch) >= 5000:
                 cursor.executemany("INSERT INTO shards VALUES (?,?,?)", batch)

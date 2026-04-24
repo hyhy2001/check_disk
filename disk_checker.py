@@ -178,7 +178,6 @@ def main():
             print(f"Target directory: {config.get('directory', '')}")
 
             report_generator = ReportGenerator(config)
-            report_generator.clear_old_detail_reports()
 
             scanner = DiskScanner(
                 config,
@@ -200,6 +199,10 @@ def main():
                 scan_results,
                 max_workers=scanner.max_workers,
             )
+            # Keep incremental-sync benefits by avoiding pre-run wipe.
+            # Remove only stale detail files after new reports are generated.
+            if not config.get('target_users_only', False):
+                report_generator.cleanup_stale_detail_reports(created)
 
             # TreeMap report runs after detail export (Phase 3)
             if getattr(args, 'tree_map', False):
