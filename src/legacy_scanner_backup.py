@@ -1,12 +1,31 @@
 """
 Disk Scanner Module - Optimized Version
 """
-import os
-import stat as stat_module
-import time
-import threading
-import heapq
+import atexit
 import glob as glob_module
+import os
+import shutil
+import stat as stat_module
+import tempfile
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from os import scandir
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from .utils import (
+    ScanHelper,
+    build_uid_cache,
+    create_usage_bar,
+    format_size,
+    format_time_duration,
+    get_actual_disk_usage,
+    get_general_system_info,
+    get_owner_from_path,
+    get_username_from_uid,
+)
+
 
 def _get_rss_mb() -> float:
     """Read RSS memory from /proc/self/status in MB (Linux only) to avoid psutil dependency."""
@@ -19,22 +38,8 @@ def _get_rss_mb() -> float:
         pass
     return 0.0
 
-import shutil
-import atexit
-import tempfile
-from os import scandir
-from collections import defaultdict, deque
-from typing import Dict, List, Any, Set, Optional, Tuple
-from dataclasses import dataclass, field
-
-from src.utils import (
-    format_size, get_general_system_info, build_uid_cache,
-    get_username_from_uid, get_owner_from_path, ScanHelper,
-    format_time_duration, get_actual_disk_usage, create_usage_bar
-)
-
 try:
-    import fast_scanner
+    import .fast_scanner  # noqa: F401
     HAS_RUST_CORE = True
 except ImportError:
     HAS_RUST_CORE = False
@@ -135,25 +140,25 @@ class LegacyDiskScanner:
         """Build mapping from username to team name"""
         user_map = {}
         team_id_to_name = {team["team_ID"]: team["name"] for team in self.config.get("teams", [])}
-        
+
         for user in self.config.get("users", []):
             username = user["name"]
             team_id = user["team_ID"]
             if team_id in team_id_to_name:
                 user_map[username] = team_id_to_name[team_id]
-                
+
         return user_map
-    
+
 
     def _determine_thread_count(self, max_workers: Optional[int]) -> int:
         """Determine optimal thread count based on system resources"""
         if max_workers is not None:
             return max_workers
-            
+
         cpu_count = os.cpu_count() or 8
         # Auto: 2x CPU cores, capped at 64 for high-latency storage (NFS/SAN)
         return min(cpu_count * 2, 64)
-    
+
     def _worker(self, thread_id: int,
                 work_queues: List[List[str]],
                 thread_stats: List[ThreadStats],
@@ -302,7 +307,7 @@ class LegacyDiskScanner:
                     global_queue.extend(subdirs[1:])
                 # Signal that new work is available
                 work_event.set()
-    
+
     # ── Streaming file-path helpers ──────────────────────────────────────────
 
     def _flush_thread_paths(self, stats: ThreadStats, thread_id: int) -> None:
@@ -369,7 +374,7 @@ class LegacyDiskScanner:
             self.root_dev = 0  # unknown: skip device check
 
         print(f"Starting scan with {self.max_workers} workers...")  # full scan
-        
+
         thread_stats = [ThreadStats() for _ in range(self.max_workers)]
         work_queues = [[] for _ in range(self.max_workers)]
 
@@ -380,7 +385,7 @@ class LegacyDiskScanner:
 
         active_workers = [0] * self.max_workers
         done_flag = [False]
-        
+
         last_report = [start_time]
         last_files = [0]
         last_dirs = [0]
@@ -391,7 +396,7 @@ class LegacyDiskScanner:
         last_progress_files = [0]
         stalled_time = [0]
         MAX_STALL_TIME = 1800  # Maximum time to allow stalled progress (seconds)
-        
+
         def report_progress():
             """Progress reporting thread function"""
             while not done_flag[0]:
@@ -404,13 +409,13 @@ class LegacyDiskScanner:
                     stalled_time[0] = current_time - last_progress_time[0]
                     if stalled_time[0] > MAX_STALL_TIME:
                         print(f"\nWARNING: Scan appears stalled for {stalled_time[0]:.1f} seconds. Checking for stuck workers...")
-                        
+
                         # Check which workers are active but not making progress
                         stuck_workers = []
                         for i, active in enumerate(active_workers):
                             if active == 1:
                                 stuck_workers.append(i)
-                        
+
                         if stuck_workers:
                             print(f"Workers {stuck_workers} appear to be stuck. Attempting to terminate scan gracefully.")
                             done_flag[0] = True
@@ -419,7 +424,7 @@ class LegacyDiskScanner:
                     last_progress_files[0] = total_files
                     last_progress_time[0] = current_time
                     stalled_time[0] = 0
-                
+
                 if current_time - last_report[0] >= self.progress_interval:
                     elapsed = current_time - start_time
                     total_files = sum(s.files for s in thread_stats)
@@ -427,33 +432,32 @@ class LegacyDiskScanner:
                     total_size = sum(s.total_size for s in thread_stats)
                     interval = current_time - last_report[0]
                     file_rate = (total_files - last_files[0]) / interval if interval > 0 else 0
-                    dir_rate = (total_dirs - last_dirs[0]) / interval if interval > 0 else 0
-                    
+
                     if file_rate > peak_rate[0]:
                         peak_rate[0] = file_rate
                     active = sum(active_workers)
                     local_q = sum(len(q) for q in work_queues)
                     global_q = len(global_queue)  # len(deque) is atomic under GIL
-                    
+
                     # Get memory usage
                     mem_usage = _get_rss_mb()
-                    
+
                     # Check memory limit
                     if hasattr(self, 'max_memory_mb') and mem_usage > getattr(self, 'max_memory_mb', 20480):
                         print(f"\nWARNING: Memory usage ({mem_usage:.1f} MB) exceeds limit. Terminating scan.")
                         done_flag[0] = True
                         return
-                    
+
                     # Compact progress output with memory usage
                     print(f"[{format_time_duration(elapsed)}] Files: {total_files:,} | Dirs: {total_dirs:,} | Size: {format_size(total_size)} | Rate: {file_rate:,.0f} files/s | Workers: {active}/{self.max_workers} | Queue: {local_q + global_q:,} | Mem: {mem_usage:.1f} MB")
                     last_report[0] = current_time
                     last_files[0] = total_files
                     last_dirs[0] = total_dirs
-        
+
         # Start progress reporting thread
         progress_thread = threading.Thread(target=report_progress, daemon=True)
         progress_thread.start()
-        
+
         # Start worker threads
         threads = []
         for i in range(self.max_workers):
@@ -465,7 +469,7 @@ class LegacyDiskScanner:
             )
             t.start()
             threads.append(t)
-        
+
         try:
             # Wait for all threads to complete
             for t in threads:
@@ -476,26 +480,26 @@ class LegacyDiskScanner:
         finally:
             done_flag[0] = True
             progress_thread.join(timeout=1)
-        
+
         elapsed = time.time() - start_time
-        
+
         # Merge results from all threads
-        print(f"\nMerging results...")
-        
+        print("\nMerging results...")
+
         self._process_scan_results(thread_stats)
-        
+
         # Calculate and display statistics
         total_files = sum(s.files for s in thread_stats)
         total_dirs = sum(s.dirs for s in thread_stats)
         total_size = sum(s.total_size for s in thread_stats)
         avg_rate = total_files / elapsed if elapsed > 0 else 0
-        
+
         # Get memory usage
         mem_usage = _get_rss_mb()
-        
+
         # Get general system info
         system = self.general_system
-        
+
         print(f"\n{'='*60}")
         print(f"SCAN COMPLETED in {format_time_duration(elapsed)}")
         print(f"{'='*60}")
@@ -506,20 +510,20 @@ class LegacyDiskScanner:
         print(f"Scan rate:        {avg_rate:,.0f} files/sec (peak: {peak_rate[0]:,.0f})")
         print(f"Memory usage:     {mem_usage:.1f} MB")
         print(f"{'='*60}")
-        print(f"Disk Information:")
+        print("Disk Information:")
         print(f"  Total capacity: {format_size(system.get('total', 0))}")
         print(f"  Used space:     {format_size(system.get('used', 0))} ({system.get('used', 0) * 100 / system.get('total', 1):.1f}%)")
         print(f"  Available:      {format_size(system.get('available', 0))}")
         print(f"{'='*60}")
-        
+
         self._display_scan_summary()
-        
+
         return total_size
-    
+
     def _process_scan_results(self, thread_stats: List[ThreadStats]) -> None:
         """
         Process and merge results from all worker threads.
-        
+
         Args:
             thread_stats: List of ThreadStats objects from worker threads
         """
@@ -564,7 +568,7 @@ class LegacyDiskScanner:
 
         # Process directory data
         self._process_directory_data(thread_stats)
-    
+
     # Kept for API compatibility; streaming version replaces the in-memory sort.
     def _merge_file_paths(self, merged: Dict[int, List[Tuple[str, int]]]) -> None:
         """Deprecated: use _stream_merge_to_results() instead."""
@@ -576,22 +580,22 @@ class LegacyDiskScanner:
     def _process_directory_data(self, thread_stats: List[ThreadStats]) -> None:
         """
         Process directory data from all worker threads.
-        
+
         Args:
             thread_stats: List of ThreadStats objects from worker threads
         """
         print("Processing directory data...")
         dir_uid_merged = {}
-        
+
         # Process each thread's directory data separately
         for stats in thread_stats:
             for dir_path, uid_sizes in stats.dir_sizes.items():
                 if dir_path not in dir_uid_merged:
                     dir_uid_merged[dir_path] = defaultdict(int)
-                
+
                 for uid, size in uid_sizes.items():
                     dir_uid_merged[dir_path][uid] += size
-        
+
         # Convert directory data to user format
         print("Converting directory data to user format...")
         for dir_path, uid_sizes in dir_uid_merged.items():
@@ -599,38 +603,38 @@ class LegacyDiskScanner:
             for uid, size in uid_sizes.items():
                 username = get_username_from_uid(uid, self.uid_to_username)
                 self.dir_usage_results[dir_path][username] = size
-    
+
     def _display_scan_summary(self) -> None:
         """Display a summary of the scan results."""
         # Import TableFormatter here to avoid circular imports
-        from src.formatters.table_formatter import TableFormatter
+        from .formatters.table_formatter import TableFormatter
         table_formatter = TableFormatter()
 
         # Display team usage report
         if self.team_usage_results:
             print("\nTeam disk usage summary:")
-            
+
             # Create table for team summary
             headers = ["Team", "Disk Usage", "Percent"]
             rows = []
-            
+
             # Get total disk capacity for percentage calculation
             total_capacity = self.general_system.get('total', 1)
-            
+
             # Add "Other" category to team usage
             other_total = sum(self.other_usage_results.values())
             team_usage_with_other = dict(self.team_usage_results)
             team_usage_with_other["Other"] = other_total
-            
+
             for team, size in sorted(team_usage_with_other.items(), key=lambda x: x[1], reverse=True):
                 percent = (size / total_capacity) * 100
                 usage_bar = self._create_usage_bar(percent)
                 rows.append([team, format_size(size), f"{usage_bar} {percent:.1f}%"])
-            
+
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Team Disk Usage")
                 print(table)
-        
+
         # Show top users in console
         print("\nTop users by disk usage:")
         headers = ["Username", "Disk Usage", "Percent"]
@@ -644,57 +648,57 @@ class LegacyDiskScanner:
         if rows:
             table = table_formatter.format_table(headers, rows, title="Top 20 Users by Disk Usage")
             print(table)
-        
+
         # Display users with permission issues
         if self.permission_issues:
             print("\nUsers with permission issues:")
-            
+
             # Create table for permission issues
             headers = ["Username", "Inaccessible Items"]
             rows = []
-            
+
             for username, issues in sorted(self.permission_issues.items()):
                 rows.append([username, len(issues)])
-            
+
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Permission Issues (Count by User)")
                 print(table)
-    
+
     def _create_usage_bar(self, percent: float, width: int = 20) -> str:
         """Delegate to shared utility."""
         return create_usage_bar(percent, width)
-    
+
     def scan(self) -> ScanResult:
         """
         Perform a complete disk scan.
-        
+
         Returns:
             ScanResult object with all scan data
         """
         print(f"Scanning: {self.location}")
         print(f"Workers: {self.max_workers}\n")
-        
+
         try:
             self.get_tree_size(self.location)
-            
+
             # Create user_list and other_list with all users (no filtering)
             user_list = ScanHelper.create_user_list(self.user_usage_results)
             team_list = ScanHelper.create_user_list(self.team_usage_results)
             other_list = ScanHelper.create_user_list(self.other_usage_results)
-            
+
             # Add "Other" category to team list
             other_total = sum(item["used"] for item in other_list)
             team_list.append({"name": "Other", "used": other_total})
-            
+
             # Create top directories list
             print("Creating directory details list...")
             top_dir_list = self._create_top_dir_list()
-            
+
             # Format permission issues
             permission_issues_data = self._format_permission_issues()
-            
+
             print(f"Found {len(top_dir_list)} directory entries")
-            
+
             return ScanResult(
                 general_system=self.general_system,
                 team_usage=team_list,
@@ -708,7 +712,7 @@ class LegacyDiskScanner:
                 detail_tmpdir=self._tmpdir,
                 detail_uid_username=getattr(self, '_detail_uid_username', {}),
             )
-        except Exception as e:
+        except Exception:
             import traceback
             traceback.print_exc()
             return ScanResult(
@@ -716,11 +720,11 @@ class LegacyDiskScanner:
                 team_usage=[], user_usage=[], other_usage=[],
                 timestamp=int(time.time())
             )
-    
+
     def _create_top_dir_list(self) -> List[Dict[str, Any]]:
         """
         Create a list of top directories by usage.
-        
+
         Returns:
             List of directory dictionaries
         """
@@ -739,7 +743,7 @@ class LegacyDiskScanner:
 
         top_dir_list.sort(key=lambda x: x["user_usage"], reverse=True)
         return top_dir_list
-    
+
     def _format_permission_issues(self) -> Dict[str, Any]:
         """
         Format permission issues in the nested structure.
@@ -755,7 +759,7 @@ class LegacyDiskScanner:
                     "type":  issue.get("type",  ""),
                     "error": issue.get("error", ""),
                 })
-            
+
             users_list.append({
                 "name": username,
                 "inaccessible_items": inaccessible_items

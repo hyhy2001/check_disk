@@ -10,16 +10,16 @@ Optimized for 6M+ directories:
 - O(1) depth from simple path separator count (no os.path.relpath)
 """
 
-import os
 import json
-import zlib
-import sqlite3
-import time
-import queue
-import threading
+import os
 import pwd
-from typing import Dict, Any, List, Set, Tuple, Optional
+import queue
+import sqlite3
+import threading
+import time
+import zlib
 from collections import defaultdict
+from typing import Dict, List, Optional, Set
 
 try:
     from src import fast_scanner as _fast_scanner
@@ -145,9 +145,9 @@ class TreeMapGenerator:
             for child_id in parent_to_children_ids.get(path_id, []):
                 child_path = self.id_to_path[child_id]
                 child_size = recursive_sizes.get(child_id, 0)
+                child_depth = self._get_depth_by_id(child_id)
 
                 # Pruning by size (only active if min_size_mb > 0)
-                child_depth = self._get_depth_by_id(child_id)
                 if self.min_size_bytes > 0 and child_size < self.min_size_bytes and child_depth > 1:
                     continue
 
@@ -360,7 +360,8 @@ class TreeMapGenerator:
             abs_path = os.path.abspath(dpath)
             depth = self._get_depth(abs_path)
             size = sum(uids.values())
-            if size <= 0: continue
+            if size <= 0:
+                continue
 
             target_path = abs_path
             if depth > self.max_level:
@@ -376,15 +377,18 @@ class TreeMapGenerator:
             while len(curr) >= len(self.root_dir):
                 cid = self._get_id(curr)
                 all_dirs_ids.add(cid)
-                if curr == self.root_dir: break
+                if curr == self.root_dir:
+                    break
                 parent = os.path.dirname(curr)
-                if parent == curr: break
+                if parent == curr:
+                    break
                 curr = parent
 
         parent_to_children_ids: Dict[int, List[int]] = defaultdict(list)
         for rid in all_dirs_ids:
             path = self.id_to_path[rid]
-            if path == self.root_dir: continue
+            if path == self.root_dir:
+                continue
             parent_id = self._get_id(os.path.dirname(path))
             if parent_id in all_dirs_ids:
                 parent_to_children_ids[parent_id].append(rid)
@@ -398,7 +402,8 @@ class TreeMapGenerator:
         recursive_sizes: Dict[int, int] = {rid: direct_sizes_ids.get(rid, 0) for rid in all_dirs_ids}
         for rid in sorted_ids:
             path = self.id_to_path[rid]
-            if path == self.root_dir: continue
+            if path == self.root_dir:
+                continue
             parent_id = self._get_id(os.path.dirname(path))
             if parent_id in recursive_sizes:
                 recursive_sizes[parent_id] += recursive_sizes[rid]
@@ -408,7 +413,6 @@ class TreeMapGenerator:
         root_children = []
         for child_id in parent_to_children_ids.get(root_id, []):
             cp = self.id_to_path[child_id]
-            child_depth = self._get_depth_by_id(child_id)
             root_children.append({
                 "name": os.path.basename(cp) or cp,
                 "path": cp,
@@ -442,7 +446,8 @@ class TreeMapGenerator:
 
         # 4. Phase 3.2: Parallel serialization and streaming to SQLite
         db_path = os.path.join(os.path.dirname(output_path), "tree_map_data.db")
-        if os.path.exists(db_path): os.remove(db_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
         print(f"Phase 3.2: Processing shards with {self.max_workers} threads...")
         db_thread = threading.Thread(target=self._db_worker, args=(db_path,))
@@ -460,8 +465,10 @@ class TreeMapGenerator:
             if self._get_depth_by_id(rid) < self.max_level:
                 self.path_queue.put(rid)
 
-        for _ in range(self.max_workers): self.path_queue.put(None)
-        for p in producers: p.join()
+        for _ in range(self.max_workers):
+            self.path_queue.put(None)
+        for p in producers:
+            p.join()
 
         # Signal consumer that all producers are done.
         self.db_queue.put(None)

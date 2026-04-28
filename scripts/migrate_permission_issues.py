@@ -41,13 +41,13 @@ Usage:
     python scripts/migrate_permission_issues.py --report old.json --output new.json
 """
 
-import os
-import sys
-import json
-import re
-import glob
 import argparse
+import glob
+import json
+import os
+import re
 import shutil
+import sys
 from typing import List, Tuple
 
 

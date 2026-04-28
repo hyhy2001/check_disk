@@ -4,12 +4,13 @@ Utilities Module
 Contains common utility functions used across the disk checker application.
 """
 
+import json
 import os
 import pwd
-import time
-import json
 import shutil
-from typing import Dict, Any, List, Optional, Tuple, Set
+import time
+from typing import Any, Dict, List, Set, Tuple
+
 
 def format_size(size_bytes: int) -> str:
     """
@@ -25,7 +26,10 @@ def format_size(size_bytes: int) -> str:
     if size_bytes < 0:
         return "0 B"
 
-    TB = 1e12; GB = 1e9; MB = 1e6; KB = 1e3
+    TB = 1e12
+    GB = 1e9
+    MB = 1e6
+    KB = 1e3
     abs_bytes = float(size_bytes)
 
     if abs_bytes >= TB:
@@ -41,16 +45,16 @@ def format_size(size_bytes: int) -> str:
 def format_time_duration(seconds: float) -> str:
     """
     Format time duration in seconds to hours, minutes, and seconds.
-    
+
     Args:
         seconds: Time duration in seconds
-        
+
     Returns:
         Formatted time string (HH:MM:SS)
     """
     hours, remainder = divmod(int(seconds), 3600)
     minutes, seconds = divmod(remainder, 60)
-    
+
     if hours > 0:
         return f"{hours}h {minutes}m {seconds}s"
     elif minutes > 0:
@@ -61,16 +65,16 @@ def format_time_duration(seconds: float) -> str:
 def parse_size(size_str: str) -> int:
     """
     Parse a human-readable size string to bytes.
-    
+
     Args:
         size_str: Size string (e.g., '1TB', '500GB')
-        
+
     Returns:
         Size in bytes
     """
     if not size_str:
         return 0
-        
+
     size_str = size_str.upper().strip()
     multipliers = {
         'B': 1,
@@ -80,11 +84,11 @@ def parse_size(size_str: str) -> int:
         'TB': 1024**4,
         'PB': 1024**5
     }
-    
+
     # Handle numeric-only input as bytes
     if size_str.isdigit():
         return int(size_str)
-        
+
     # Extract number and unit
     for unit, multiplier in multipliers.items():
         if size_str.endswith(unit):
@@ -93,13 +97,13 @@ def parse_size(size_str: str) -> int:
                 return int(number * multiplier)
             except ValueError:
                 return 0
-                
+
     return 0
 
 def get_terminal_size() -> Tuple[int, int]:
     """
     Get the current terminal size.
-    
+
     Returns:
         Tuple of (width, height)
     """
@@ -108,31 +112,31 @@ def get_terminal_size() -> Tuple[int, int]:
 def get_username_from_uid(uid: int, uid_cache: Dict[int, str] = None) -> str:
     """
     Get username from UID with caching.
-    
+
     Args:
         uid: User ID
         uid_cache: Optional cache dictionary to use
-        
+
     Returns:
         Username string
     """
     if uid_cache is not None and uid in uid_cache:
         return uid_cache[uid]
-        
+
     try:
         username = pwd.getpwuid(uid).pw_name
     except KeyError:
         username = f"uid-{uid}"
-        
+
     if uid_cache is not None:
         uid_cache[uid] = username
-        
+
     return username
 
 def build_uid_cache() -> Dict[int, str]:
     """
     Build a cache of UID to username mappings.
-    
+
     Returns:
         Dictionary mapping UIDs to usernames
     """
@@ -147,10 +151,10 @@ def build_uid_cache() -> Dict[int, str]:
 def get_general_system_info(directory: str) -> Dict[str, int]:
     """
     Get general system disk information, including inodes.
-    
+
     Args:
         directory: Path to check
-        
+
     Returns:
         Dictionary with total, used, available space, and inode stats.
     """
@@ -208,11 +212,11 @@ def create_usage_bar(percent: float, width: int = 20) -> str:
 def get_owner_from_path(path: str, uid_cache: Dict[int, str] = None) -> str:
     """
     Get the owner username of a file or directory.
-    
+
     Args:
         path: Path to check
         uid_cache: Optional cache dictionary to use
-        
+
     Returns:
         Username of the owner
     """
@@ -226,10 +230,10 @@ def get_owner_from_path(path: str, uid_cache: Dict[int, str] = None) -> str:
 def format_timestamp(timestamp: int) -> str:
     """
     Format a Unix timestamp to human-readable date/time.
-    
+
     Args:
         timestamp: Unix timestamp
-        
+
     Returns:
         Formatted date/time string
     """
@@ -285,10 +289,10 @@ def save_json_report(report: Dict[str, Any], filepath: str) -> None:
 def load_json_report(filepath: str) -> Dict[str, Any]:
     """
     Load a report from a JSON file.
-    
+
     Args:
         filepath: Path to the report file
-        
+
     Returns:
         Dictionary containing the report data
     """
@@ -301,51 +305,51 @@ def load_json_report(filepath: str) -> Dict[str, Any]:
 
 class ScanHelper:
     """Helper class for disk scanning operations."""
-    
+
     @staticmethod
-    def process_user_data(uid_sizes: Dict[int, int], uid_to_username: Dict[int, str], 
+    def process_user_data(uid_sizes: Dict[int, int], uid_to_username: Dict[int, str],
                          user_map: Dict[str, str]) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
         """
         Process user data from UID sizes.
-        
+
         Args:
             uid_sizes: Dictionary mapping UIDs to sizes
             uid_to_username: Dictionary mapping UIDs to usernames
             user_map: Dictionary mapping usernames to team names
-            
+
         Returns:
             Tuple of (user_usage, team_usage, other_usage) dictionaries
         """
         user_usage = {}
         team_usage = {}
         other_usage = {}
-        
+
         # Initialize team usage counters
         for team_name in set(user_map.values()):
             team_usage[team_name] = 0
-        
+
         # Process user data
         for uid, size in uid_sizes.items():
             username = get_username_from_uid(uid, uid_to_username)
-            
+
             # Categorize by team or as "other"
             if username in user_map:
                 user_usage[username] = size
                 team_usage[user_map[username]] += size
             else:
                 other_usage[username] = size
-        
+
         return user_usage, team_usage, other_usage
-    
+
     @staticmethod
     def create_user_list(user_usage: Dict[str, int], sort: bool = True) -> List[Dict[str, Any]]:
         """
         Create a list of user dictionaries from user usage data.
-        
+
         Args:
             user_usage: Dictionary mapping usernames to sizes
             sort: Whether to sort the list by usage (descending)
-            
+
         Returns:
             List of dictionaries with 'name' and 'used' keys
         """
@@ -353,16 +357,16 @@ class ScanHelper:
         if sort:
             user_list.sort(key=lambda x: x["used"], reverse=True)
         return user_list
-    
+
     @staticmethod
     def filter_users_by_names(user_list: List[Dict[str, Any]], usernames: Set[str]) -> List[Dict[str, Any]]:
         """
         Filter users by username.
-        
+
         Args:
             user_list: List of user dictionaries
             usernames: Set of usernames to include
-            
+
         Returns:
             Filtered list of user dictionaries
         """

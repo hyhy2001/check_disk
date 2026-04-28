@@ -6,23 +6,25 @@ Contains the ReportFormatter class for formatting and displaying reports.
 
 import json
 import sqlite3
-from typing import Dict, Any, List, Optional, Tuple
-from src.utils import format_size, format_timestamp
-from src.formatters.base_formatter import BaseFormatter
-from src.formatters.table_formatter import TableFormatter
-from src.formatters.config_display import ConfigDisplay
-from src.formatters.report_comparison import ReportComparison
+from typing import Any, Dict, List, Optional, Tuple
+
+from .base_formatter import BaseFormatter
+from .config_display import ConfigDisplay
+from .report_comparison import ReportComparison
+from .table_formatter import TableFormatter
+from ..utils import format_size, format_timestamp
+
 
 class ReportFormatter(BaseFormatter):
     """Helper class for formatting and displaying reports."""
-    
+
     def __init__(self):
         """Initialize the report formatter."""
         super().__init__()
         self.table_formatter = TableFormatter()
         self.config_display = ConfigDisplay()
         self.report_comparison = ReportComparison()
-    
+
     def display_report_summary(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
         """Display a summary of a disk usage report."""
         print("\n" + "=" * 60)
@@ -32,10 +34,10 @@ class ReportFormatter(BaseFormatter):
         timestamp = report.get('date', 0)
         if timestamp:
             print(f"Date: {format_timestamp(timestamp)}")
-        
+
         # Display general system info
         self._display_system_info(report)
-        
+
         # Display appropriate report sections based on report type
         if 'check_users' in report:
             self._display_checked_users_report(report, report_path, filter_users)
@@ -43,14 +45,14 @@ class ReportFormatter(BaseFormatter):
             self._display_top_users_report(report, report_path, filter_users)
         else:
             self._display_standard_report(report, report_path, filter_users)
-        
+
         print(f"\nFull report saved to: {report_path}")
-    
+
     def _display_system_info(self, report: Dict[str, Any]) -> None:
         """Display general system information."""
         system = report.get('general_system', {})
-        total_capacity = system.get('total', 1)
-        
+        system.get('total', 1)
+
         # Create a table for general system info
         headers = ["Metric", "Value", "Percentage"]
         rows = [
@@ -58,37 +60,37 @@ class ReportFormatter(BaseFormatter):
             ["Used Space", format_size(system.get('used', 0)), f"{system.get('used', 0) * 100 / system.get('total', 1):.1f}%"],
             ["Available", format_size(system.get('available', 0)), f"{system.get('available', 0) * 100 / system.get('total', 1):.1f}%"]
         ]
-        
+
         system_table = self.table_formatter.format_table(headers, rows, title="General System Information")
         print(f"\n{system_table}")
-    
+
     def _display_checked_users_report(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
         """Display checked users report."""
         # Create a table for checked users
         headers = ["Username", "Disk Usage", "Percent"]
         rows = []
-        
+
         user_usage = report.get('user_usage', [])
         total_capacity = report.get('general_system', {}).get('total', 1)
-        
+
         # Apply user filter if provided
         if filter_users:
             user_usage = [u for u in user_usage if u['name'] in filter_users]
-        
+
         for user in sorted(user_usage, key=lambda x: x.get('used', 0), reverse=True):
             size = user.get('used', 0)
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
             rows.append([user['name'], format_size(size), f"{usage_bar} {percent:.1f}%"])
-        
+
         if rows:
             table = self.table_formatter.format_table(headers, rows, title="Checked Users")
             print("\n" + table)
-    
+
     def _display_top_users_report(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
         """Display top users report."""
         total_capacity = report.get('general_system', {}).get('total', 1)
-        
+
         # Display top users
         top_n   = report.get('top_user', 10)
         min_use = report.get('min_usage', '')
@@ -99,7 +101,7 @@ class ReportFormatter(BaseFormatter):
             title,
             filter_users
         )
-        
+
         # Display other users
         if 'other_usage' in report and report['other_usage']:
             self._display_user_usage_table(
@@ -108,11 +110,11 @@ class ReportFormatter(BaseFormatter):
                 "Top Other Users (not in config)",
                 filter_users
             )
-        
+
         # Display team usage if available
         if 'team_usage' in report and report['team_usage']:
             self._display_team_usage_table(report.get('team_usage', []), total_capacity)
-    
+
     def _display_standard_report(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
         """Display standard report with teams and users."""
         total_capacity = report.get('general_system', {}).get('total', 1)
@@ -137,42 +139,42 @@ class ReportFormatter(BaseFormatter):
         )[:10]
         if other_usage:
             self._display_user_usage_table(other_usage, total_capacity, "Top Other Users (not in config)", filter_users)
-    
-    def _display_user_usage_table(self, users: List[Dict[str, Any]], total_capacity: int, 
+
+    def _display_user_usage_table(self, users: List[Dict[str, Any]], total_capacity: int,
                                  title: str, filter_users: List[str] = None) -> None:
         """Display a table of user disk usage."""
         if filter_users:
             users = [u for u in users if u['name'] in filter_users]
-            
+
         if not users:
             return
-            
+
         headers = ["Username", "Disk Usage", "Percent"]
         rows = []
-        
+
         for user in sorted(users, key=lambda x: x.get('used', 0), reverse=True):
             size = user.get('used', 0)
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
             rows.append([user['name'], format_size(size), f"{usage_bar} {percent:.1f}%"])
-        
+
         table = self.table_formatter.format_table(headers, rows, title=title)
         print("\n" + table)
-    
+
     def _display_team_usage_table(self, teams: List[Dict[str, Any]], total_capacity: int) -> None:
         """Display a table of team disk usage."""
         headers = ["Team", "Disk Usage", "Percent"]
         rows = []
-        
+
         for team in sorted(teams, key=lambda x: x.get('used', 0), reverse=True):
             size = team.get('used', 0)
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
             rows.append([team['name'], format_size(size), f"{usage_bar} {percent:.1f}%"])
-        
+
         table = self.table_formatter.format_table(headers, rows, title="Team Usage")
         print("\n" + table)
-    
+
     def compare_reports(self, reports: List[Tuple[str, Dict[str, Any]]], filter_users: List[str] = None, compare_by: str = "growth") -> None:
         """Compare multiple reports and display a comparison table."""
         self.report_comparison.compare_reports(reports, filter_users, compare_by)
@@ -257,34 +259,55 @@ class ReportFormatter(BaseFormatter):
         if path.endswith('.ndjson'):
             return self._load_detail_from_ndjson(path, is_dir)
 
-        from src.utils import load_json_report
+        from ..utils import load_json_report
         return load_json_report(path)
 
     def _load_detail_from_db(self, path: str, is_dir: bool) -> Dict[str, Any]:
         data: Dict[str, Any] = {}
         conn = sqlite3.connect(path)
         try:
-            row = conn.execute(
-                "SELECT date, user, total_items, total_used FROM meta LIMIT 1"
-            ).fetchone()
-            if row:
-                data["date"] = int(row[0] or 0)
-                data["user"] = row[1] or ""
-                data["total_used"] = int(row[3] or 0)
-                if is_dir:
-                    data["total_dirs"] = int(row[2] or 0)
-                else:
-                    data["total_files"] = int(row[2] or 0)
-
             if is_dir:
+                meta_row = conn.execute(
+                    "SELECT date, user, total_dirs, total_used FROM meta_dirs LIMIT 1"
+                ).fetchone() if self._table_exists(conn, "meta_dirs") else None
+                if meta_row:
+                    data["date"] = int(meta_row[0] or 0)
+                    data["user"] = meta_row[1] or ""
+                    data["total_dirs"] = int(meta_row[2] or 0)
+                    data["total_used"] = int(meta_row[3] or 0)
+                else:
+                    row = conn.execute(
+                        "SELECT date, user, total_items, total_used FROM meta LIMIT 1"
+                    ).fetchone()
+                    if row:
+                        data["date"] = int(row[0] or 0)
+                        data["user"] = row[1] or ""
+                        data["total_dirs"] = int(row[2] or 0)
+                        data["total_used"] = int(row[3] or 0)
                 rows = conn.execute("SELECT path, used FROM dirs ORDER BY used DESC").fetchall()
                 data["dirs"] = [{"path": r[0], "used": int(r[1] or 0)} for r in rows]
             else:
+                row = conn.execute(
+                    "SELECT date, user, total_items, total_used FROM meta LIMIT 1"
+                ).fetchone()
+                if row:
+                    data["date"] = int(row[0] or 0)
+                    data["user"] = row[1] or ""
+                    data["total_files"] = int(row[2] or 0)
+                    data["total_used"] = int(row[3] or 0)
                 rows = conn.execute("SELECT path, size FROM files ORDER BY size DESC").fetchall()
                 data["files"] = [{"path": r[0], "size": int(r[1] or 0)} for r in rows]
         finally:
             conn.close()
         return data
+
+    @staticmethod
+    def _table_exists(conn, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name=? LIMIT 1",
+            (table_name,),
+        ).fetchone()
+        return row is not None
 
     def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
         data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}

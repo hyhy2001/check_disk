@@ -4,20 +4,21 @@ Configuration Manager Module
 Handles all configuration-related operations for the disk usage checker.
 """
 
-import os
 import json
+import os
 import sys
-from typing import Dict, List, Any, Optional, Set
+from typing import Any, Dict, List, Optional, Set
+
 
 class ConfigManager:
     """Manages the configuration for the disk usage checker."""
-    
+
     CONFIG_FILE = "disk_checker_config.json"
-    
+
     def __init__(self, config_file: str = None):
         """
         Initialize the configuration manager.
-        
+
         Args:
             config_file: Optional custom configuration file path
         """
@@ -30,11 +31,11 @@ class ConfigManager:
             self.config_file = os.path.join(script_dir, self.CONFIG_FILE)
 
         self._config = self._load_config()
-    
+
     def _load_config(self) -> Dict[str, Any]:
         """
         Load configuration from the config file.
-        
+
         Returns:
             Dict containing the configuration or empty dict if file doesn't exist
         """
@@ -46,10 +47,10 @@ class ConfigManager:
                 print(f"Error loading configuration: {e}")
                 return {}
         return {}
-    
+
     def _save_config(self) -> None:
         """Save the current configuration to the config file."""
-        from src.utils import _compact_json
+        from .utils import _compact_json
         try:
             if "users" in self._config:
                 self._config["users"] = sorted(self._config["users"], key=lambda u: u["name"])
@@ -58,11 +59,11 @@ class ConfigManager:
                 f.write(_compact_json(self._config))
         except IOError as e:
             print(f"Error saving configuration: {e}")
-    
+
     def initialize_config(self, directory: str, output_file: str = "disk_usage_report.json") -> None:
         """
         Initialize a new configuration.
-        
+
         Args:
             directory: Path to the directory to scan
             output_file: Path where the report will be saved
@@ -74,25 +75,25 @@ class ConfigManager:
             "users": []
         }
         self._save_config()
-    
+
     def update_directory(self, directory: str) -> None:
         """
         Update the directory in the configuration.
-        
+
         Args:
             directory: New directory path to use for scanning
         """
         if not self._config:
             print("Error: No configuration found. Run --init first.")
             return
-            
+
         self._config["directory"] = directory
         self._save_config()
-    
+
     def add_team(self, team_name: str) -> None:
         """
         Add a new team to the configuration.
-        
+
         Args:
             team_name: Name of the team to add
         """
@@ -101,30 +102,30 @@ class ConfigManager:
             if team["name"] == team_name:
                 print(f"Team '{team_name}' already exists")
                 return
-        
+
         # Add new team with next available team_id
         if "teams" not in self._config:
             self._config["teams"] = []
-        
+
         # Find the highest team_id and increment by 1
         next_id = 1
         if self._config["teams"]:
             next_id = max(team.get("team_id", 0) for team in self._config["teams"]) + 1
-        
+
         self._config["teams"].append({
             "name": team_name,
             "team_id": next_id
         })
         self._save_config()
-    
+
     def add_user(self, username: str, team_name: str) -> bool:
         """
         Add a user to a team.
-        
+
         Args:
             username: Name of the user to add
             team_name: Name of the team to add the user to
-            
+
         Returns:
             True if user already exists, False otherwise
         """
@@ -134,20 +135,20 @@ class ConfigManager:
             if team["name"] == team_name:
                 team_id = team["team_id"]
                 break
-        
+
         if team_id is None:
             print(f"Team '{team_name}' not found")
             return False
-        
+
         # Check if user already exists
         if "users" not in self._config:
             self._config["users"] = []
-        
+
         for user in self._config["users"]:
             if user["name"] == username:
                 print(f"User '{username}' already exists")
                 return True
-        
+
         # Add user to the users list with the team_id
         self._config["users"].append({
             "name": username,
@@ -155,52 +156,52 @@ class ConfigManager:
         })
         self._save_config()
         return False
-    
+
     def remove_user(self, username: str) -> None:
         """
         Remove a user from the configuration.
-        
+
         Args:
             username: Name of the user to remove
         """
         user_found = False
-        
+
         if "users" in self._config:
             original_length = len(self._config["users"])
             self._config["users"] = [user for user in self._config["users"] if user["name"] != username]
             user_found = len(self._config["users"]) < original_length
-        
+
         if user_found:
             self._save_config()
             print(f"User '{username}' removed successfully")
         else:
             print(f"User '{username}' not found")
-    
+
     def get_config(self) -> Dict[str, Any]:
         """
         Get the current configuration.
-        
+
         Returns:
             Dict containing the current configuration
         """
         return self._config
-    
+
     def get_teams(self) -> List[Dict[str, Any]]:
         """
         Get all teams from the configuration.
-        
+
         Returns:
             List of team dictionaries
         """
         return self._config.get("teams", [])
-    
+
     def get_users_by_team(self, team_name: str) -> List[str]:
         """
         Get all users in a specific team.
-        
+
         Args:
             team_name: Name of the team
-            
+
         Returns:
             List of usernames
         """
@@ -210,31 +211,31 @@ class ConfigManager:
             if team["name"] == team_name:
                 team_id = team["team_id"]
                 break
-        
+
         if team_id is None:
             return []
-        
+
         # Return all usernames with matching team_id, sorted alphabetically
         users = [user["name"] for user in self._config.get("users", []) if user["team_id"] == team_id]
         return sorted(users)
-    
+
     def get_all_users(self) -> List[str]:
         """
         Get all users from all teams.
-        
+
         Returns:
             List of all usernames
         """
         users = [user["name"] for user in self._config.get("users", [])]
         return sorted(users)
-    
+
     def get_user_team(self, username: str) -> Optional[str]:
         """
         Get the team name for a specific user.
-        
+
         Args:
             username: Name of the user
-            
+
         Returns:
             Team name or None if user not found
         """
@@ -244,34 +245,34 @@ class ConfigManager:
             if user["name"] == username:
                 team_id = user["team_id"]
                 break
-        
+
         if team_id is None:
             return None
-        
+
         # Find the team name for this team_id
         for team in self._config.get("teams", []):
             if team["team_id"] == team_id:
                 return team["name"]
-        
+
         return None
-    
+
     def get_team_id_map(self) -> Dict[int, str]:
         """
         Get a mapping of team IDs to team names.
-        
+
         Returns:
             Dictionary mapping team_id to team name
         """
         return {team["team_id"]: team["name"] for team in self._config.get("teams", [])}
-    
+
     def add_users_batch(self, usernames: List[str], team_name: str) -> Set[str]:
         """
         Add multiple users to a team in a single operation.
-        
+
         Args:
             usernames: List of usernames to add
             team_name: Name of the team to add users to
-            
+
         Returns:
             Set of usernames that were already in the configuration
         """
@@ -281,19 +282,19 @@ class ConfigManager:
             if team["name"] == team_name:
                 team_id = team["team_id"]
                 break
-        
+
         if team_id is None:
             print(f"Team '{team_name}' not found")
             return set()
-        
+
         # Initialize users list if needed
         if "users" not in self._config:
             self._config["users"] = []
-        
+
         # Get existing usernames
         existing_users = {user["name"] for user in self._config["users"]}
         already_exists = set()
-        
+
         # Add new users
         for username in usernames:
             if username in existing_users:
@@ -303,9 +304,9 @@ class ConfigManager:
                     "name": username,
                     "team_id": team_id
                 })
-        
+
         # Save if any users were added
         if len(already_exists) < len(usernames):
             self._save_config()
-            
+
         return already_exists

@@ -4,18 +4,26 @@ Disk Usage Checker Package
 This package provides tools for checking disk usage by team and user.
 """
 
-from src.cli_interface import CLIInterface
-from src.config_manager import ConfigManager
-from src.disk_scanner import DiskScanner, ScanResult
-from src.report_generator import ReportGenerator
-from src.utils import (
-    format_size, parse_size, get_terminal_size, get_username_from_uid,
-    build_uid_cache, get_general_system_info, get_owner_from_path,
-    format_timestamp, ScanHelper, save_json_report, load_json_report,
+from .cli_interface import CLIInterface
+from .config_manager import ConfigManager
+from .disk_scanner import DiskScanner, ScanResult
+from .formatters.report_formatter import ReportFormatter
+from .formatters.table_formatter import TableFormatter
+from .report_generator import ReportGenerator
+from .utils import (
+    ScanHelper,
+    build_uid_cache,
     create_usage_bar,
+    format_size,
+    format_timestamp,
+    get_general_system_info,
+    get_owner_from_path,
+    get_terminal_size,
+    get_username_from_uid,
+    load_json_report,
+    parse_size,
+    save_json_report,
 )
-from src.formatters.table_formatter import TableFormatter
-from src.formatters.report_formatter import ReportFormatter
 
 __all__ = [
     'CLIInterface',

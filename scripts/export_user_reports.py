@@ -11,11 +11,11 @@ Output contract note:
 - Legacy short keys (n/s) are still supported by parser-side normalization.
 """
 
-import os
-import sys
-import glob
-import sqlite3
 import argparse
+import glob
+import os
+import sqlite3
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -38,7 +38,7 @@ def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
     """Return the directory that actually contains the detail JSON files."""
     sub = os.path.join(input_dir, "detail_users")
     pat_prefix = f"{prefix}_" if prefix else ""
-    
+
     if glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.db")) or \
        glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.ndjson")) or \
        glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.json")):
@@ -54,20 +54,20 @@ def find_users(input_dir: str, prefix: str) -> list:
     """Return sorted list of usernames discovered from detail_report_*.json files."""
     detail_dir = _resolve_detail_dir(input_dir, prefix)
     pat_prefix = f"{prefix}_" if prefix else ""
-    
+
     # Try looking for the unified detail_report_<user>.ndjson or .json pattern
     users = set()
     for ext in [".db", ".ndjson", ".json"]:
         unified_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_*{ext}")
         strip_unified = f"{pat_prefix}detail_report_"
-        
+
         for path in glob.glob(unified_pattern):
             name = os.path.basename(path)
             # Exclude legacy dir/file markers if mixed
             if name.startswith(strip_unified) and name.endswith(ext) and "dir_" not in name and "file_" not in name:
                 user = name[len(strip_unified):-len(ext)]
                 users.add(user)
-                
+
         # If using legacy format fallback
         if not users:
             legacy_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_*{ext}")
@@ -87,7 +87,7 @@ def find_users(input_dir: str, prefix: str) -> list:
                 if name.startswith(strip_file) and name.endswith(ext):
                     user = name[len(strip_file):-len(ext)]
                     users.add(user)
-                    
+
         if users:
             break
 
@@ -147,7 +147,7 @@ def export_user(user: str,
     Outputs TWO separate files: one for directories (dir) and one for files (file).
     """
     unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
-    
+
     # Check what exists
     has_unified = os.path.exists(unified_path)
     has_dir = os.path.exists(dir_path)

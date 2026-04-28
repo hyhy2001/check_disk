@@ -1,0 +1,15 @@
+# check_disk — Runtime Dependencies
+#
+# This project uses ONLY Python standard library modules.
+# No third-party packages are required for production use.
+#
+# The Rust scanning core (fast_scanner.abi3.so, export_rust.abi3.so)
+# is precompiled and shipped inside src/. No Rust toolchain needed.
+
+# ── Development / Testing ──────────────────────────────────────────────────
+# Install with: pip install -r requirements-dev.txt
+
+# requirements-dev.txt
+pytest>=7
+pytest-cov>=4
+ruff>=0.4

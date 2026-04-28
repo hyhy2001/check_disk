@@ -1,12 +1,29 @@
 """
 Disk Scanner Module - Optimized Version
 """
-import os
-import stat as stat_module
-import time
-import threading
-import heapq
 import glob as glob_module
+import os
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple
+
+from .utils import (
+    ScanHelper,
+    create_usage_bar,
+    format_size,
+    format_time_duration,
+    get_general_system_info,
+    get_username_from_uid,
+)
+
+try:
+    from src import fast_scanner
+    _HAS_FAST_SCANNER = True
+except ImportError:
+    fast_scanner = None  # type: ignore[assignment]
+    _HAS_FAST_SCANNER = False
+
 
 def _get_rss_mb() -> float:
     """Read RSS memory from /proc/self/status in MB (Linux only) to avoid psutil dependency."""
@@ -18,22 +35,6 @@ def _get_rss_mb() -> float:
     except Exception:
         pass
     return 0.0
-
-import shutil
-import atexit
-import tempfile
-from os import scandir
-from collections import defaultdict, deque
-from typing import Dict, List, Any, Set, Optional, Tuple
-from dataclasses import dataclass, field
-
-from src.utils import (
-    format_size, get_general_system_info, build_uid_cache,
-    get_username_from_uid, get_owner_from_path, ScanHelper,
-    format_time_duration, get_actual_disk_usage, create_usage_bar
-)
-
-from src import fast_scanner
 
 
 @dataclass
@@ -58,22 +59,22 @@ class ScanResult:
 
 class DiskScanner:
     """Proxy class routing scanning to the high-performance Rust core or Python fallback"""
-    
+
     def __init__(self, config: Dict[str, Any], max_workers: int = None, debug: bool = False):
         import os
         self.config = config
         self.max_workers = (
-            max_workers if max_workers 
+            max_workers if max_workers
             else config.get("workers", min(32, (os.cpu_count() or 1) * 2))
         )
         self.debug = debug
-        self.use_rust = config.get("use_rust", True)
-        
+        self.use_rust = config.get("use_rust", True) and _HAS_FAST_SCANNER
+
         if not self.use_rust:
-            if config.get("use_rust", True):
+            if not _HAS_FAST_SCANNER:
                 print("  [fallback] Rust core 'fast_scanner' not loaded. Attempting to use pure-Python backup...")
             try:
-                from src.legacy_scanner_backup import LegacyDiskScanner
+                from .legacy_scanner_backup import LegacyDiskScanner
                 self._scanner = LegacyDiskScanner(config, max_workers, debug)
             except ImportError as e:
                 print(f"  [error] Legacy fallback scanner backup not found! ({e})")
@@ -85,11 +86,11 @@ class DiskScanner:
         if self.use_rust:
             return self._rust_scan()
         return self._scanner.scan()
-        
+
     def _rust_scan(self) -> ScanResult:
         """Execute the Rust core scanner"""
-        print(f"\n[RUST] Initiating High-Performance Rust Core Engine")
-        
+        print("\n[RUST] Initiating High-Performance Rust Core Engine")
+
         directory = self.config.get("directory", "/")
         skip_dirs = self.config.get("exclude_patterns", [])
         target_users_only = self.config.get('target_users_only', False)
@@ -112,16 +113,16 @@ class DiskScanner:
         except TypeError:
             result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
         duration = time.time() - start
-        
-        from src.utils import get_username_from_uid, get_general_system_info, ScanHelper, format_time_duration, format_size
-        
+
+        from .utils import format_size
+
         mem_usage = _get_rss_mb()
-        
+
         total_files = result.get('total_files', 0)
         total_dirs = result.get('total_dirs', 0)
         total_size = result.get('total_size', 0)
         avg_rate = total_files / duration if duration > 0 else 0
-        
+
         print(f"\n{'='*60}")
         print(f"SCAN COMPLETED in {format_time_duration(duration)}")
         print(f"{'='*60}")
@@ -131,31 +132,30 @@ class DiskScanner:
         print(f"Total size:       {format_size(total_size)}")
         print(f"Scan rate:        {avg_rate:,.0f} files/sec")
         print(f"Memory usage:     {mem_usage:.1f} MB")
-        
+
         # Build UID mapping
-        from collections import defaultdict
-        
+
         uid_cache = {}
         for uid_str in result.get("uid_sizes", {}).keys():
             uid = int(uid_str)
             if uid not in uid_cache:
                 uid_cache[uid] = get_username_from_uid(uid)
-                
+
         user_usage_results = defaultdict(int)
         user_inode_results = defaultdict(int)
         team_usage_results = defaultdict(int)
         other_usage_results = defaultdict(int)
-        
+
         valid_users = {u["name"]: u for u in self.config.get("users", [])}
         valid_teams = {t["name"]: t for t in self.config.get("teams", [])}
-        
+
         uid_files_dict = result.get("uid_files", {})
 
         for uid_str, size in result.get("uid_sizes", {}).items():
             uid = int(uid_str)
             username = uid_cache[uid]
             file_count = uid_files_dict.get(uid_str, 0)
-            
+
             if username in valid_users:
                 user_usage_results[username] += size
                 user_inode_results[username] += file_count
@@ -165,18 +165,17 @@ class DiskScanner:
             elif not self.config.get('target_users_only', False):
                 other_usage_results[username] += size
                 user_inode_results[username] += file_count
-                
+
         user_list = ScanHelper.create_user_list(user_usage_results)
         team_list = ScanHelper.create_user_list(team_usage_results)
         other_list = ScanHelper.create_user_list(other_usage_results)
-        
+
         user_inode_list = [{"name": name, "inodes": count} for name, count in user_inode_results.items()]
         user_inode_list.sort(key=lambda x: x["inodes"], reverse=True)
-        
+
         other_total = sum(item["used"] for item in other_list)
         team_list.append({"name": "Other", "used": other_total})
-        
-        relevant_users = set(valid_users.keys()) | set(other_usage_results.keys())
+
 
         # ── dir_sizes: read from streaming TSV files written by Rust scanner ──
         # Each line: "<path>\t<uid>\t<size>"
@@ -239,7 +238,7 @@ class DiskScanner:
                         if size > 0:
                             by_user[username] = by_user.get(username, 0) + size
 
-        
+
         # Build permission_issues in the same nested format as Python legacy
         rust_perm_flat = result.get("permission_issues", [])
         perm_by_user: Dict[str, List] = {}
@@ -247,18 +246,18 @@ class DiskScanner:
             path = item.get("path", "")
             kind = item.get("type", "unknown")
             err  = item.get("error", "")
-            
+
             uid_value = item.get("uid")
             if uid_value is not None:
                 # Dùng uid trực tiếp kết hợp bộ đệm `uid_cache` để lấy chuẩn user name
                 owner = uid_cache.get(uid_value, get_username_from_uid(uid_value, uid_cache))
             else:
                 owner = "unknown"
-                
+
             if self.config.get('target_users_only', False) and owner not in valid_users:
                 continue
             perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
-            
+
         # Format into users and unknown_items exactly like legacy Python expected output
         perm_formatted = {
             "users": [],
@@ -270,7 +269,7 @@ class DiskScanner:
                     "name": owner,
                     "inaccessible_items": issues
                 })
-            
+
         # Re-use LegacyDiskScanner's table formatting for the console summary
         # Use one final filesystem snapshot after scan for consistency
         # between terminal output and report JSON.
@@ -278,7 +277,7 @@ class DiskScanner:
         system_info["inodes_scanned"] = result.get("total_inodes", 0)
 
         print(f"{'='*60}")
-        print(f"Disk Information (final snapshot):")
+        print("Disk Information (final snapshot):")
         print(f"  Total capacity: {format_size(system_info.get('total', 0))}")
         print(f"  Used space:     {format_size(system_info.get('used', 0))} ({system_info.get('used', 0) * 100 / system_info.get('total', 1):.1f}%)")
         print(f"  Available:      {format_size(system_info.get('available', 0))}")
@@ -309,34 +308,34 @@ class DiskScanner:
     def _display_scan_summary(self) -> None:
         """Display a summary of the scan results."""
         # Import TableFormatter here to avoid circular imports
-        from src.formatters.table_formatter import TableFormatter
+        from .formatters.table_formatter import TableFormatter
         table_formatter = TableFormatter()
 
         # Display team usage report
         if self.team_usage_results:
             print("\nTeam disk usage summary:")
-            
+
             # Create table for team summary
             headers = ["Team", "Disk Usage", "Percent"]
             rows = []
-            
+
             # Get total disk capacity for percentage calculation
             total_capacity = self.general_system.get('total', 1)
-            
+
             # Add "Other" category to team usage
             other_total = sum(self.other_usage_results.values())
             team_usage_with_other = dict(self.team_usage_results)
             team_usage_with_other["Other"] = other_total
-            
+
             for team, size in sorted(team_usage_with_other.items(), key=lambda x: x[1], reverse=True):
                 percent = (size / total_capacity) * 100
                 usage_bar = self._create_usage_bar(percent)
                 rows.append([team, format_size(size), f"{usage_bar} {percent:.1f}%"])
-            
+
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Team Disk Usage")
                 print(table)
-        
+
         # Show top users in console
         print("\nTop users by disk usage:")
         headers = ["Username", "Disk Usage", "Percent"]
@@ -349,7 +348,7 @@ class DiskScanner:
         if rows:
             table = table_formatter.format_table(headers, rows, title="Top 20 Users by Disk Usage")
             print(table)
-        
+
         # Show top OTHER users in console
         if self.other_usage_results:
             print("\nTop other users by disk usage:")
@@ -362,23 +361,23 @@ class DiskScanner:
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Top 20 Other Users by Disk Usage")
                 print(table)
-        
+
         # Display users with permission issues
         if self.permission_issues:
             print("\nUsers with permission issues:")
-            
+
             # Create table for permission issues
             headers = ["Username", "Inaccessible Items"]
             rows = []
-            
+
             for username, issues in sorted(self.permission_issues.items()):
                 rows.append([username, len(issues)])
-            
+
             if rows:
                 table = table_formatter.format_table(headers, rows, title="Permission Issues (Count by User)")
                 print(table)
-    
+
     def _create_usage_bar(self, percent: float, width: int = 20) -> str:
         """Delegate to shared utility."""
         return create_usage_bar(percent, width)
-    
+

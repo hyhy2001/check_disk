@@ -22,7 +22,6 @@ import json
 import os
 import sys
 
-
 # ── Compact JSON serialiser (same style as the rest of the project) ──────────
 
 def _compact_json(obj: object, indent: int = 2) -> str:

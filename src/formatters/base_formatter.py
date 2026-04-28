@@ -5,8 +5,8 @@ Contains the base formatter class with common formatting functionality.
 """
 
 import shutil
-from typing import Dict, Any, List, Optional, Tuple
-from src.utils import create_usage_bar as _create_usage_bar_util
+
+from ..utils import create_usage_bar as _create_usage_bar_util
 
 
 class BaseFormatter:

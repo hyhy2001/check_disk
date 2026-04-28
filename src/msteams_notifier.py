@@ -1,11 +1,12 @@
 import json
-import urllib.request
 import urllib.error
+import urllib.request
 from datetime import datetime
-from typing import Dict, Any
+from typing import Any, Dict
 
-from src.utils import format_size
-from src.disk_scanner import ScanResult
+from .disk_scanner import ScanResult
+from .utils import format_size
+
 
 def send_msteams_notification(webhook_url: str, scan_result: ScanResult, config: Dict[str, Any]) -> None:
     """
@@ -13,30 +14,30 @@ def send_msteams_notification(webhook_url: str, scan_result: ScanResult, config:
     """
     if not webhook_url:
         return
-        
-    print(f"\nSending notification to MS Teams workflow...", flush=True)
-    
+
+    print("\nSending notification to MS Teams workflow...", flush=True)
+
     try:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         directory = config.get("directory", "Unknown")
-        
+
         general = scan_result.general_system
         total_space = format_size(general.get("total", 0))
         used_space = format_size(general.get("used", 0))
         avail_space = format_size(general.get("available", 0))
-        
+
         # Sort users by 'used' descending
         top_users = sorted(scan_result.user_usage, key=lambda x: x.get("used", 0), reverse=True)[:10]
         top_others = sorted(scan_result.other_usage, key=lambda x: x.get("used", 0), reverse=True)[:10]
-        
+
         user_lines = [f"- **{u.get('name', 'Unknown')}**: {format_size(u.get('used', 0))}" for u in top_users]
         if not user_lines:
             user_lines = ["- No data"]
-            
+
         other_lines = [f"- **{u.get('name', 'Unknown')}**: {format_size(u.get('used', 0))}" for u in top_others]
         if not other_lines:
             other_lines = ["- No data"]
-            
+
         user_list_md = "\n".join(user_lines)
         other_list_md = "\n".join(other_lines)
 
@@ -96,17 +97,17 @@ def send_msteams_notification(webhook_url: str, scan_result: ScanResult, config:
                 }
             ]
         }
-        
+
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(webhook_url, data=data, headers={
             'Content-Type': 'application/json'
         }, method='POST')
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
+
+        with urllib.request.urlopen(req, timeout=30) as response:
             if response.status in [200, 202]:
-                print(f"Successfully sent MS Teams notification.")
+                print("Successfully sent MS Teams notification.")
             else:
                 print(f"MS Teams returned unusual status: {response.status}")
-                
+
     except Exception as e:
         print(f"Failed to send MS Teams notification: {e}")
