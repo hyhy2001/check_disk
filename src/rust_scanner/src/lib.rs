@@ -23,9 +23,9 @@ const CRITICAL_SKIP_NAMES: &[&str] = &[
     ".nfs",
 ];
 /// Max in-memory file entries per UID buffer before flushing to disk.
-const DETAIL_FLUSH_THRESHOLD: usize = 50_000;
+const DETAIL_FLUSH_THRESHOLD: usize = 500_000;
 /// Max in-memory dir-size entries per thread buffer before flushing to disk.
-const DIR_FLUSH_THRESHOLD: usize = 50_000;
+const DIR_FLUSH_THRESHOLD: usize = 500_000;
 
 fn format_num(mut n: u64) -> String {
     if n == 0 { return "0".to_string(); }
@@ -121,7 +121,6 @@ impl Drop for ThreadLocalState {
             if buf.is_empty() { continue; }
             let count = self.t_flush_counts.entry(*uid).or_insert(0);
             *count += 1;
-            buf.sort_by(|a, b| b.1.cmp(&a.1));
             let filepath = format!("{}/uid_{}_t{}_c{}.tsv", self.tmpdir, uid, self.thread_id, count);
             if let Ok(f) = fs::File::create(&filepath) {
                 let mut w = BufWriter::new(f);
@@ -410,7 +409,6 @@ fn scan_disk(
                             if buf.len() >= DETAIL_FLUSH_THRESHOLD {
                                 let count = state.t_flush_counts.entry(uid).or_insert(0);
                                 *count += 1;
-                                buf.sort_by(|a, b| b.1.cmp(&a.1));
                                 let fp = format!("{}/uid_{}_t{}_c{}.tsv",
                                     state.tmpdir, uid, state.thread_id, count);
                                 if let Ok(f) = fs::File::create(&fp) {
