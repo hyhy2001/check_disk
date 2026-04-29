@@ -258,8 +258,6 @@ def main():
         config['output_file'] = output_file
         config['output_prefix'] = output_prefix
         config['output_date_suffix'] = output_date
-        config['detail_fts'] = getattr(args, 'detail_fts', 'off')
-        config['detail_size_index'] = getattr(args, 'detail_size_index', 'off')
         config['debug'] = getattr(args, 'debug', False)
 
         target_users = getattr(args, 'user', None)
@@ -353,7 +351,6 @@ def main():
                 standalone_files = []
                 for fpath in created:
                     parent = os.path.dirname(os.path.abspath(fpath))
-                    # detail_users/ contains all per-user DBs → batch the directory
                     if os.path.basename(parent) == "detail_users":
                         detail_dirs_seen.add(parent)
                     else:
@@ -378,13 +375,11 @@ def main():
                 )
                 if sync_pipeline and tree_map_path:
                     sync_pipeline.enqueue_file(tree_map_path)
-                    # Also sync the SQLite shards DB (tree_map_data.db) which
-                    # lives alongside the JSON and is required by the dashboard.
-                    tree_map_db = os.path.join(
-                        os.path.dirname(tree_map_path), "tree_map_data.db"
+                    tree_map_data = os.path.join(
+                        os.path.dirname(tree_map_path), "tree_map_data"
                     )
-                    if os.path.isfile(tree_map_db):
-                        sync_pipeline.enqueue_file(tree_map_db)
+                    if os.path.isdir(tree_map_data):
+                        sync_pipeline.enqueue_directory(tree_map_data)
 
             if sync_pipeline:
                 heartbeat.set_phase("sync", "Syncing reports to remote server")

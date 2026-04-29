@@ -1,7 +1,7 @@
 """
 export_user_reports.py
 
-Reads per-user detail JSON/NDJSON/DB reports and exports plain-text usage files per user.
+Reads per-user detail JSON/NDJSON reports and exports plain-text usage files per user.
 This script uses a high-performance Rust core `export_rust` to parse reports and dump TXT.
 
 Output contract note:
@@ -13,8 +13,8 @@ Output contract note:
 
 import argparse
 import glob
+import json
 import os
-import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,55 +39,48 @@ def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
     sub = os.path.join(input_dir, "detail_users")
     pat_prefix = f"{prefix}_" if prefix else ""
 
-    if glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.db")) or \
-       glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.ndjson")) or \
+    if os.path.exists(os.path.join(input_dir, "data_detail.json")):
+        return input_dir
+    if os.path.exists(os.path.join(sub, "data_detail.json")):
+        return sub
+    if glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.ndjson")) or \
        glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.json")):
         return sub
-    if glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.db")) or \
-       glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.ndjson")) or \
+    if glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.ndjson")) or \
        glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.json")):
         return input_dir
     return sub
 
 
-def _find_data_detail_db(detail_dir: str) -> str:
-    path = os.path.join(detail_dir, "data_detail.db")
+def _find_data_detail_manifest(detail_dir: str) -> str:
+    path = os.path.join(detail_dir, "data_detail.json")
     return path if os.path.exists(path) else ""
 
 
-def _users_from_data_detail_db(db_path: str) -> list:
-    if not db_path:
+def _users_from_data_detail_manifest(manifest_path: str) -> list:
+    if not manifest_path:
         return []
     try:
-        conn = sqlite3.connect(db_path)
-        try:
-            table = "user_meta"
-            row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name='user_meta' LIMIT 1"
-            ).fetchone()
-            if row is None:
-                table = "users"
-            rows = conn.execute(f"SELECT username FROM {table} ORDER BY username").fetchall()
-            return [str(r[0]) for r in rows if r and r[0]]
-        finally:
-            conn.close()
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        return sorted(str(u.get("username")) for u in manifest.get("users", []) if u.get("username"))
     except Exception:
         return []
 
 
+
 def find_users(input_dir: str, prefix: str) -> list:
-    """Return sorted list of usernames discovered from detail reports or data_detail.db."""
+    """Return sorted list of usernames discovered from detail reports."""
     detail_dir = _resolve_detail_dir(input_dir, prefix)
-    data_detail_db = _find_data_detail_db(detail_dir)
-    db_users = _users_from_data_detail_db(data_detail_db)
-    if db_users:
-        return db_users
+    manifest_users = _users_from_data_detail_manifest(_find_data_detail_manifest(detail_dir))
+    if manifest_users:
+        return manifest_users
 
     pat_prefix = f"{prefix}_" if prefix else ""
 
     # Try looking for the unified detail_report_<user>.ndjson or .json pattern
     users = set()
-    for ext in [".db", ".ndjson", ".json"]:
+    for ext in [".ndjson", ".json"]:
         unified_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_*{ext}")
         strip_unified = f"{pat_prefix}detail_report_"
 
@@ -126,29 +119,11 @@ def find_users(input_dir: str, prefix: str) -> list:
 
 def _pick_existing_path(detail_dir: str, base_name: str) -> str:
     """Pick first existing path by preferred extension order."""
-    for ext in [".db", ".ndjson", ".json"]:
+    for ext in [".ndjson", ".json"]:
         p = os.path.join(detail_dir, f"{base_name}{ext}")
         if os.path.exists(p):
             return p
     return ""
-
-
-def _sqlite_has_dirs(path: str) -> bool:
-    """True when SQLite DB contains a dirs table/view (combined schema)."""
-    if not path or not path.endswith(".db") or not os.path.exists(path):
-        return False
-    try:
-        conn = sqlite3.connect(path)
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE (type='table' OR type='view') AND name='dirs' LIMIT 1"
-            ).fetchone()
-            return row is not None
-        finally:
-            conn.close()
-    except Exception:
-        return False
 
 
 def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
@@ -156,15 +131,16 @@ def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
     detail_dir = _resolve_detail_dir(input_dir, prefix)
     pat_prefix = f"{prefix}_" if prefix else ""
 
-    data_detail_db = _find_data_detail_db(detail_dir)
-    if data_detail_db:
-        return (data_detail_db, "", "")
+    data_detail_manifest = _find_data_detail_manifest(detail_dir)
+    if data_detail_manifest:
+        return (data_detail_manifest, "", "")
 
     unified_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_{user}")
     dir_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_dir_{user}")
     file_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_file_{user}")
 
     return (unified_path, dir_path, file_path)
+
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +153,7 @@ def export_user(user: str,
                 prefix: str,
                 sem: threading.Semaphore) -> list:
     """
-    Load JSON/NDJSON/DB reports for user and write plain-text report using Rust.
+    Load JSON/NDJSON reports for user and write plain-text report using Rust.
     Outputs TWO separate files: one for directories (dir) and one for files (file).
     """
     unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
@@ -186,8 +162,6 @@ def export_user(user: str,
     has_unified = os.path.exists(unified_path)
     has_dir = os.path.exists(dir_path)
     has_file = os.path.exists(file_path)
-    has_combined_file_db = (not has_unified and not has_dir and has_file and _sqlite_has_dirs(file_path))
-
     if not has_unified and not has_dir and not has_file:
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
         return []
@@ -203,9 +177,8 @@ def export_user(user: str,
 
     with sem:
         try:
-            if has_unified or has_combined_file_db:
-                # Unified schema (detail_report_<user>.*) or combined file DB that contains dirs+files.
-                source_path = unified_path if has_unified else file_path
+            if has_unified:
+                source_path = unified_path
                 out_dir_fname = "_".join(base_parts + ["dir", user]) + ".txt"
                 out_dir_path = os.path.join(output_dir, out_dir_fname)
                 dir_result = export_rust.process(user, source_path, "", out_dir_path)

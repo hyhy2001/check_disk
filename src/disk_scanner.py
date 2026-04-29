@@ -169,66 +169,7 @@ class DiskScanner:
         team_list.append({"name": "Other", "used": other_total})
 
 
-        # ── dir_sizes: read from streaming TSV files written by Rust scanner ──
-        # Each line: "<path>\t<uid>\t<size>"
-        # Multiple entries with same (path, uid) are aggregated via dir_sizes_map.
-        # dir_by_user and top_dir_list are intentionally removed: report_generator
-        # derives per-user directory lists directly from dir_sizes_map, saving ~2 GB RAM.
-        dir_tmpdir = result.get("dir_tmpdir", "") or result.get("detail_tmpdir", "")
         dir_sizes_map: Dict[str, Dict[str, int]] = {}
-
-        if dir_tmpdir:
-            dir_tsv_files = sorted(glob_module.glob(os.path.join(dir_tmpdir, "dirs_t*.tsv")))
-            for tsv_file in dir_tsv_files:
-                try:
-                    with open(tsv_file, encoding="utf-8", errors="surrogateescape") as fh:
-                        for line in fh:
-                            line = line.rstrip("\n")
-                            if not line:
-                                continue
-                            parts = line.split("\t", 2)
-                            if len(parts) != 3:
-                                continue
-                            dir_path, uid_raw, size_raw = parts
-                            try:
-                                uid = int(uid_raw)
-                                size = int(size_raw)
-                            except ValueError:
-                                continue
-                            if uid not in uid_cache:
-                                uid_cache[uid] = get_username_from_uid(uid)
-                            username = uid_cache[uid]
-                            if size > 0:
-                                by_user = dir_sizes_map.setdefault(dir_path, {})
-                                by_user[username] = by_user.get(username, 0) + size
-                except OSError:
-                    pass
-        else:
-            # Backward-compatible fallback: old Rust build returns dir_sizes_flat PyList
-            raw_dir_sizes_flat = result.pop("dir_sizes_flat", None)
-            raw_dir_sizes = result.pop("dir_sizes", {}) or {}
-            if raw_dir_sizes_flat is not None:
-                for row in raw_dir_sizes_flat:
-                    if not row or len(row) != 3:
-                        continue
-                    dir_path, uid_raw, size = row
-                    uid = int(uid_raw)
-                    if uid not in uid_cache:
-                        uid_cache[uid] = get_username_from_uid(uid)
-                    username = uid_cache[uid]
-                    if size > 0:
-                        by_user = dir_sizes_map.setdefault(dir_path, {})
-                        by_user[username] = by_user.get(username, 0) + size
-            else:
-                for dir_path, user_sizes in raw_dir_sizes.items():
-                    by_user = dir_sizes_map.setdefault(dir_path, {})
-                    for uid_str, size in user_sizes.items():
-                        uid = int(uid_str)
-                        if uid not in uid_cache:
-                            uid_cache[uid] = get_username_from_uid(uid)
-                        username = uid_cache[uid]
-                        if size > 0:
-                            by_user[username] = by_user.get(username, 0) + size
 
 
         # Build permission_issues in the same nested format as Python legacy

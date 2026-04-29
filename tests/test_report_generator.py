@@ -13,7 +13,6 @@ Tests cover:
 
 import json
 import os
-import sqlite3
 import sys
 import time
 
@@ -56,8 +55,6 @@ def make_config(tmp_path, **overrides):
             {"name": "alice", "team_id": 1},
             {"name": "bob",   "team_id": 1},
         ],
-        "detail_fts": "off",
-        "detail_size_index": "off",
     }
     base.update(overrides)
     return base
@@ -94,33 +91,30 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
 
     created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1)
 
-    detail_db = tmp_path / "detail_users" / "data_detail.db"
+    detail_manifest = tmp_path / "detail_users" / "data_detail.json"
     treemap_json = tmp_path / "tree_map_report.json"
-    treemap_db = tmp_path / "tree_map_data.db"
-    assert sorted(map(str, [detail_db, treemap_json, treemap_db])) == created
-    assert detail_db.exists()
+    treemap_manifest = tmp_path / "tree_map_data" / "manifest.json"
+    assert sorted(map(str, [detail_manifest, treemap_json, treemap_manifest])) == created
+    assert detail_manifest.exists()
     assert treemap_json.exists()
-    assert treemap_db.exists()
+    assert treemap_manifest.exists()
 
-    conn = sqlite3.connect(detail_db)
-    try:
-        user_row = conn.execute(
-            "SELECT username, total_files, total_dirs, total_used FROM users"
-        ).fetchone()
-        assert user_row == ("alice", 2, 2, 6144)
-        assert conn.execute("SELECT COUNT(*) FROM file_detail").fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM dir_detail").fetchone()[0] == 2
-        path_rows = conn.execute("SELECT path FROM files ORDER BY size DESC").fetchall()
-        assert path_rows[0][0].endswith("alpha.txt")
-        assert path_rows[1][0].endswith("beta.log")
-    finally:
-        conn.close()
+    detail = json.loads(detail_manifest.read_text(encoding="utf-8"))
+    assert detail["users"][0]["username"] == "alice"
+    assert detail["users"][0]["total_files"] == 2
+    assert detail["users"][0]["total_dirs"] == 2
+    assert detail["users"][0]["total_used"] == 6144
 
-    tree_conn = sqlite3.connect(treemap_db)
-    try:
-        assert tree_conn.execute("SELECT COUNT(*) FROM shards").fetchone()[0] >= 1
-    finally:
-        tree_conn.close()
+    user_dir = tmp_path / "detail_users" / "users" / "alice"
+    user_manifest = json.loads((user_dir / "manifest.json").read_text(encoding="utf-8"))
+    part_path = user_manifest["files"]["parts"][0]["path"]
+    file_rows = (user_dir / part_path).read_text(encoding="utf-8").splitlines()
+    assert len(file_rows) == 2
+    assert "alpha.txt" in file_rows[0]
+    assert "beta.log" in file_rows[1]
+
+    tree_manifest = json.loads(treemap_manifest.read_text(encoding="utf-8"))
+    assert tree_manifest["shard_count"] >= 1
 
 
 # ── ReportGenerator.__init__ ──────────────────────────────────────────────────

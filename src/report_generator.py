@@ -5,6 +5,7 @@ Handles generating and saving disk usage reports.
 """
 
 import os
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
@@ -69,25 +70,16 @@ class ReportGenerator:
             return
 
         keep_abs = {os.path.abspath(p) for p in keep_paths if p}
-        # Keep sidecar files for current DBs too.
-        keep_with_sidecars = set(keep_abs)
-        for p in list(keep_abs):
-            if p.endswith(".db"):
-                keep_with_sidecars.add(p + "-wal")
-                keep_with_sidecars.add(p + "-shm")
 
         removed = 0
         for name in os.listdir(detail_dir):
             if not (
                 name.endswith(".json")
                 or name.endswith(".ndjson")
-                or name.endswith(".db")
-                or name.endswith(".db-wal")
-                or name.endswith(".db-shm")
             ):
                 continue
             fp = os.path.abspath(os.path.join(detail_dir, name))
-            if fp in keep_with_sidecars:
+            if fp in keep_abs:
                 continue
             try:
                 os.remove(fp)
@@ -253,7 +245,7 @@ class ReportGenerator:
         if os.path.exists(output_path):
             return output_path
         raise RuntimeError(
-            "TreeMap generation is now part of Phase 2 unified Rust DB build. "
+            "TreeMap generation is now part of Phase 2 JSON/NDJSON output build. "
             "Call generate_detail_reports() before generate_tree_map()."
         )
 
@@ -276,7 +268,7 @@ class ReportGenerator:
         scan_result: ScanResult,
         max_workers: int = 1,
     ) -> List[str]:
-        """Generate the unified detail DB and TreeMap outputs via Rust."""
+        """Generate JSON/NDJSON detail data and TreeMap outputs via Rust."""
         if not scan_result.detail_tmpdir:
             raise RuntimeError(
                 "Phase 2 requires Rust streaming outputs (detail_tmpdir). "
@@ -292,22 +284,24 @@ class ReportGenerator:
         detail_dir = os.path.join(output_dir, "detail_users")
         os.makedirs(detail_dir, exist_ok=True)
 
-        unified_path = os.path.join(detail_dir, "data_detail.db")
+        unified_path = os.path.join(detail_dir, "data_detail.json")
         tree_json_path = self._get_output_filename("tree_map_report")
-        tree_db_path = os.path.join(output_dir, "tree_map_data.db")
-        for stale_path in (unified_path, tree_json_path, tree_db_path):
-            if os.path.exists(stale_path):
+        tree_data_path = os.path.join(output_dir, "tree_map_data")
+        stale_paths = (
+            unified_path,
+            tree_json_path,
+            tree_data_path,
+        )
+        for stale_path in stale_paths:
+            if os.path.isdir(stale_path):
+                shutil.rmtree(stale_path)
+            elif os.path.exists(stale_path):
                 os.remove(stale_path)
-            for suffix in ("-wal", "-shm"):
-                sidecar = stale_path + suffix
-                if os.path.exists(sidecar):
-                    os.remove(sidecar)
-
         phase2_start = time.time()
         phase2_mem_start = self._get_rss_mb() if self.debug else 0.0
         if self.debug:
             print(f"[Phase 2] RAM at start: {phase2_mem_start:.1f} MB")
-            print(f"Phase 2: Building unified detail DB via Rust [streaming, {max(1, int(max_workers))}w]...")
+            print(f"Phase 2: Building JSON/NDJSON detail outputs via Rust [streaming, {max(1, int(max_workers))}w]...")
 
         team_map = {
             str(user.get("name", "")): str(user.get("team_id", ""))
@@ -323,7 +317,7 @@ class ReportGenerator:
             team_map,
             unified_path,
             tree_json_path,
-            tree_db_path,
+            tree_data_path,
             self.config.get("directory", "/"),
             int(max(1, tree_map_level)),
             0,
@@ -337,14 +331,14 @@ class ReportGenerator:
                 raise
             total_files = _fast_scanner.build_unified_dbs(*build_args)
 
-        created = [unified_path, tree_json_path, tree_db_path]
+        created = [unified_path, tree_json_path, os.path.join(tree_data_path, "manifest.json")]
         self.cleanup_stale_detail_reports(created)
 
         phase2_elapsed = time.time() - phase2_start
         if self.debug:
             phase2_mem_end = self._get_rss_mb()
-            print(f"  [Phase 2] Unified detail DB ready: {unified_path}")
-            print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_db_path}")
+            print(f"  [Phase 2] Detail manifest ready: {unified_path}")
+            print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
             print(
                 f"[Phase 2] RAM end: {phase2_mem_end:.1f} MB "
                 f"(delta: {phase2_mem_end - phase2_mem_start:+.1f} MB, elapsed: {phase2_elapsed:.2f}s, "
@@ -352,9 +346,9 @@ class ReportGenerator:
             )
         else:
             print(f"Reports generated in {phase2_elapsed:.2f}s ({int(total_files):,} files):")
-            print(f"  Detail DB: {unified_path}")
+            print(f"  Detail manifest: {unified_path}")
             print(f"  TreeMap JSON: {tree_json_path}")
-            print(f"  TreeMap DB: {tree_db_path}")
+            print(f"  TreeMap data: {tree_data_path}")
         return sorted(created)
 
     def generate_detail_reports_with_level(

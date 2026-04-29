@@ -6,7 +6,6 @@ Contains the ReportFormatter class for formatting and displaying reports.
 
 import json
 import os
-import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils import format_size, format_timestamp
@@ -254,124 +253,58 @@ class ReportFormatter(BaseFormatter):
             self.display_user_detail_report(user, dir_data, file_data, top)
 
     def _load_detail_report(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
-        """Load detail report from DB, NDJSON, or legacy JSON and normalize shape."""
-        if path.endswith('.db'):
-            return self._load_detail_from_db(path, is_dir, user=user)
+        """Load detail report from generated manifest, NDJSON, or JSON."""
+        if path.endswith('data_detail.json'):
+            return self._load_detail_from_manifest(path, is_dir, user=user)
         if path.endswith('.ndjson'):
             return self._load_detail_from_ndjson(path, is_dir)
 
         from ..utils import load_json_report
         return load_json_report(path)
 
-    def _load_detail_from_db(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
-        data: Dict[str, Any] = {}
-        conn = sqlite3.connect(path)
-        try:
-            user_filter = user or os.path.splitext(os.path.basename(path))[0]
-            if "detail_report_" in user_filter:
-                user_filter = user_filter.split("detail_report_")[-1]
-                if user_filter.startswith("dir_"):
-                    user_filter = user_filter[4:]
-                elif user_filter.startswith("file_"):
-                    user_filter = user_filter[5:]
-
-            is_unified = self._table_exists(conn, "user_meta") and self._table_exists(conn, "dir_detail")
-            if is_unified and user_filter:
-                user_row = conn.execute(
-                    "SELECT scan_date, username, total_dirs, total_files, total_used, user_id "
-                    "FROM user_meta WHERE username = ? LIMIT 1",
-                    (user_filter,),
-                ).fetchone()
-                if not user_row:
-                    return data
-                data["date"] = int(user_row[0] or 0)
-                data["user"] = user_row[1] or ""
-                data["total_dirs"] = int(user_row[2] or 0)
-                data["total_files"] = int(user_row[3] or 0)
-                data["total_used"] = int(user_row[4] or 0)
-                user_id = int(user_row[5])
-
-                has_domain_dict = self._table_exists(conn, "dirs_dict")
-                if is_dir:
-                    if has_domain_dict:
-                        rows = conn.execute(
-                            "SELECT dd.path, d.size "
-                            "FROM dir_detail d JOIN dirs_dict dd ON dd.dir_id = d.dir_id "
-                            "WHERE d.user_id = ? ORDER BY d.size DESC",
-                            (user_id,),
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            "SELECT s.val, d.size "
-                            "FROM dir_detail d JOIN strings_dict s ON s.id = d.dir_id "
-                            "WHERE d.user_id = ? ORDER BY d.size DESC",
-                            (user_id,),
-                        ).fetchall()
-                    data["dirs"] = [{"path": r[0], "used": int(r[1] or 0)} for r in rows]
-                else:
-                    if has_domain_dict:
-                        rows = conn.execute(
-                            "SELECT dd.path || '/' || bd.basename, f.size "
-                            "FROM file_detail f "
-                            "JOIN dirs_dict dd ON dd.dir_id = f.dir_id "
-                            "JOIN basename_dict bd ON bd.basename_id = f.basename_id "
-                            "WHERE f.user_id = ? ORDER BY f.size DESC",
-                            (user_id,),
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            "SELECT ds.val || '/' || bs.val, f.size "
-                            "FROM file_detail f "
-                            "JOIN strings_dict ds ON ds.id = f.dir_id "
-                            "JOIN strings_dict bs ON bs.id = f.basename_id "
-                            "WHERE f.user_id = ? ORDER BY f.size DESC",
-                            (user_id,),
-                        ).fetchall()
-                    data["files"] = [{"path": r[0], "size": int(r[1] or 0)} for r in rows]
-                return data
-
-            if is_dir:
-                meta_row = conn.execute(
-                    "SELECT date, user, total_dirs, total_used FROM meta_dirs LIMIT 1"
-                ).fetchone() if self._table_exists(conn, "meta_dirs") else None
-                if meta_row:
-                    data["date"] = int(meta_row[0] or 0)
-                    data["user"] = meta_row[1] or ""
-                    data["total_dirs"] = int(meta_row[2] or 0)
-                    data["total_used"] = int(meta_row[3] or 0)
-                else:
-                    row = conn.execute(
-                        "SELECT date, user, total_items, total_used FROM meta LIMIT 1"
-                    ).fetchone()
-                    if row:
-                        data["date"] = int(row[0] or 0)
-                        data["user"] = row[1] or ""
-                        data["total_dirs"] = int(row[2] or 0)
-                        data["total_used"] = int(row[3] or 0)
-                rows = conn.execute("SELECT path, used FROM dirs ORDER BY used DESC").fetchall()
-                data["dirs"] = [{"path": r[0], "used": int(r[1] or 0)} for r in rows]
+    def _load_detail_from_manifest(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
+        with open(path, "r", encoding="utf-8") as fh:
+            root_manifest = json.load(fh)
+        base_dir = os.path.dirname(path)
+        user_entry = next(
+            (entry for entry in root_manifest.get("users", []) if entry.get("username") == user),
+            None,
+        )
+        if not user_entry:
+            return {}
+        manifest_path = os.path.join(base_dir, user_entry.get("manifest", ""))
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        user_dir = os.path.dirname(manifest_path)
+        summary = manifest.get("summary", {})
+        data: Dict[str, Any] = {
+            "date": int(manifest.get("scan_date", root_manifest.get("scan", {}).get("timestamp", 0)) or 0),
+            "user": user,
+            "total_dirs": int(summary.get("total_dirs", 0) or 0),
+            "total_files": int(summary.get("total_files", 0) or 0),
+            "total_used": int(summary.get("total_used", 0) or 0),
+        }
+        if is_dir:
+            top_path = os.path.join(user_dir, manifest.get("top_dirs", "top_dirs.json"))
+            if os.path.exists(top_path):
+                with open(top_path, "r", encoding="utf-8") as fh:
+                    data["dirs"] = json.load(fh)
             else:
-                row = conn.execute(
-                    "SELECT date, user, total_items, total_used FROM meta LIMIT 1"
-                ).fetchone()
-                if row:
-                    data["date"] = int(row[0] or 0)
-                    data["user"] = row[1] or ""
-                    data["total_files"] = int(row[2] or 0)
-                    data["total_used"] = int(row[3] or 0)
-                rows = conn.execute("SELECT path, size FROM files ORDER BY size DESC").fetchall()
-                data["files"] = [{"path": r[0], "size": int(r[1] or 0)} for r in rows]
-        finally:
-            conn.close()
+                dirs_path = os.path.join(user_dir, manifest.get("dirs", {}).get("path", "dirs.ndjson"))
+                data.update(self._load_detail_from_ndjson(dirs_path, True))
+        else:
+            top_path = os.path.join(user_dir, manifest.get("top_files", "top_files.json"))
+            if os.path.exists(top_path):
+                with open(top_path, "r", encoding="utf-8") as fh:
+                    data["files"] = json.load(fh)
+            else:
+                files = []
+                for part in manifest.get("files", {}).get("parts", []):
+                    part_path = os.path.join(user_dir, part.get("path", ""))
+                    part_data = self._load_detail_from_ndjson(part_path, False)
+                    files.extend(part_data.get("files", []))
+                data["files"] = files
         return data
-
-    @staticmethod
-    def _table_exists(conn, table_name: str) -> bool:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name=? LIMIT 1",
-            (table_name,),
-        ).fetchone()
-        return row is not None
 
     def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
         data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}

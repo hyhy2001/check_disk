@@ -1,10 +1,10 @@
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use rusqlite::{Connection, OpenFlags};
+use pyo3::prelude::*;
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Default)]
 struct JsonItem {
@@ -27,6 +27,44 @@ struct ReportFile {
     files: Vec<JsonItem>,
 }
 
+#[derive(Deserialize, Default)]
+struct DetailRootManifest {
+    #[serde(default)]
+    users: Vec<DetailRootUser>,
+}
+
+#[derive(Deserialize, Default)]
+struct DetailRootUser {
+    username: String,
+    manifest: String,
+}
+
+#[derive(Deserialize, Default)]
+struct UserManifest {
+    #[serde(default)]
+    dirs: DirsRef,
+    #[serde(default)]
+    files: FilesRef,
+}
+
+#[derive(Deserialize, Default)]
+struct DirsRef {
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Deserialize, Default)]
+struct FilesRef {
+    #[serde(default)]
+    parts: Vec<FilePartRef>,
+}
+
+#[derive(Deserialize, Default)]
+struct FilePartRef {
+    #[serde(default)]
+    path: String,
+}
+
 struct ExportEntry {
     kind: &'static str,
     path: String,
@@ -34,8 +72,6 @@ struct ExportEntry {
 }
 
 fn format_size(size_bytes: f64) -> String {
-    // Keep TXT output consistent with Python check-disk formatter:
-    // SI/decimal units (1 KB = 1,000 B), not binary 1,024.
     let n = if size_bytes.is_sign_negative() { 0.0 } else { size_bytes };
     const KB: f64 = 1_000.0;
     const MB: f64 = 1_000_000.0;
@@ -60,110 +96,8 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
         return;
     }
 
-    if file_path.ends_with(".db") {
-        let conn = match Connection::open_with_flags(file_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("  [rust-warn] Failed to open sqlite {}: {}", file_path, e);
-                return;
-            }
-        };
-
-        let has_users = conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name='users' LIMIT 1",
-            [],
-            |_| Ok(()),
-        ).is_ok();
-
-        if kind == "dir " {
-            let sql = if has_users {
-                "SELECT path, used FROM dirs WHERE user = ?1 ORDER BY used DESC"
-            } else {
-                "SELECT path, used FROM dirs ORDER BY used DESC"
-            };
-            let mut stmt = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("  [rust-warn] Failed to query dirs in {}: {}", file_path, e);
-                    return;
-                }
-            };
-            if has_users {
-                let rows = match stmt.query_map([user], |row| {
-                    let path: String = row.get(0)?;
-                    let size: u64 = row.get(1)?;
-                    Ok((path, size))
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("  [rust-warn] Failed to iterate dirs in {}: {}", file_path, e);
-                        return;
-                    }
-                };
-                for r in rows.flatten() {
-                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
-                }
-            } else {
-                let rows = match stmt.query_map([], |row| {
-                    let path: String = row.get(0)?;
-                    let size: u64 = row.get(1)?;
-                    Ok((path, size))
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("  [rust-warn] Failed to iterate dirs in {}: {}", file_path, e);
-                        return;
-                    }
-                };
-                for r in rows.flatten() {
-                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
-                }
-            }
-        } else {
-            let sql = if has_users {
-                "SELECT path, size FROM files WHERE user = ?1 ORDER BY size DESC"
-            } else {
-                "SELECT path, size FROM files ORDER BY size DESC"
-            };
-            let mut stmt = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("  [rust-warn] Failed to query files in {}: {}", file_path, e);
-                    return;
-                }
-            };
-            if has_users {
-                let rows = match stmt.query_map([user], |row| {
-                    let path: String = row.get(0)?;
-                    let size: u64 = row.get(1)?;
-                    Ok((path, size))
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("  [rust-warn] Failed to iterate files in {}: {}", file_path, e);
-                        return;
-                    }
-                };
-                for r in rows.flatten() {
-                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
-                }
-            } else {
-                let rows = match stmt.query_map([], |row| {
-                    let path: String = row.get(0)?;
-                    let size: u64 = row.get(1)?;
-                    Ok((path, size))
-                }) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("  [rust-warn] Failed to iterate files in {}: {}", file_path, e);
-                        return;
-                    }
-                };
-                for r in rows.flatten() {
-                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
-                }
-            }
-        }
+    if file_path.ends_with("data_detail.json") {
+        parse_manifest_items(user, file_path, kind, entries);
         return;
     }
 
@@ -174,52 +108,112 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
             return;
         }
     };
-    
+
     if file_path.ends_with(".ndjson") {
-        for line in BufReader::new(f).lines() {
-            if let Ok(l) = line {
-                if let Ok(item) = serde_json::from_str::<JsonItem>(&l) {
-                    if let Some(path) = item.path {
-                        let sz = if kind == "dir " { item.used.unwrap_or(0) } else { item.size.unwrap_or(0) };
-                        entries.push(ExportEntry { kind, path, size: sz });
-                    }
+        parse_ndjson_reader(f, kind, entries);
+    } else if kind == "dir " {
+        if let Ok(data) = serde_json::from_reader::<_, ReportDir>(BufReader::new(f)) {
+            for d in data.dirs {
+                if let Some(path) = d.path {
+                    entries.push(ExportEntry { kind, path, size: d.used.unwrap_or(0) });
                 }
             }
         }
-    } else {
-        // legacy JSON
-        if kind == "dir " {
-            if let Ok(data) = serde_json::from_reader::<_, ReportDir>(BufReader::new(f)) {
-                for d in data.dirs {
-                    if let Some(path) = d.path {
-                        let sz = d.used.unwrap_or(0);
-                        entries.push(ExportEntry { kind, path, size: sz });
-                    }
-                }
-            }
-        } else {
-            if let Ok(data) = serde_json::from_reader::<_, ReportFile>(BufReader::new(f)) {
-                for file in data.files {
-                    if let Some(path) = file.path {
-                        let sz = file.size.unwrap_or(0);
-                        entries.push(ExportEntry { kind, path, size: sz });
-                    }
-                }
+    } else if let Ok(data) = serde_json::from_reader::<_, ReportFile>(BufReader::new(f)) {
+        for file in data.files {
+            if let Some(path) = file.path {
+                entries.push(ExportEntry { kind, path, size: file.size.unwrap_or(0) });
             }
         }
     }
 }
 
+fn parse_ndjson_reader(file: File, kind: &'static str, entries: &mut Vec<ExportEntry>) {
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(item) = serde_json::from_str::<JsonItem>(&line) {
+            if let Some(path) = item.path {
+                let size = if kind == "dir " { item.used.unwrap_or(0) } else { item.size.unwrap_or(0) };
+                entries.push(ExportEntry { kind, path, size });
+            }
+        }
+    }
+}
+
+fn parse_ndjson_path(path: &Path, kind: &'static str) -> Vec<ExportEntry> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("  [rust-warn] Failed to open {}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
+    let mut entries = Vec::new();
+    parse_ndjson_reader(file, kind, &mut entries);
+    entries
+}
+
+fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
+    let file = match File::open(manifest_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("  [rust-warn] Failed to open manifest {}: {}", manifest_path, e);
+            return;
+        }
+    };
+    let root_manifest: DetailRootManifest = match serde_json::from_reader(BufReader::new(file)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("  [rust-warn] Failed to parse manifest {}: {}", manifest_path, e);
+            return;
+        }
+    };
+    let Some(user_entry) = root_manifest.users.into_iter().find(|entry| entry.username == user) else {
+        return;
+    };
+    let detail_dir = Path::new(manifest_path).parent().unwrap_or_else(|| Path::new("."));
+    let user_manifest_path = detail_dir.join(user_entry.manifest);
+    let file = match File::open(&user_manifest_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("  [rust-warn] Failed to open user manifest {}: {}", user_manifest_path.display(), e);
+            return;
+        }
+    };
+    let user_manifest: UserManifest = match serde_json::from_reader(BufReader::new(file)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("  [rust-warn] Failed to parse user manifest {}: {}", user_manifest_path.display(), e);
+            return;
+        }
+    };
+    let user_dir = user_manifest_path.parent().unwrap_or(detail_dir);
+
+    if kind == "dir " {
+        let dir_rel = if user_manifest.dirs.path.is_empty() { "dirs.ndjson" } else { user_manifest.dirs.path.as_str() };
+        entries.extend(parse_ndjson_path(&user_dir.join(dir_rel), kind));
+    } else {
+        let part_paths: Vec<PathBuf> = user_manifest.files.parts
+            .into_iter()
+            .filter(|part| !part.path.is_empty())
+            .map(|part| user_dir.join(part.path))
+            .collect();
+        let mut part_entries: Vec<ExportEntry> = part_paths
+            .par_iter()
+            .flat_map_iter(|path| parse_ndjson_path(path, kind))
+            .collect();
+        entries.append(&mut part_entries);
+    }
+}
+
+
 #[pyfunction]
 fn process(user: String, dir_path: String, file_path: String, out_path: String) -> PyResult<String> {
     let mut entries = Vec::new();
 
-    // 1. Read dir JSON/NDJSON/DB if exists
     if !dir_path.is_empty() {
         parse_file_items(&user, &dir_path, "dir ", &mut entries);
     }
 
-    // 2. Read file JSON/NDJSON/DB if exists
     if !file_path.is_empty() {
         parse_file_items(&user, &file_path, "file", &mut entries);
     }
@@ -228,10 +222,8 @@ fn process(user: String, dir_path: String, file_path: String, out_path: String) 
         return Ok("".to_string());
     }
 
-    // 3. Sort by size desc
     entries.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
-    // 4. Write to TXT
     if let Some(parent) = Path::new(&out_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }

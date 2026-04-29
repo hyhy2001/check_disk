@@ -1,5 +1,5 @@
+import json
 import os
-import sqlite3
 import sys
 import threading
 import time
@@ -110,52 +110,40 @@ def _build_unified_fixture(tmp_path):
     )
 
     created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1)
-    detail_db = tmp_path / "detail_users" / "data_detail.db"
-    return cfg, created, detail_db, tmp_path / "tree_map_report.json", tmp_path / "tree_map_data.db"
+    detail_manifest = tmp_path / "detail_users" / "data_detail.json"
+    return cfg, created, detail_manifest, tmp_path / "tree_map_report.json", tmp_path / "tree_map_data" / "manifest.json"
 
 
-def test_unified_db_schema_queries_multi_user_ext_and_paths(tmp_path):
-    _, _, detail_db, _, _ = _build_unified_fixture(tmp_path)
+def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
+    _, _, detail_manifest, _, tree_manifest = _build_unified_fixture(tmp_path)
 
-    conn = sqlite3.connect(detail_db)
-    try:
-        users = conn.execute(
-            "SELECT username, total_files, total_dirs, total_used FROM users ORDER BY username"
-        ).fetchall()
-        assert users == [("alice", 3, 2, 6144), ("bob", 2, 2, 9216)]
+    detail = json.loads(detail_manifest.read_text(encoding="utf-8"))
+    users = sorted(
+        (u["username"], u["total_files"], u["total_dirs"], u["total_used"])
+        for u in detail["users"]
+    )
+    assert users == [("alice", 3, 2, 6144), ("bob", 2, 2, 9216)]
 
-        alice_id = conn.execute("SELECT user_id FROM users WHERE username='alice'").fetchone()[0]
-        bob_id = conn.execute("SELECT user_id FROM users WHERE username='bob'").fetchone()[0]
-        log_ext_id = conn.execute("SELECT ext_id FROM ext_dict WHERE ext='log'").fetchone()[0]
+    alice_dir = detail_manifest.parent / "users" / "alice"
+    alice_manifest = json.loads((alice_dir / "manifest.json").read_text(encoding="utf-8"))
+    alice_part = alice_manifest["files"]["parts"][0]["path"]
+    alice_files = [
+        json.loads(line)
+        for line in (alice_dir / alice_part).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["size"] for row in alice_files] == [4096, 2048, 512]
+    assert [row["size"] for row in alice_files if row["ext"] == "log"] == [2048]
+    assert any(row["path"].endswith("alpha.txt") for row in alice_files)
 
-        alice_files = conn.execute(
-            "SELECT size FROM file_detail WHERE user_id=? ORDER BY size DESC",
-            (alice_id,),
-        ).fetchall()
-        assert alice_files == [(4096,), (2048,), (512,)]
+    bob_dir = detail_manifest.parent / "users" / "bob"
+    bob_dirs = [
+        json.loads(line)
+        for line in (bob_dir / "dirs.ndjson").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["used"] for row in bob_dirs] == [8192, 1024]
 
-        alice_logs = conn.execute(
-            "SELECT size FROM file_detail WHERE user_id=? AND ext_id=? ORDER BY size DESC",
-            (alice_id, log_ext_id),
-        ).fetchall()
-        bob_logs = conn.execute(
-            "SELECT size FROM file_detail WHERE user_id=? AND ext_id=? ORDER BY size DESC",
-            (bob_id, log_ext_id),
-        ).fetchall()
-        assert alice_logs == [(2048,)]
-        assert bob_logs == [(1024,)]
-
-        basenames = conn.execute(
-            "SELECT basename FROM basename_dict WHERE basename IN ('alpha.txt', 'shared.log') ORDER BY basename"
-        ).fetchall()
-        assert basenames == [("alpha.txt",), ("shared.log",)]
-
-        dirs = conn.execute(
-            "SELECT used FROM dirs WHERE user='bob' ORDER BY used DESC"
-        ).fetchall()
-        assert dirs == [(8192,), (1024,)]
-    finally:
-        conn.close()
+    tree = json.loads(tree_manifest.read_text(encoding="utf-8"))
+    assert tree["shard_count"] >= 1
 
 
 def test_build_unified_dbs_accepts_legacy_and_debug_signatures(tmp_path):
@@ -165,9 +153,9 @@ def test_build_unified_dbs_accepts_legacy_and_debug_signatures(tmp_path):
         str(tmp_path / "missing_tmpdir"),
         {},
         {},
-        str(tmp_path / "detail.db"),
+        str(tmp_path / "detail_users" / "data_detail.json"),
         str(tmp_path / "tree.json"),
-        str(tmp_path / "tree.db"),
+        str(tmp_path / "tree_map_data"),
         str(tmp_path),
         3,
         0,
@@ -183,13 +171,13 @@ def test_build_unified_dbs_accepts_legacy_and_debug_signatures(tmp_path):
             pass
 
 
-def test_export_user_reports_detects_and_exports_data_detail_db(tmp_path):
-    _, _, detail_db, _, _ = _build_unified_fixture(tmp_path)
+def test_export_user_reports_detects_and_exports_data_detail_manifest(tmp_path):
+    _, _, detail_manifest, _, _ = _build_unified_fixture(tmp_path)
     out_dir = tmp_path / "exports"
     out_dir.mkdir()
 
     assert export_user_reports.find_users(str(tmp_path), "") == ["alice", "bob"]
-    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == (str(detail_db), "", "")
+    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == (str(detail_manifest), "", "")
 
     exported = export_user_reports.export_user(
         "alice",
@@ -209,7 +197,7 @@ def test_export_user_reports_detects_and_exports_data_detail_db(tmp_path):
     assert "other/alpha.txt" not in file_text
 
 
-def test_cli_check_users_uses_data_detail_db(tmp_path):
+def test_cli_check_users_uses_data_detail_manifest(tmp_path):
     _, _, _, _, _ = _build_unified_fixture(tmp_path)
 
     calls = []
@@ -225,7 +213,7 @@ def test_cli_check_users_uses_data_detail_db(tmp_path):
     users, dir_files, file_files, top = calls[0]
     assert users == ["alice", "missing"]
     assert top == 7
-    expected = str(tmp_path / "detail_users" / "data_detail.db")
+    expected = str(tmp_path / "detail_users" / "data_detail.json")
     assert dir_files["alice"] == expected
     assert file_files["alice"] == expected
     assert dir_files["missing"] == expected

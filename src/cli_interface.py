@@ -7,7 +7,6 @@ Handles command-line interface for the disk usage checker.
 import argparse
 import glob
 import os
-import sqlite3
 from typing import Any, Dict, List
 
 from .formatters.report_formatter import ReportFormatter
@@ -58,19 +57,6 @@ class CLIInterface:
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
         scan_group.add_argument("--tree-map", action="store_true", help="Generate a TreeMap JSON for directory visualization")
         scan_group.add_argument("--level", type=int, default=3, help="Maximum depth level for TreeMap generation (default: 3)")
-        scan_group.add_argument(
-            "--detail-fts",
-            choices=["on", "off"],
-            default="on",
-            help="Enable/disable FTS4 indexes in detail user SQLite DBs (default: on).",
-        )
-        scan_group.add_argument(
-            "--detail-size-index",
-            choices=["on", "off"],
-            default="on",
-            help="Enable/disable size-based index in detail user SQLite DBs for faster size queries (default: on).",
-        )
-
         # Report commands
         report_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")
         report_group.add_argument("--sync-user", metavar="USER", help="SSH username of the remote server")
@@ -81,7 +67,7 @@ class CLIInterface:
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
         report_group.add_argument("--check-users", "--check-user", metavar="USER", nargs="+",
-                                help="Display detail reports for specific user(s). Supports detail_report_dir/file in DB, NDJSON, or JSON.")
+                                help="Display detail reports for specific user(s) from generated JSON/NDJSON detail data.")
         report_group.add_argument("--top", type=int, default=30,
                                 help="Top N rows to display for both directory and file breakdown in --check-user(s) (default: 30).")
 
@@ -246,61 +232,23 @@ class CLIInterface:
         output_dir: str = ".",
         top: int = 30,
     ) -> None:
-        """Display per-user detail reports (dir + file breakdown).
-
-        Locates detail files inside the detail_users/ subdirectory:
-            {output_dir}/detail_users/{prefix}_detail_report_dir_{user}.db|.ndjson|.json
-            {output_dir}/detail_users/{prefix}_detail_report_file_{user}.db|.ndjson|.json
-        """
+        """Display per-user detail reports from the generated JSON/NDJSON manifest."""
+        if prefix:
+            print("Warning: --prefix is ignored for JSON/NDJSON detail manifests")
         detail_dir = os.path.join(output_dir, "detail_users")
-        unified_db_path = os.path.join(detail_dir, "data_detail.db")
-
-        def _build_path(base: str, user: str) -> str:
-            parts = [p for p in [prefix, base, user] if p]
-            stem = os.path.join(detail_dir, "_".join(parts))
-            for ext in [".db", ".ndjson", ".json"]:
-                candidate = stem + ext
-                if os.path.exists(candidate):
-                    return candidate
-            if os.path.exists(unified_db_path):
-                return unified_db_path
-            return ""
-
-        def _db_has_dirs(path: str) -> bool:
-            """True if SQLite file contains a dirs table/view (combined schema support)."""
-            if not path or not path.endswith(".db"):
-                return False
-            try:
-                conn = sqlite3.connect(path)
-                try:
-                    row = conn.execute(
-                        "SELECT 1 FROM sqlite_master "
-                        "WHERE (type='table' OR type='view') AND name='dirs' LIMIT 1"
-                    ).fetchone()
-                    return row is not None
-                finally:
-                    conn.close()
-            except Exception:
-                return False
+        detail_manifest = os.path.join(detail_dir, "data_detail.json")
 
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}
 
         for user in users:
-            dp = _build_path("detail_report_dir",  user)
-            fp = _build_path("detail_report_file", user)
-
-            # New combined schema may store both dir+file data in detail_report_file_<user>.db.
-            if not dp and fp and _db_has_dirs(fp):
-                dp = fp
-
-            dir_files[user]  = dp if dp else None
-            file_files[user] = fp if fp else None
-
-            if dir_files[user] is None:
-                print(f"Warning: dir detail not found for '{user}' in: {detail_dir}")
-            if file_files[user] is None:
-                print(f"Warning: file detail not found for '{user}' in: {detail_dir}")
+            if os.path.exists(detail_manifest):
+                dir_files[user] = detail_manifest
+                file_files[user] = detail_manifest
+            else:
+                dir_files[user] = None
+                file_files[user] = None
+                print(f"Warning: detail manifest not found for '{user}' in: {detail_dir}")
 
         self.report_formatter.display_user_detail_reports(
             users, dir_files, file_files, top

@@ -244,7 +244,7 @@ class TestDeltaSync(SyncTestBase):
         d = tempfile.mkdtemp(prefix="sync_local_")
         Path(d, "a.json").write_text('{"v": 1}')
         Path(d, "b.json").write_text('{"v": 2}')
-        Path(d, "c.db").write_bytes(b"\x53\x51\x4c\x69\x74\x65" + b"\x00" * 94)
+        Path(d, "c.ndjson").write_text('{"v": 3}\n')
         return d
 
     def test_initial_full_sync(self):
@@ -259,14 +259,14 @@ class TestDeltaSync(SyncTestBase):
             remote_files = _remote_ls(self._remote_tmp, self.SSH_KEY)
             self.assertIn("a.json", remote_files)
             self.assertIn("b.json", remote_files)
-            self.assertIn("c.db", remote_files)
+            self.assertIn("c.ndjson", remote_files)
             # Kiểm tra nội dung
             self.assertIn('"v": 1', _remote_read(f"{self._remote_tmp}/a.json", self.SSH_KEY))
         finally:
             shutil.rmtree(local, ignore_errors=True)
 
     def test_delta_only_changed_file(self):
-        """Lần sync thứ 2, chỉ có a.json thay đổi → b.json và c.db không bị ghi lại."""
+        """Lần sync thứ 2, chỉ có a.json thay đổi → b.json và c.ndjson không bị ghi lại."""
         local = self._make_local()
         try:
             with _patched_ssh(self.SSH_KEY):
@@ -274,9 +274,9 @@ class TestDeltaSync(SyncTestBase):
                     local, "root", "localhost", self._remote_tmp
                 )
 
-            # Lưu mtime của b.json và c.db TRƯỚC khi sync lần 2
+            # Lưu mtime của b.json và c.ndjson TRƯỚC khi sync lần 2
             mtime_b_before = _remote_mtime(f"{self._remote_tmp}/b.json", self.SSH_KEY)
-            mtime_c_before = _remote_mtime(f"{self._remote_tmp}/c.db", self.SSH_KEY)
+            mtime_c_before = _remote_mtime(f"{self._remote_tmp}/c.ndjson", self.SSH_KEY)
 
             # Đợi ít nhất 1 giây để mtime có thể thay đổi nếu file bị ghi lại
             time.sleep(1.2)
@@ -294,16 +294,16 @@ class TestDeltaSync(SyncTestBase):
             content_a = _remote_read(f"{self._remote_tmp}/a.json", self.SSH_KEY)
             self.assertIn("999", content_a, "a.json phải chứa nội dung mới")
 
-            # b.json và c.db KHÔNG được thay đổi (rsync --inplace)
+            # b.json và c.ndjson KHÔNG được thay đổi (rsync --inplace)
             mtime_b_after = _remote_mtime(f"{self._remote_tmp}/b.json", self.SSH_KEY)
-            mtime_c_after = _remote_mtime(f"{self._remote_tmp}/c.db", self.SSH_KEY)
+            mtime_c_after = _remote_mtime(f"{self._remote_tmp}/c.ndjson", self.SSH_KEY)
             self.assertEqual(
                 mtime_b_before, mtime_b_after,
                 "b.json không thay đổi nên mtime không được thay đổi (delta sync)"
             )
             self.assertEqual(
                 mtime_c_before, mtime_c_after,
-                "c.db không thay đổi nên mtime không được thay đổi (delta sync)"
+                "c.ndjson không thay đổi nên mtime không được thay đổi (delta sync)"
             )
         finally:
             shutil.rmtree(local, ignore_errors=True)
@@ -330,7 +330,7 @@ class TestDeltaSync(SyncTestBase):
                 "b.json đã bị xóa ở local phải biến mất trên remote"
             )
             self.assertIn("a.json", remote_files)
-            self.assertIn("c.db", remote_files)
+            self.assertIn("c.ndjson", remote_files)
         finally:
             shutil.rmtree(local, ignore_errors=True)
 
@@ -633,7 +633,7 @@ class TestStagedDirectorySync:
     def test_directory_rsync_uses_staging_swap_without_inplace(self, tmp_path):
         local = tmp_path / "reports"
         local.mkdir()
-        (local / "data_detail.db").write_text("db")
+        (local / "data_detail.json").write_text("{}")
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -860,7 +860,7 @@ class TestShouldCompress(unittest.TestCase):
     """Unit test cho _should_compress logic."""
 
     def test_compressible_extensions(self):
-        for ext in [".db", ".sqlite", ".json", ".tsv", ".csv", ".txt", ".ndjson", ".sql"]:
+        for ext in [".json", ".tsv", ".csv", ".txt", ".ndjson", ".sql"]:
             fname = f"/tmp/testfile{ext}"
             # Tạo file tạm để stat không fail
             Path(fname).touch()

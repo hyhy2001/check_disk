@@ -145,11 +145,11 @@ def _build_sshpass_env(password: str = None):
 def _should_compress(file_path: str) -> bool:
     """Determine if rsync should use -z for this file.
 
-    SQLite (.db, .sqlite), JSON and TSV files benefit from compression.
+    JSON, NDJSON, TSV, and other text reports benefit from compression.
     Already-compressed files (gz, xz, zst) should not be double-compressed.
     """
     ext = os.path.splitext(file_path)[1].lower()
-    compressible = {".db", ".sqlite", ".json", ".tsv", ".csv", ".txt", ".ndjson", ".sql"}
+    compressible = {".json", ".tsv", ".csv", ".txt", ".ndjson", ".sql"}
     skip = {".gz", ".xz", ".zst", ".bz2", ".lz4", ".zip", ".tar"}
     if ext in skip:
         return False
