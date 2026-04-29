@@ -56,34 +56,14 @@ def _build_unified_fixture(tmp_path):
 
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()
-    (detail_tmpdir / "dirs_t1.tsv").write_text(
+    (detail_tmpdir / "scan_t1_c1.tsv").write_text(
         "\n".join(
             [
-                f"{tmp_path}\t1000\t4096",
-                f"{tmp_path / 'sub'}\t1000\t2048",
-                f"{tmp_path / 'other'}\t1001\t8192",
-                f"{tmp_path / 'other' / 'logs'}\t1001\t1024",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (detail_tmpdir / "uid_1000_t1_c1.tsv").write_text(
-        "\n".join(
-            [
-                f"4096\t{tmp_path / 'alpha.txt'}",
-                f"2048\t{tmp_path / 'sub' / 'shared.log'}",
-                f"512\t{tmp_path / 'sub' / 'same.bin'}",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (detail_tmpdir / "uid_1001_t1_c1.tsv").write_text(
-        "\n".join(
-            [
-                f"8192\t{tmp_path / 'other' / 'alpha.txt'}",
-                f"1024\t{tmp_path / 'other' / 'logs' / 'shared.log'}",
+                f"F\t1000\t4096\t{tmp_path / 'alpha.txt'}",
+                f"F\t1000\t2048\t{tmp_path / 'sub' / 'shared.log'}",
+                f"F\t1000\t512\t{tmp_path / 'sub' / 'same.bin'}",
+                f"F\t1001\t8192\t{tmp_path / 'other' / 'alpha.txt'}",
+                f"F\t1001\t1024\t{tmp_path / 'other' / 'logs' / 'shared.log'}",
             ]
         )
         + "\n",
@@ -122,7 +102,7 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
         (u["username"], u["total_files"], u["total_dirs"], u["total_used"])
         for u in detail["users"]
     )
-    assert users == [("alice", 3, 2, 6144), ("bob", 2, 2, 9216)]
+    assert users == [("alice", 3, 2, 6656), ("bob", 2, 2, 9216)]
 
     alice_dir = detail_manifest.parent / "users" / "alice"
     alice_manifest = json.loads((alice_dir / "manifest.json").read_text(encoding="utf-8"))

@@ -5,12 +5,10 @@ use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::_aggregate_tsv_to_map;
-use crate::glob_module_rust_many;
 
 const FILE_PART_RECORDS: usize = 100_000;
 const TOP_RECORDS: usize = 1_000;
@@ -37,8 +35,8 @@ struct UserJobMeta {
 struct FileChunkJob {
     username: String,
     chunk_index: usize,
-    chunk_path: String,
     output_dir: PathBuf,
+    rows: Vec<(u64, String)>,
 }
 
 struct FileChunkResult {
@@ -77,7 +75,6 @@ pub fn build_unified_dbs(
 ) -> PyResult<u64> {
     py.allow_threads(move || -> PyResult<u64> {
         let t_all = Instant::now();
-        let uids: Vec<u32> = uids_map.keys().copied().collect();
 
         let detail_root = Path::new(&unified_db_path)
             .parent()
@@ -89,17 +86,20 @@ pub fn build_unified_dbs(
         let tree_data_dir = PathBuf::from(&treemap_db);
         recreate_dir(&tree_data_dir)?;
 
-        let pattern = format!("{}/dirs_t*.tsv", tmpdir);
-        let mut dirs_tsv: Vec<String> = glob::glob(&pattern)
-            .map_err(|e| PyRuntimeError::new_err(format!("glob: {}", e)))?
-            .filter_map(|entry| entry.ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-        dirs_tsv.sort();
-
-        let dir_sizes = _aggregate_tsv_to_map(&dirs_tsv, &uids_map)?;
-        let mut dir_owner_map: HashMap<String, String> = HashMap::with_capacity(dir_sizes.len());
+        let scan_events = read_scan_events(&tmpdir)?;
+        let mut dir_sizes: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let mut dir_owner_map: HashMap<String, String> = HashMap::new();
         let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
+        let mut rows_by_user: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+
+        for event in scan_events {
+            let username = uids_map.get(&event.uid).cloned().unwrap_or_else(|| format!("uid-{}", event.uid));
+            rows_by_user.entry(username.clone()).or_default().push((event.size, event.path.clone()));
+            if let Some(parent) = parent_path(&event.path) {
+                let user_sizes = dir_sizes.entry(parent).or_default();
+                *user_sizes.entry(username).or_default() += event.size as i64;
+            }
+        }
 
         for (dpath, user_sizes) in &dir_sizes {
             let mut d_max_size = 0_i64;
@@ -125,23 +125,14 @@ pub fn build_unified_dbs(
             }
         }
 
-        let mut chunks_by_uid = group_chunks_by_uid(&tmpdir, &uids)?;
-        for chunks in chunks_by_uid.values_mut() {
-            chunks.sort();
-        }
-
-        for (&uid, chunks) in &chunks_by_uid {
-            let username = uids_map.get(&uid).cloned().unwrap_or_else(|| format!("uid-{}", uid));
+        for username in rows_by_user.keys() {
             users.entry(username.clone()).or_insert_with(|| UserOutputMeta {
-                team_id: team_map.get(&username).cloned().unwrap_or_default(),
+                team_id: team_map.get(username).cloned().unwrap_or_default(),
                 ..Default::default()
             });
-            if chunks.is_empty() {
-                continue;
-            }
         }
 
-        let (user_metas, chunk_jobs) = build_output_jobs(&detail_root, users, chunks_by_uid, &uids_map, &team_map, timestamp);
+        let (user_metas, chunk_jobs) = build_output_jobs(&detail_root, users, rows_by_user, &team_map, timestamp);
 
         let tree_handle = std::thread::spawn({
             let treemap_root = treemap_root.clone();
@@ -218,49 +209,75 @@ fn json_line_result(writer: &mut BufWriter<fs::File>, value: serde_json::Value) 
     writer.write_all(b"\n").map_err(|e| format!("write newline: {}", e))
 }
 
-fn group_chunks_by_uid(tmpdir: &str, uids: &[u32]) -> PyResult<HashMap<u32, Vec<String>>> {
-    let chunk_files = glob_module_rust_many(tmpdir, uids)?;
-    let mut chunks_by_uid: HashMap<u32, Vec<String>> = HashMap::new();
-    for path in chunk_files {
-        let filename = Path::new(&path)
-            .file_name()
-            .ok_or_else(|| PyRuntimeError::new_err(format!("invalid chunk path: {}", path)))?
-            .to_string_lossy()
-            .to_string();
-        let uid = extract_uid_from_filename(&filename);
-        chunks_by_uid.entry(uid).or_default().push(path);
+struct ScanEvent {
+    uid: u32,
+    size: u64,
+    path: String,
+}
+
+fn read_scan_events(tmpdir: &str) -> PyResult<Vec<ScanEvent>> {
+    let pattern = format!("{}/scan_t*.tsv", tmpdir);
+    let mut paths: Vec<PathBuf> = glob::glob(&pattern)
+        .map_err(|e| PyRuntimeError::new_err(format!("glob: {}", e)))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    paths.sort();
+
+    let mut events = Vec::new();
+    for path in paths {
+        let f = fs::File::open(&path)
+            .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path.display(), e)))?;
+        for line in BufReader::new(f).lines() {
+            let line = line.map_err(|e| PyRuntimeError::new_err(format!("read {}: {}", path.display(), e)))?;
+            if let Some(event) = parse_scan_event_line(&line) {
+                events.push(event);
+            }
+        }
     }
-    Ok(chunks_by_uid)
+    Ok(events)
+}
+
+fn parse_scan_event_line(line: &str) -> Option<ScanEvent> {
+    let mut parts = line.splitn(4, '\t');
+    if parts.next()? != "F" {
+        return None;
+    }
+    let uid = parts.next()?.parse::<u32>().ok()?;
+    let size = parts.next()?.parse::<u64>().ok()?;
+    let path = parts.next()?.to_string();
+    Some(ScanEvent { uid, size, path })
+}
+
+fn parent_path(path: &str) -> Option<String> {
+    let slash_pos = path.rfind('/')?;
+    if slash_pos == 0 {
+        Some("/".to_string())
+    } else {
+        Some(path[..slash_pos].to_string())
+    }
 }
 
 fn build_output_jobs(
     detail_root: &Path,
     users: HashMap<String, UserOutputMeta>,
-    chunks_by_uid: HashMap<u32, Vec<String>>,
-    uids_map: &HashMap<u32, String>,
+    mut rows_by_user: HashMap<String, Vec<(u64, String)>>,
     team_map: &HashMap<String, String>,
     timestamp: i64,
 ) -> (Vec<UserJobMeta>, Vec<FileChunkJob>) {
-    let mut chunks_by_user: HashMap<String, Vec<String>> = HashMap::new();
-    for (uid, chunks) in chunks_by_uid {
-        let username = uids_map.get(&uid).cloned().unwrap_or_else(|| format!("uid-{}", uid));
-        chunks_by_user.entry(username).or_default().extend(chunks);
-    }
-
     let mut metas = Vec::new();
     let mut chunk_jobs = Vec::new();
     for (username, user) in users {
         let safe = safe_user_dir(&username);
-        let mut chunks = chunks_by_user.remove(&username).unwrap_or_default();
-        chunks.sort();
+        let mut rows = rows_by_user.remove(&username).unwrap_or_default();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let tmp_dir = detail_root.join("users").join(format!(".tmp_{}", safe));
         let final_dir = detail_root.join("users").join(&safe);
-        for (chunk_index, chunk_path) in chunks.into_iter().enumerate() {
+        for (chunk_index, chunk_rows) in rows.chunks(FILE_PART_RECORDS).enumerate() {
             chunk_jobs.push(FileChunkJob {
                 username: username.clone(),
                 chunk_index,
-                chunk_path,
                 output_dir: tmp_dir.join("files").join(format!("chunk-{:05}", chunk_index)),
+                rows: chunk_rows.to_vec(),
             });
         }
         metas.push(UserJobMeta {
@@ -271,31 +288,6 @@ fn build_output_jobs(
             total_dirs: user.total_dirs,
             total_used: user.total_used,
             top_dirs: user.top_dirs,
-            timestamp,
-        });
-    }
-
-    for (username, mut chunks) in chunks_by_user {
-        chunks.sort();
-        let safe = safe_user_dir(&username);
-        let tmp_dir = detail_root.join("users").join(format!(".tmp_{}", safe));
-        let final_dir = detail_root.join("users").join(&safe);
-        for (chunk_index, chunk_path) in chunks.into_iter().enumerate() {
-            chunk_jobs.push(FileChunkJob {
-                username: username.clone(),
-                chunk_index,
-                chunk_path,
-                output_dir: tmp_dir.join("files").join(format!("chunk-{:05}", chunk_index)),
-            });
-        }
-        metas.push(UserJobMeta {
-            username: username.clone(),
-            team_id: team_map.get(&username).cloned().unwrap_or_default(),
-            final_dir,
-            tmp_dir,
-            total_dirs: 0,
-            total_used: 0,
-            top_dirs: Vec::new(),
             timestamp,
         });
     }
@@ -318,9 +310,7 @@ fn build_one_file_chunk(job: FileChunkJob) -> Result<FileChunkResult, String> {
     let mut current_records = 0_usize;
     let mut current_writer: Option<BufWriter<fs::File>> = None;
 
-    let f = fs::File::open(&job.chunk_path).map_err(|e| format!("open {}: {}", job.chunk_path, e))?;
-    let mut reader = crate::MergeReaderState::new(f);
-    while let Some((size, raw_path)) = reader.next_entry() {
+    for (size, raw_path) in job.rows {
         if current_writer.is_none() || current_records >= FILE_PART_RECORDS {
             if let Some(mut writer) = current_writer.take() {
                 writer.flush().map_err(|e| format!("flush file part: {}", e))?;
@@ -727,17 +717,3 @@ fn tm_basename(path: &str) -> String {
     trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
 }
 
-fn extract_uid_from_filename(filename: &str) -> u32 {
-    if let Some(rest) = filename.strip_prefix("uid_") {
-        if let Some(pivot) = rest.find("_t") {
-            return rest[..pivot].parse().unwrap_or(0);
-        }
-    }
-    if let Some(u_idx) = filename.rfind("_u") {
-        if let Some(dot_idx) = filename[u_idx..].find('.') {
-            let uid_str = &filename[u_idx + 2..u_idx + dot_idx];
-            return uid_str.parse().unwrap_or(0);
-        }
-    }
-    0
-}

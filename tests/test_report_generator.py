@@ -70,12 +70,8 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
 
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()
-    (detail_tmpdir / "dirs_t1.tsv").write_text(
-        f"{tmp_path}\t1000\t4096\n{tmp_path / 'sub'}\t1000\t2048\n",
-        encoding="utf-8",
-    )
-    (detail_tmpdir / "uid_1000_t1_c1.tsv").write_text(
-        f"4096\t{tmp_path / 'alpha.txt'}\n2048\t{tmp_path / 'sub' / 'beta.log'}\n",
+    (detail_tmpdir / "scan_t1_c1.tsv").write_text(
+        f"F\t1000\t4096\t{tmp_path / 'alpha.txt'}\nF\t1000\t2048\t{tmp_path / 'sub' / 'beta.log'}\n",
         encoding="utf-8",
     )
 

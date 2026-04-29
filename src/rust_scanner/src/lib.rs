@@ -11,7 +11,6 @@ use std::time::{Instant, Duration};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use rayon::prelude::*;
 
 mod unified_output;
 pub use unified_output::build_unified_dbs;
@@ -22,10 +21,8 @@ const CRITICAL_SKIP_NAMES: &[&str] = &[
     "proc", "sys", "dev",
     ".nfs",
 ];
-/// Max in-memory file entries per UID buffer before flushing to disk.
-const DETAIL_FLUSH_THRESHOLD: usize = 500_000;
-/// Max in-memory dir-size entries per thread buffer before flushing to disk.
-const DIR_FLUSH_THRESHOLD: usize = 500_000;
+/// Max in-memory raw file events per scan worker before flushing to disk.
+const SCAN_EVENT_FLUSH_THRESHOLD: usize = 500_000;
 
 fn format_num(mut n: u64) -> String {
     if n == 0 { return "0".to_string(); }
@@ -99,11 +96,8 @@ struct ThreadLocalState {
     t_size: u64,
     t_uid_sizes: HashMap<u32, u64>,
     t_uid_files: HashMap<u32, u64>,
-    /// Streaming dir-size buffer: (path, uid, size) flushed to TSV when full
-    t_dir_buf: Vec<(String, u32, u64)>,
-    t_dir_flush_count: u32,
-    t_uid_buffers: HashMap<u32, Vec<(String, u64)>>,
-    t_flush_counts: HashMap<u32, u32>,
+    t_event_buf: Vec<(u32, u64, String)>,
+    t_event_flush_count: u32,
     t_perm_issues: Vec<(String, String, String, Option<u32>)>,
     global_stats: Arc<Mutex<GlobalStats>>,
     prog_files: Arc<AtomicU64>,
@@ -114,41 +108,30 @@ struct ThreadLocalState {
     thread_id: usize,
 }
 
+impl ThreadLocalState {
+    fn flush_events(&mut self) {
+        if self.t_event_buf.is_empty() {
+            return;
+        }
+        self.t_event_flush_count += 1;
+        let fp = format!("{}/scan_t{}_c{}.tsv", self.tmpdir, self.thread_id, self.t_event_flush_count);
+        if let Ok(f) = fs::File::create(&fp) {
+            let mut w = BufWriter::new(f);
+            for (uid, size, path) in self.t_event_buf.iter() {
+                let _ = writeln!(w, "F\t{}\t{}\t{}", uid, size, path);
+            }
+        }
+        self.t_event_buf.clear();
+        if self.t_event_buf.capacity() > SCAN_EVENT_FLUSH_THRESHOLD * 2 {
+            self.t_event_buf.shrink_to_fit();
+        }
+    }
+}
+
 impl Drop for ThreadLocalState {
     fn drop(&mut self) {
-        // 1. Flush remaining file-detail buffers
-        for (uid, buf) in self.t_uid_buffers.iter_mut() {
-            if buf.is_empty() { continue; }
-            let count = self.t_flush_counts.entry(*uid).or_insert(0);
-            *count += 1;
-            let filepath = format!("{}/uid_{}_t{}_c{}.tsv", self.tmpdir, uid, self.thread_id, count);
-            if let Ok(f) = fs::File::create(&filepath) {
-                let mut w = BufWriter::new(f);
-                for (p, s) in buf.iter() {
-                    let _ = writeln!(w, "{}\t{}", s, p);
-                }
-            }
-            buf.clear();
-            if buf.capacity() > DETAIL_FLUSH_THRESHOLD * 2 {
-                buf.shrink_to_fit();
-            }
-        }
+        self.flush_events();
 
-        // 2. Flush remaining dir-size buffer to TSV (streaming — avoids keeping in GlobalStats)
-        if !self.t_dir_buf.is_empty() {
-            self.t_dir_flush_count += 1;
-            let fp = format!("{}/dirs_t{}_c{}.tsv", self.tmpdir, self.thread_id, self.t_dir_flush_count);
-            if let Ok(f) = fs::File::create(&fp) {
-                let mut w = BufWriter::new(f);
-                for (path, uid, size) in self.t_dir_buf.iter() {
-                    let _ = writeln!(w, "{}\t{}\t{}", path, uid, size);
-                }
-            }
-            self.t_dir_buf.clear();
-            self.t_dir_buf.shrink_to_fit();
-        }
-
-        // 3. Merge scalar stats into global state
         if let Ok(mut g) = self.global_stats.lock() {
             g.total_files += self.t_files;
             g.total_dirs  += self.t_dirs;
@@ -231,10 +214,8 @@ fn scan_disk(
                     t_files: 0, t_dirs: 0, t_inodes: 0, t_size: 0,
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
-                    t_dir_buf: Vec::new(),
-                    t_dir_flush_count: 0,
-                    t_uid_buffers: HashMap::new(),
-                    t_flush_counts: HashMap::new(),
+                    t_event_buf: Vec::new(),
+                    t_event_flush_count: 0,
                     t_perm_issues: Vec::new(),
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),
@@ -245,7 +226,6 @@ fn scan_disk(
                     thread_id: tid,
                 };
                 let skips = skips.clone();
-                let dir = dir_clone.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
                 let visited_dirs_shared = visited_dirs.clone();
 
@@ -292,16 +272,6 @@ fn scan_disk(
 
                     if ft.is_symlink() {
                         state.t_inodes += 1;
-                        if let Ok(meta) = fs::symlink_metadata(path) {
-                            let uid = meta.uid();
-                            let is_target = match &state.target_uids {
-                                Some(set) => set.contains(&uid),
-                                None => true,
-                            };
-                            if is_target {
-                                *state.t_uid_files.entry(uid).or_insert(0) += 1;
-                            }
-                        }
                         return WalkState::Continue;
                     }
 
@@ -316,15 +286,6 @@ fn scan_disk(
 
                         // --- Bind mount / Loop deduplication ---
                         if let Ok(meta) = entry.metadata() {
-                            let uid = meta.uid();
-                            let is_target = match &state.target_uids {
-                                Some(set) => set.contains(&uid),
-                                None => true,
-                            };
-                            if is_target {
-                                *state.t_uid_files.entry(uid).or_insert(0) += 1;
-                            }
-
                             let key = (meta.ino(), meta.dev());
                             // DashSet.insert() returns false when key already exists
                             if !visited_dirs_shared.insert(key) {
@@ -378,49 +339,9 @@ fn scan_disk(
                         if is_target {
                             *state.t_uid_sizes.entry(uid).or_insert(0) += size;
                             *state.t_uid_files.entry(uid).or_insert(0) += 1;
-
-                            // Attribute size to direct parent dir only (flat, matches Python legacy)
-                            // Stream to TSV file: (path, uid, size) — never accumulate in GlobalStats
-                            if let Some(parent) = path.parent() {
-                                if parent.starts_with(&dir) {
-                                    let parent_str = parent.to_string_lossy().into_owned();
-                                    state.t_dir_buf.push((parent_str, uid, size));
-                                    if state.t_dir_buf.len() >= DIR_FLUSH_THRESHOLD {
-                                        state.t_dir_flush_count += 1;
-                                        let fp = format!("{}/dirs_t{}_c{}.tsv",
-                                            state.tmpdir, state.thread_id, state.t_dir_flush_count);
-                                        if let Ok(f) = fs::File::create(&fp) {
-                                            let mut w = BufWriter::new(f);
-                                            for (dp, du, ds) in state.t_dir_buf.iter() {
-                                                let _ = writeln!(w, "{}\t{}\t{}", dp, du, ds);
-                                            }
-                                        }
-                                        state.t_dir_buf.clear();
-                                        if state.t_dir_buf.capacity() > DIR_FLUSH_THRESHOLD * 2 {
-                                            state.t_dir_buf.shrink_to_fit();
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Streaming TSV buffer (same as Python's DETAIL_FLUSH_THRESHOLD)
-                            let buf = state.t_uid_buffers.entry(uid).or_insert_with(Vec::new);
-                            buf.push((path.to_string_lossy().into_owned(), size));
-                            if buf.len() >= DETAIL_FLUSH_THRESHOLD {
-                                let count = state.t_flush_counts.entry(uid).or_insert(0);
-                                *count += 1;
-                                let fp = format!("{}/uid_{}_t{}_c{}.tsv",
-                                    state.tmpdir, uid, state.thread_id, count);
-                                if let Ok(f) = fs::File::create(&fp) {
-                                    let mut w = BufWriter::new(f);
-                                    for (p, s) in buf.iter() {
-                                        let _ = writeln!(w, "{}\t{}", s, p);
-                                    }
-                                }
-                                buf.clear();
-                                if buf.capacity() > DETAIL_FLUSH_THRESHOLD * 2 {
-                                    buf.shrink_to_fit();
-                                }
+                            state.t_event_buf.push((uid, size, path.to_string_lossy().into_owned()));
+                            if state.t_event_buf.len() >= SCAN_EVENT_FLUSH_THRESHOLD {
+                                state.flush_events();
                             }
                         }
 
@@ -475,8 +396,6 @@ fn scan_disk(
     result.set_item("total_inodes", g.total_inodes)?;
     result.set_item("total_size",   g.total_size)?;
     result.set_item("detail_tmpdir", &tmpdir_str)?;
-    // dir_sizes are streamed to dirs_t*.tsv files inside detail_tmpdir
-    // Python reads them directly — no huge PyList copy needed
     result.set_item("dir_tmpdir", &tmpdir_str)?;
 
     let py_uid = PyDict::new(py);
@@ -665,64 +584,6 @@ pub(crate) fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     Some((size, path))
 }
 
-pub(crate) struct MergeReaderState {
-    reader: BufReader<fs::File>,
-    line: String,
-}
-
-impl MergeReaderState {
-    pub(crate) fn new(file: fs::File) -> Self {
-        Self {
-            reader: BufReader::new(file),
-            line: String::new(),
-        }
-    }
-
-    pub(crate) fn next_entry(&mut self) -> Option<(u64, String)> {
-        loop {
-            self.line.clear();
-            let bytes = self.reader.read_line(&mut self.line).ok()?;
-            if bytes == 0 {
-                return None;
-            }
-            if let Some(entry) = parse_tsv_line(self.line.trim_end_matches(['\r', '\n'])) {
-                return Some(entry);
-            }
-        }
-    }
-}
-
-pub(crate) fn _aggregate_tsv_to_map(
-    paths: &[String],
-    uids_map: &HashMap<u32, String>,
-) -> PyResult<HashMap<String, HashMap<String, i64>>> {
-    let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
-
-    for path in paths {
-        let f = fs::File::open(path)
-            .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path, e)))?;
-        for line in BufReader::new(f).lines() {
-            let line = line.map_err(|e| PyRuntimeError::new_err(format!("read {}: {}", path, e)))?;
-            let mut parts = line.splitn(3, '\t');
-            let Some(dir_path) = parts.next() else { continue };
-            let Some(uid_raw) = parts.next() else { continue };
-            let Some(size_raw) = parts.next() else { continue };
-            let Ok(uid) = uid_raw.parse::<u32>() else { continue };
-            let Ok(size) = size_raw.parse::<i64>() else { continue };
-            if size <= 0 {
-                continue;
-            }
-            let owner = uids_map.get(&uid).cloned().unwrap_or_else(|| format!("uid-{}", uid));
-            *out.entry(dir_path.to_string())
-                .or_default()
-                .entry(owner)
-                .or_default() += size;
-        }
-    }
-
-    Ok(out)
-}
-
 pub(crate) fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<String>> {
     if uids.is_empty() {
         return Ok(Vec::new());
@@ -780,29 +641,3 @@ fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     Ok(())
 }
 
-#[inline]
-pub(crate) fn split_path_for_stage(path: &str) -> (&str, &str, String) {
-    let (dir, basename) = if let Some(slash_pos) = path.rfind('/') {
-        let dir_part = &path[..slash_pos];
-        let base_part = if slash_pos + 1 < path.len() {
-            &path[slash_pos + 1..]
-        } else {
-            path
-        };
-        (dir_part, base_part)
-    } else {
-        ("", path)
-    };
-
-    let xt = if let Some(dot_pos) = basename.rfind('.') {
-        if dot_pos > 0 && dot_pos + 1 < basename.len() {
-            basename[dot_pos + 1..].to_ascii_lowercase()
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    (dir, basename, xt)
-}
