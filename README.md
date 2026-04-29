@@ -1,268 +1,370 @@
-# Check Disk 💾
+# Check Disk
 
-> A high-performance disk usage monitoring CLI for Linux servers, powered by native Rust scanning and report-generation cores.
+> High-performance disk usage monitoring CLI for Linux servers, powered by native Rust scanning and JSON/NDJSON report generation.
 
-`check_disk` is designed to rapidly scan heavily-loaded file systems (like NFS/SAN or dense local storage). It bypasses Python's Global Interpreter Lock (GIL) via precompiled Rust modules (`fast_scanner.abi3.so`, `export_rust.abi3.so`) for true multi-threaded I/O and streaming report writing. The Rust scanner is required for production scans.
+`check_disk` scans large Linux filesystems, maps usage to configured teams/users, and writes report artifacts for terminal inspection, export, remote sync, and the companion `disk_usage` web dashboard. Production scans require the bundled Rust extension modules (`src/fast_scanner.abi3.so` and `src/export_rust.abi3.so`) so scanning and report building avoid Python's GIL and keep memory bounded.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-Get up and running in less than 5 minutes.
+### 1. Initialize config
 
-### 1. Initialization
-Create the default configuration (`disk_checker_config.json`):
 ```bash
-python disk_checker.py --init --dir /data/shared
+python3 disk_checker.py --init --dir /data/shared
 ```
 
-### 2. Setup Teams & Users
+### 2. Add teams and users
+
 ```bash
-# Define teams
-python disk_checker.py --add-team backend
-python disk_checker.py --add-team frontend
+python3 disk_checker.py --add-team backend
+python3 disk_checker.py --add-team frontend
 
-# Assign users to teams
-python disk_checker.py --add-user alice bob carol --team backend
-python disk_checker.py --add-user dave eve --team frontend
-
-# (Also supports space-separated names in a single quoted string)
-python disk_checker.py --add-user "alice bob carol" --team backend
+python3 disk_checker.py --add-user alice bob carol --team backend
+python3 disk_checker.py --add-user dave eve --team frontend
 ```
 
-### 3. Run & View Reports
+### 3. Run a scan
+
 ```bash
-# Execute the scan
-python disk_checker.py --run
+python3 disk_checker.py --run --tree-map
+```
 
-# View the generated report summary
-python disk_checker.py --show-report --files disk_usage_report.json
+### 4. View reports
 
-# View detailed per-user metrics (files & directories)
-python disk_checker.py --check-users alice bob
+```bash
+python3 disk_checker.py --show-report --files disk_usage_report.json
+python3 disk_checker.py --check-users alice bob --top 20
+```
+
+### 5. Export per-user text reports
+
+```bash
+python3 scripts/export_user_reports.py \
+  --input-dir . \
+  --output-dir ./exports \
+  --users alice bob \
+  --workers 4
 ```
 
 ---
 
-## ✨ Features
+## Features
 
-- **Blazing Fast Scanning (Native Rust)**
-  - Parallel `WalkBuilder` traversal for zero-GIL, multi-threaded I/O.
-  - Auto-scaling worker threads automatically optimized for high-latency systems.
-  - Minimal syscall overhead (single `stat()` per entry).
-  - Smart skipping: handles hard-links, snapshots, sparse files natively, and automatically ignores system mounts (`proc`, `sys`, `dev`).
-- **Rust-only scan pipeline**
-  - Requires the bundled `fast_scanner.abi3.so` module.
-  - Streams Phase-1 file and directory details to temporary TSV chunks instead of materializing large Python lists.
-- **Advanced Report Generation**
-  - **Unified DB in Rust**: Builds `detail_users/data_detail.db` directly from streaming TSV chunks.
-  - **TreeMap in Rust**: Builds `tree_map_report.json` and `tree_map_data.db` in the same Phase-2 pipeline.
-  - Uses domain-specific SQLite dictionaries for paths, basenames, and extensions to reduce DB size.
-  - Detail reports are stored in a dedicated `detail_users/` subdirectory for clean organization.
-- **User & Team Quota Tracking**
-  - Map filesystem UIDs to custom Teams and Users for granular insights.
-  - Track accessibility boundaries with out-of-the-box permission error reporting.
-  - **Inode Exhaustion Monitoring**: Detect hidden storage limits by tracking total/free filesystem inodes alongside per-user inode usage (file count tracking).
-- **MS Teams Notifications**
-  - Post a rich Adaptive Card summary to a Microsoft Teams channel via a Workflow Webhook URL after each scan.
-- **Remote SSH Sync**
-  - Automatically streams generated reports to a remote server using a zero-footprint pipeline (`tar | ssh "rm && mkdir && tar"`).
-  - Safely provisions reports on a centralized server with optional SSH password auto-fill (via `sshpass`).
-- **Temporal Report Comparison**
-  - Diff two or more historical scan files ranked by usage total or growth rate.
+- **Native Rust scanner**
+  - Uses `ignore::WalkBuilder` parallel traversal.
+  - Tracks disk blocks, inodes, hard links, permissions, and UID ownership.
+  - Skips critical pseudo/system mounts such as `proc`, `sys`, `dev`, snapshots, and `.nfs` entries.
+  - Streams detail data to bounded TSV chunks during scan instead of building large Python data structures.
 
----
+- **Rust JSON/NDJSON report pipeline**
+  - Builds detail reports from scan TSV chunks in Rust.
+  - Uses a global Rust/Rayon chunk worker pool so very large users can still use multiple workers.
+  - Writes user detail data as manifest-driven JSON/NDJSON, not SQLite.
+  - Writes TreeMap data as JSON root + shard files for fast frontend lazy loading.
 
-## 🛠 Requirements
+- **Fast per-user inspection**
+  - `--check-users` reads `detail_users/data_detail.json` and per-user top indexes.
+  - It does not need to load all NDJSON parts for the normal top-N view.
 
-- **Python**: 3.6 or higher.
-- **OS**: Linux x86_64, glibc ≥ 2.17 (e.g., RHEL/CentOS 7/8, Ubuntu 18+).
+- **Remote SSH sync**
+  - Uses rsync when available, with SSH ControlMaster reuse.
+  - Batch-syncs `detail_users/` and `tree_map_data/` directories.
+  - Uses staging directories and atomic swaps for directory syncs so the web frontend avoids partially synced datasets.
+  - Falls back to tar+gzip over SSH when rsync is unavailable.
 
-> **Note:** The Rust `.so` binaries are already included. No Rust toolchain or compilation is required to deploy this tool.
-
+- **Report comparison and notifications**
+  - Compare historical summary reports by usage or growth.
+  - Send Microsoft Teams Workflow notifications after scans.
 
 ---
 
-## ⚙️ Configuration Format
+## Requirements
 
-The tool reads from `disk_checker_config.json`, auto-generated by `--init`.
+- **Python**: 3.8+ recommended.
+- **OS**: Linux x86_64.
+- **glibc**: bundled Rust artifacts are built for broad compatibility, targeting glibc 2.17+.
+- **Optional for sync**:
+  - `rsync` on local and remote hosts for fastest sync.
+  - `sshpass` only if using `--sync-pass` instead of key-based SSH.
+
+The Rust `.so` artifacts are included in the repository. If you modify Rust code, rebuild with the repository build scripts:
+
+```bash
+bash src/rust_scanner/build.sh
+bash src/rust_exporter/build.sh
+```
+
+---
+
+## Configuration Format
+
+`disk_checker_config.json` is generated by `--init` and uses a flat team/user model:
 
 ```json
 {
   "directory": "/data/shared",
   "output_file": "disk_usage_report.json",
   "teams": [
-    { "name": "backend",  "team_id": 1 },
+    { "name": "backend", "team_id": 1 },
     { "name": "frontend", "team_id": 2 }
   ],
   "users": [
     { "name": "alice", "team_id": 1 },
-    { "name": "bob",   "team_id": 1 }
+    { "name": "bob", "team_id": 1 }
   ]
 }
 ```
 
-> **Migrating from an older config?** Use `scripts/convert_config.py` to convert the legacy format (which used a `location` key and embedded user lists inside each team) to the current flat format:
-> ```bash
-> python scripts/convert_config.py old_config.json disk_checker_config.json
-> ```
+To migrate an older config that used `location` and embedded users inside teams:
+
+```bash
+python3 scripts/convert_config.py old_config.json disk_checker_config.json
+```
 
 ---
 
-## 💻 CLI Reference
+## CLI Reference
 
-### Configuration Commands
+### Configuration commands
+
 | Command | Description |
-|---------|-------------|
-| `--init --dir <path>` | Initializes config file with root directory. |
-| `--dir <path>` | Updates directory in existing config (without reinitializing). |
-| `--add-team <name>` | Adds a new team. |
-| `--add-user <u1> [u2 …] --team <t>` | Associates one or more users with a team. |
-| `--remove-user <u1> [u2 …]` | Removes one or more users from the config. |
-| `--list` | Lists all teams and users. |
-| `--list --team <name>` | Lists users for a specific team only. |
+|---|---|
+| `--init --dir <path>` | Create `disk_checker_config.json` for a scan root. |
+| `--dir <path>` | Update the scan directory in the current config. |
+| `--add-team <name>` | Add a team. |
+| `--add-user <u1> [u2 ...] --team <team>` | Add one or more users to a team. |
+| `--remove-user <u1> [u2 ...]` | Remove users from the config. |
+| `--list` | List teams and users. |
+| `--list --team <name>` | List users for one team. |
 
-### Scanning Options
+### Scan commands
+
 | Command | Description |
-|---------|-------------|
-| `--run` | Runs a full scan over the configured directory. |
-| `--run --user <u1> [u2 …]` | Targeted scan — only tracks the listed users (very fast). |
-| `--run --workers <N>` | Manually set Rust scan/detail worker count. |
-| `--run --debug` | Enable verbose debug output during scan and report generation. |
-| `--run --output <file>` | Override the full output file path (including filename). |
-| `--run --output-dir <dir>` | Write all reports to a specific directory (keeps default filenames). |
-| `--run --prefix <name>` | Add a prefix to all output filenames. |
-| `--run --date` | Append current date (`YYYYMMDD`) to the main output filename. |
-| `--run --tree-map` | Generate TreeMap SQLite+JSON outputs with the unified Rust detail pipeline. |
-| `--run --level <N>` | Maximum depth level for TreeMap generation (default: 3). |
-| `--run --webhook-url <URL>` | Send an MS Teams Adaptive Card notification on scan completion. |
-| `--run --sync --sync-user <U> --sync-host <H> --sync-dest-dir <D>` | Streams generated reports over SSH to a remote destination directory. |
-| `--run --sync ... --sync-pass <pwd>` | Provide SSH password securely via command line (requires `sshpass` tool). |
+|---|---|
+| `--run` | Run a full scan and generate reports. |
+| `--run --workers <N>` | Set Rust scan/detail worker count manually. Default is auto. |
+| `--run --debug` | Print verbose timing and memory diagnostics. |
+| `--run --user <u1> [u2 ...]` | Target detail tracking to selected users. |
+| `--run --output <file>` | Override the main summary report path. |
+| `--run --output-dir <dir>` | Write reports to a specific directory. |
+| `--run --prefix <name>` | Prefix generated report filenames. |
+| `--run --date` | Add `YYYYMMDD` to output filenames. |
+| `--run --tree-map` | Make `tree_map_report.json` available for TreeMap visualization. TreeMap data is built by the unified Rust output pipeline. |
+| `--run --level <N>` | Maximum TreeMap depth. Default: `3`. |
+| `--run --webhook-url <URL>` | Send a Microsoft Teams Workflow notification after completion. |
 
-> **Tip:** `--prefix` and `--date` can be combined with `--output-dir`:
-> ```bash
-> python disk_checker.py --run --output-dir /reports --prefix sda1 --date
-> # → /reports/sda1_disk_usage_report_20260408.json
-> ```
+`--prefix`, `--date`, and `--output-dir` can be combined:
 
-### Inspecting & Exporting Reports
+```bash
+python3 disk_checker.py --run --output-dir /reports --prefix sda1 --date
+# /reports/sda1_disk_usage_report_YYYYMMDD.json
+```
+
+### Remote sync commands
+
 | Command | Description |
-|---------|-------------|
-| `--show-report --files <f1.json>` | Shows a single report as a clean terminal table. |
-| `--show-report --files "disk_usage_*.json"` | Accepts shell wildcards to select multiple reports. |
-| `--show-report --files <f1> <f2> --compare-by growth` | Diffs two reports ranked by growth rate (default). |
-| `--show-report --files <f1> <f2> --compare-by usage` | Diffs two reports ranked by total usage. |
-| `--show-report --files … --user <u1> [u2 …]` | Filter report display to specific user(s). |
-| `--check-users <u1> [u2 …]` | Display per-user directory & file breakdown from detail reports. |
-| `--check-users … --output-dir <dir> --prefix <p>` | Locate detail reports at a custom path/prefix. |
+|---|---|
+| `--run --sync --sync-user <U> --sync-host <H> --sync-dest-dir <D>` | Sync generated reports to a remote directory over SSH. |
+| `--run --sync ... --sync-pass <pwd>` | Use password auth via `sshpass`. Key-based SSH is preferred. |
+
+Current sync behavior:
+
+- Main JSON reports are enqueued as files.
+- `detail_users/` is batch-synced as a directory.
+- `tree_map_data/` is batch-synced as a directory when present.
+- Directory sync uses rsync staging + swap when rsync is available.
+
+### Inspecting reports
+
+| Command | Description |
+|---|---|
+| `--show-report --files <report.json>` | Display one summary report. |
+| `--show-report --files "disk_usage_*.json"` | Display multiple reports selected by wildcard. |
+| `--show-report --files <a.json> <b.json> --compare-by growth` | Compare reports by growth rate. |
+| `--show-report --files <a.json> <b.json> --compare-by usage` | Compare reports by total usage. |
+| `--show-report --files ... --user <u1> [u2 ...]` | Filter displayed users. |
+| `--check-users <u1> [u2 ...]` | Display per-user directory and file breakdown from JSON/NDJSON detail data. |
+| `--check-users ... --top <N>` | Limit both directory and file rows. Default: `30`. |
+| `--check-users ... --output-dir <dir> --prefix <p>` | Locate detail data in a custom report directory/prefix. |
+
+### Exporting per-user text reports
+
+`scripts/export_user_reports.py` reads the current JSON/NDJSON detail format and writes plain-text usage files:
+
+```bash
+python3 scripts/export_user_reports.py \
+  --input-dir /reports \
+  --output-dir /reports/exports \
+  --users root www \
+  --workers 4 \
+  --max-readers 4
+```
+
+`--input-dir` may point either to the report root or directly to `detail_users/`.
 
 ---
 
-## 📊 Output Formats
+## Output Layout
 
-Summary reports are standard JSON files. Per-user detail reports are **SQLite databases** (`.db`):
+The current report format is JSON/NDJSON. SQLite report databases are no longer generated or read by the active pipeline.
 
-| File | Location | Description |
-|------|----------|-------------|
-| `disk_usage_report.json` | Root output dir | Overall summary: system stats, team usage, per-user totals, UID mappings. |
-| `inode_usage_report.json` | Root output dir | Inode monitoring: system total/free inodes, and top users ranked by inode consumption (files count). |
-| `permission_issues.json` | Root output dir | Paths that could not be accessed due to permission errors. |
-| `tree_map_report.json` | Root output dir | TreeMap root node JSON for directory visualization (generated with `--tree-map`). |
-| `tree_map_data.db` | Root output dir | SQLite shards DB containing compressed TreeMap children nodes (required by dashboard). |
-| `detail_users/data_detail.db` | `detail_users/` subdir | Unified SQLite DB for all users: largest directories and files with compact dictionaries and query indexes. |
+| Path | Description |
+|---|---|
+| `disk_usage_report.json` | Main summary report: general system usage, team usage, user usage, other usage. Prefix/date may alter the filename. |
+| `inode_usage_report.json` | Inode usage report with per-user file/inode counts. Prefix may alter the filename. |
+| `permission_issues.json` | Permission and inaccessible-path report. Prefix may alter the filename. |
+| `scan_status.json` | Runtime status heartbeat for web/remote monitoring. |
+| `detail_users/data_detail.json` | Root detail manifest listing users and relative per-user manifest paths. |
+| `detail_users/users/<user>/manifest.json` | Per-user detail manifest. |
+| `detail_users/users/<user>/dirs.ndjson` | Per-user directory rows: one JSON object per line. |
+| `detail_users/users/<user>/files/chunk-*/part-*.ndjson` | Per-user file detail rows, sharded for parallel writing and sync friendliness. |
+| `detail_users/users/<user>/top_dirs.json` | Fast top-directory index for UI/CLI display. |
+| `detail_users/users/<user>/top_files.json` | Fast top-file index for UI/CLI display. |
+| `detail_users/users/<user>/extensions.json` | Per-extension counts and byte totals. |
+| `tree_map_report.json` | TreeMap root JSON used by the dashboard. |
+| `tree_map_data/manifest.json` | TreeMap shard manifest. |
+| `tree_map_data/shards/<prefix>/<shard_id>.json` | Lazy-load TreeMap shard JSON files. |
 
-**Unified Detail DB Schema (`detail_users/data_detail.db`)**
+### Detail manifest structure
 
-The unified SQLite database uses domain-specific dictionaries to keep file size small across large scans.
+`detail_users/data_detail.json` is the stable entrypoint for per-user detail data:
 
-*Tables & Views:*
-- `users`: `(user_id, username, team_id, total_files, total_dirs, total_used, scan_date)` — Per-user metadata.
-- `dirs_dict`: `(dir_id, path)` — Shared directory path dictionary.
-- `basename_dict`: `(basename_id, basename)` — Shared filename dictionary.
-- `ext_dict`: `(ext_id, ext)` — Shared file extension dictionary.
-- `dir_detail`: `(user_id, dir_id, size)` — Per-user directory usage rows.
-- `file_detail`: `(user_id, dir_id, basename_id, ext_id, size)` — Normalized per-user file rows.
+```json
+{
+  "schema": "check_disk.detail.v1",
+  "scan": {
+    "timestamp": 1234567890
+  },
+  "users": [
+    {
+      "username": "alice",
+      "team_id": "backend",
+      "manifest": "users/alice/manifest.json",
+      "total_files": 100,
+      "total_dirs": 20,
+      "total_used": 123456789
+    }
+  ]
+}
+```
 
-*Compatibility Views:*
-- `user_meta`: exposes user metadata for tools that expect a metadata view.
-- `meta` / `meta_dirs`: expose legacy-shaped metadata rows.
-- `VIEW files`: reconstructs full paths by joining `file_detail`, `dirs_dict`, `basename_dict`, `ext_dict`, and `users`.
-- `VIEW dirs`: reconstructs full paths by joining `dir_detail`, `dirs_dict`, and `users`.
+Each user manifest points to relative files under that user's directory. Tools should follow the manifest rather than hardcoding part paths.
 
-*Performance Indexes:*
-- `idx_dir_detail_size`: `ON dir_detail(user_id, size DESC)` — Fast Top-N directories per user.
-- `idx_file_detail_size`: `ON file_detail(user_id, size DESC)` — Fast Top-N files per user.
-- `idx_file_detail_ext`: `ON file_detail(user_id, ext_id, size DESC)` — Fast extension-filtered queries.
+### Frontend read path
 
-## 🏗 Architecture & Modules
+The dashboard should use:
 
-### `src/fast_scanner.abi3.so` — Rust scanner and report builder
-Precompiled PyO3 module (ABI-stable `abi3` wheel).
-- **`scan_disk()`**: Parallel inode walker. Calculates blocks accurately and aggregates sizes per UID.
-- **`build_unified_dbs()`**: Builds `detail_users/data_detail.db`, `tree_map_report.json`, and `tree_map_data.db` directly from streaming TSV chunks.
+1. `detail_users/data_detail.json` to list users.
+2. `users/<user>/manifest.json` for user metadata and relative paths.
+3. `top_files.json`, `top_dirs.json`, and `extensions.json` for fast overview pages.
+4. NDJSON parts only for full export or deep drill-down.
+5. `tree_map_report.json` plus `tree_map_data/manifest.json` and shard JSON files for lazy TreeMap rendering.
 
-### `src/export_rust.abi3.so` — Report exporter
-Second Rust extension used by `scripts/export_user_reports.py`.
-- **`process()`**: Streams formatted per-user directory/file output directly to disk from `data_detail.db` or compatibility detail reports.
-- **`format_size()`**: Helper for human-readable size formatting.
+---
 
-### Python Source Modules (`src/`)
+## Architecture
+
+### `src/fast_scanner.abi3.so`
+
+Precompiled PyO3 scanner/report builder.
+
+- `scan_disk()` runs the parallel Rust filesystem scan and writes bounded TSV chunks.
+- `build_unified_dbs()` is the compatibility-named Python API that now builds JSON/NDJSON detail data and TreeMap JSON shards. The name is preserved for Python API stability, but it no longer writes SQLite DB files.
+
+### `src/rust_scanner/src/unified_output.rs`
+
+Rust JSON/NDJSON output pipeline.
+
+- Aggregates directory TSV data.
+- Builds global file-chunk jobs across all users.
+- Processes file chunks with Rayon.
+- Finalizes per-user manifests and top indexes.
+- Writes the root detail manifest after successful user output and TreeMap generation.
+- Writes TreeMap shards as independent JSON files.
+
+### `src/export_rust.abi3.so`
+
+Rust exporter used by `scripts/export_user_reports.py`.
+
+- Reads `detail_users/data_detail.json`.
+- Resolves each user's manifest.
+- Reads `dirs.ndjson` and file parts.
+- Reads file parts in parallel with Rayon.
+- Writes plain-text directory/file reports.
+
+### Python modules
+
 | Module | Description |
-|--------|-------------|
-| `disk_scanner.py` | Rust scanner wrapper and `ScanResult` dataclass. |
-| `report_generator.py` | Transforms raw `ScanResult` data into JSON reports and invokes the unified Rust detail/TreeMap builder. |
-| `config_manager.py` | CRUD operations for `disk_checker_config.json`: teams, users, and directory settings. |
-| `cli_interface.py` | Builds the `argparse` parser, handles wildcard expansion for `--files`, and routes display calls to the formatter. |
-| `sync_manager.py` | Executes the secure SSH pipeline allowing report datasets to be streamed and extracted on remote servers. |
-| `msteams_notifier.py` | Sends an MS Teams Adaptive Card (v1.4) notification via a Workflow Webhook URL after a successful scan. |
-| `formatters/report_formatter.py` | Terminal table rendering for single reports, multi-report comparisons, and per-user detail views. |
-| `utils.py` | Shared helpers: `format_size`, `format_time_duration`, `format_timestamp`, `get_general_system_info`, `build_uid_cache`, `get_username_from_uid`, `save_json_report`, `load_json_report`, etc. |
+|---|---|
+| `disk_checker.py` | Main CLI entrypoint and scan/report orchestration. |
+| `src/cli_interface.py` | Argument parser and display command routing. |
+| `src/config_manager.py` | Config CRUD for teams, users, and scan directory. |
+| `src/disk_scanner.py` | Python wrapper around the Rust scanner and `ScanResult`. |
+| `src/report_generator.py` | Writes summary JSON reports and invokes Rust unified output generation. |
+| `src/sync_manager.py` | Async SSH/rsync sync pipeline. |
+| `src/formatters/report_formatter.py` | Terminal rendering for summary, comparison, and detail views. |
+| `src/msteams_notifier.py` | Microsoft Teams Workflow notification helper. |
+| `src/utils.py` | Shared formatting, UID, and JSON helpers. |
 
-### Root Scripts
-| File | Description |
-|------|-------------|
-| `disk_checker.py` | Main CLI entrypoint — parses arguments and orchestrates scan + report pipeline. |
+### Scripts
 
-### Utility Scripts (`scripts/`)
 | Script | Description |
-|--------|-------------|
-| `convert_config.py` | One-time migration helper to convert legacy config format to the current flat format. |
-| `export_user_reports.py` | Exports per-user JSON detail reports to plain-text format for archiving or emailing. |
-| `backfill_team_ids.py` | Retroactively injects `team_id` fields into existing historical report JSON files. |
-| `migrate_permission_issues.py` | Migrates old-format `permission_issues.json` files to the current schema. |
+|---|---|
+| `scripts/convert_config.py` | Convert legacy config files to the flat config format. |
+| `scripts/export_user_reports.py` | Export JSON/NDJSON user details to plain text. |
+| `scripts/backfill_team_ids.py` | Add `team_id` fields to historical summary reports. |
+| `scripts/migrate_permission_issues.py` | Migrate older permission issue report shapes. |
 
 ---
 
+## Companion Dashboard
 
+`check_disk` is designed to feed the `disk_usage` web dashboard.
 
-## 🔗 Companion Dashboard
+Recommended report root layout:
 
-This scanner is designed to pair with the `disk_usage` web dashboard.
-Typical flow:
-1. `check_disk` scans the filesystem
-2. It writes summary JSON, permission JSON, unified detail SQLite, and TreeMap data
-3. `disk_usage` reads those files through PHP handlers and renders them in the browser
+```text
+<report_root>/disk_usage_report*.json
+<report_root>/permission_issues*.json
+<report_root>/inode_usage_report*.json
+<report_root>/scan_status.json
+<report_root>/detail_users/data_detail.json
+<report_root>/detail_users/users/<user>/manifest.json
+<report_root>/tree_map_report.json
+<report_root>/tree_map_data/manifest.json
+<report_root>/tree_map_data/shards/**/*.json
+```
 
-Recommended output layout for dashboard consumption:
-- `<report_root>/disk_usage_report*.json`
-- `<report_root>/permission_issues*.json`
-- `<report_root>/inode_usage_report.json`
-- `<report_root>/tree_map_report.json`
-- `<report_root>/tree_map_data.db`
-- `<report_root>/detail_users/data_detail.db`
+Point `disk_usage/disks.json` entries at directories containing these generated files.
 
-When deploying both together, point `disk_usage/disks.json` entries at directories containing these generated files.
+---
 
-## ⚡ Performance & Memory Notes
+## Performance and Memory Notes
 
-**Engine Throughput Guidelines:**
-| Scenario | Engine | Expected Time |
-|----------|--------|---------------|
-| NVMe local, 10M files | Rust | < 5 min |
-| SSD local, 50M files | Rust | 5–15 min |
-| NFS/SAN high-latency, 75M files | Rust (Auto-scaled) | 15–40 min |
-| HDD single disk | Rust (I/O Bound) | 30–90 min |
-| Legacy scan, 75M files | Python Fallback | 60–180 min |
+- Phase 1 scan streams file and directory detail rows to temporary TSV chunks.
+- Phase 2 output generation runs in Rust and uses bounded memory.
+- Large users are split across global file chunk jobs, so one huge user does not serialize the whole detail phase.
+- TreeMap shard output is JSON-file based and parallel-friendly.
+- JSON/NDJSON is rsync- and compression-friendly compared with a large mutable binary database.
 
-**Memory Efficiency (Rust vs Legacy Python)**
-Switching to Rust drops peak RAM from `~5 GB` (heavy Python datastructures) down to **`~1.5 GB`** for massive 75M+ inode traversals, by streaming data directly to disk in bounded TSV chunks and merging them with a `BinaryHeap` in Phase 2.
+Typical performance depends on storage latency, inode count, directory fanout, and worker count. Use `--debug` to print timing and memory diagnostics for your environment.
+
+---
+
+## Verification Commands
+
+Useful checks after code changes:
+
+```bash
+cargo check --manifest-path src/rust_scanner/Cargo.toml --message-format short
+cargo check --manifest-path src/rust_exporter/Cargo.toml --message-format short
+python3 -m pytest tests/test_report_generator.py tests/test_unified_pipeline.py tests/test_sync_manager.py -q
+```
+
+Build broad-compatible Rust artifacts with:
+
+```bash
+bash src/rust_scanner/build.sh
+bash src/rust_exporter/build.sh
+```
