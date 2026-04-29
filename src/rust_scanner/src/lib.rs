@@ -665,6 +665,64 @@ pub(crate) fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     Some((size, path))
 }
 
+pub(crate) struct MergeReaderState {
+    reader: BufReader<fs::File>,
+    line: String,
+}
+
+impl MergeReaderState {
+    pub(crate) fn new(file: fs::File) -> Self {
+        Self {
+            reader: BufReader::new(file),
+            line: String::new(),
+        }
+    }
+
+    pub(crate) fn next_entry(&mut self) -> Option<(u64, String)> {
+        loop {
+            self.line.clear();
+            let bytes = self.reader.read_line(&mut self.line).ok()?;
+            if bytes == 0 {
+                return None;
+            }
+            if let Some(entry) = parse_tsv_line(self.line.trim_end_matches(['\r', '\n'])) {
+                return Some(entry);
+            }
+        }
+    }
+}
+
+pub(crate) fn _aggregate_tsv_to_map(
+    paths: &[String],
+    uids_map: &HashMap<u32, String>,
+) -> PyResult<HashMap<String, HashMap<String, i64>>> {
+    let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
+
+    for path in paths {
+        let f = fs::File::open(path)
+            .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path, e)))?;
+        for line in BufReader::new(f).lines() {
+            let line = line.map_err(|e| PyRuntimeError::new_err(format!("read {}: {}", path, e)))?;
+            let mut parts = line.splitn(3, '\t');
+            let Some(dir_path) = parts.next() else { continue };
+            let Some(uid_raw) = parts.next() else { continue };
+            let Some(size_raw) = parts.next() else { continue };
+            let Ok(uid) = uid_raw.parse::<u32>() else { continue };
+            let Ok(size) = size_raw.parse::<i64>() else { continue };
+            if size <= 0 {
+                continue;
+            }
+            let owner = uids_map.get(&uid).cloned().unwrap_or_else(|| format!("uid-{}", uid));
+            *out.entry(dir_path.to_string())
+                .or_default()
+                .entry(owner)
+                .or_default() += size;
+        }
+    }
+
+    Ok(out)
+}
+
 pub(crate) fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<String>> {
     if uids.is_empty() {
         return Ok(Vec::new());
