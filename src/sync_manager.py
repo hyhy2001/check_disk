@@ -1,5 +1,6 @@
 import atexit
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -469,6 +470,8 @@ class ReportSyncer:
             rel_path = os.path.basename(local_abs)
 
         remote_target = f"{dest_dir}/{rel_path}"
+        remote_staging = f"{remote_target}.__staging__"
+        remote_old = f"{remote_target}.__old__"
 
         control_socket = ""
         if _capability_cache is not None:
@@ -476,24 +479,6 @@ class ReportSyncer:
 
         ssh_base, env = _build_ssh_base(user, host, password, control_socket)
         merged_env = {**os.environ, **env}
-
-        # Ensure remote dir exists
-        mkdir_cmd = ssh_base + [f"mkdir -p '{remote_target}'"]
-        try:
-            mkdir_proc = subprocess.run(
-                mkdir_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=merged_env,
-                timeout=SSH_TIMEOUT,
-            )
-            if mkdir_proc.returncode != 0:
-                print(f"[SYNC WARN] Cannot prepare remote dir {remote_target}, falling back to file-by-file.")
-                return False
-        except (subprocess.TimeoutExpired, OSError) as e:
-            print(f"[SYNC WARN] mkdir failed for {remote_target}: {e}")
-            return False
 
         has_rsync = False
         if _capability_cache is not None:
@@ -509,16 +494,48 @@ class ReportSyncer:
                 f" -o ControlPath={control_socket} -o ControlMaster=auto"
                 if control_socket else ""
             )
+            prepare_cmd = ssh_base + [
+                "set -e; "
+                f"rm -rf {shlex.quote(remote_staging)}; "
+                f"if [ -d {shlex.quote(remote_target)} ]; then "
+                f"cp -al {shlex.quote(remote_target)} {shlex.quote(remote_staging)}; "
+                "else "
+                f"mkdir -p {shlex.quote(remote_staging)}; "
+                "fi"
+            ]
+            swap_cmd = ssh_base + [
+                "set -e; "
+                f"rm -rf {shlex.quote(remote_old)}; "
+                f"if [ -d {shlex.quote(remote_target)} ]; then "
+                f"mv {shlex.quote(remote_target)} {shlex.quote(remote_old)}; "
+                "fi; "
+                f"mv {shlex.quote(remote_staging)} {shlex.quote(remote_target)}; "
+                f"rm -rf {shlex.quote(remote_old)}"
+            ]
             rsync_cmd = [
                 *(["sshpass", "-e"] if password else []),
-                "rsync", "-az",
+                "rsync", "-az", "--compress-level=1",
                 "--delete", "--delete-delay",
-                "--partial", "--inplace", "--no-whole-file",
+                "--partial", "--no-whole-file",
                 "-e", ssh_e,
                 f"{local_abs}/",
-                f"{user}@{host}:{remote_target}/",
+                f"{user}@{host}:{remote_staging}/",
             ]
             try:
+                prepare_proc = subprocess.run(
+                    prepare_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=merged_env,
+                    timeout=SSH_TIMEOUT,
+                )
+                if prepare_proc.returncode != 0:
+                    print(f"[SYNC WARN] Could not prepare staging dir for {rel_path}/.")
+                    if prepare_proc.stderr:
+                        print(f"[SYNC WARN DETAILS]:\n{prepare_proc.stderr.strip()}")
+                    return False
+
                 rsync_proc = subprocess.run(
                     rsync_cmd,
                     stdout=subprocess.PIPE,
@@ -528,9 +545,22 @@ class ReportSyncer:
                     timeout=RSYNC_TIMEOUT,
                 )
                 if rsync_proc.returncode == 0:
-                    file_count = sum(1 for _ in os.scandir(local_abs) if _.is_file())
-                    print(f"[SYNC] Batch synced directory: {rel_path}/ ({file_count} files)")
-                    return True
+                    swap_proc = subprocess.run(
+                        swap_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=merged_env,
+                        timeout=SSH_TIMEOUT,
+                    )
+                    if swap_proc.returncode == 0:
+                        file_count = sum(1 for _ in os.scandir(local_abs) if _.is_file())
+                        print(f"[SYNC] Batch synced directory via staging swap: {rel_path}/ ({file_count} files)")
+                        return True
+                    print(f"[SYNC ERROR] Atomic swap failed for {rel_path}/ (code {swap_proc.returncode}).")
+                    if swap_proc.stderr:
+                        print(f"[SYNC ERROR DETAILS]:\n{swap_proc.stderr.strip()}")
+                    return False
                 print(f"[SYNC WARN] Batch rsync failed for {rel_path}/ (code {rsync_proc.returncode}).")
                 if rsync_proc.stderr:
                     print(f"[SYNC WARN DETAILS]:\n{rsync_proc.stderr.strip()}")
@@ -539,8 +569,19 @@ class ReportSyncer:
             except Exception as e:
                 print(f"[SYNC WARN] Batch rsync failed for {rel_path}/: {e}")
 
-        # Fallback: tar+gzip stream for the directory
-        ssh_extract_cmd = ssh_base + [f"mkdir -p '{remote_target}' && tar -xzf - -C '{remote_target}'"]
+        # Fallback: tar+gzip stream into staging, then atomic swap.
+        ssh_extract_cmd = ssh_base + [
+            "set -e; "
+            f"rm -rf {shlex.quote(remote_staging)}; "
+            f"mkdir -p {shlex.quote(remote_staging)}; "
+            f"tar -xzf - -C {shlex.quote(remote_staging)}; "
+            f"rm -rf {shlex.quote(remote_old)}; "
+            f"if [ -d {shlex.quote(remote_target)} ]; then "
+            f"mv {shlex.quote(remote_target)} {shlex.quote(remote_old)}; "
+            "fi; "
+            f"mv {shlex.quote(remote_staging)} {shlex.quote(remote_target)}; "
+            f"rm -rf {shlex.quote(remote_old)}"
+        ]
         try:
             tar_proc = subprocess.Popen(
                 ["tar", "-czf", "-", "-C", local_abs, "."],

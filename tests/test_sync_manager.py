@@ -24,6 +24,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # Đảm bảo import được src/
@@ -628,6 +629,79 @@ class TestControlMasterReuse(SyncTestBase):
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. AsyncSyncPipeline concurrency
 # ─────────────────────────────────────────────────────────────────────────────
+class TestStagedDirectorySync:
+    def test_directory_rsync_uses_staging_swap_without_inplace(self, tmp_path):
+        local = tmp_path / "reports"
+        local.mkdir()
+        (local / "data_detail.db").write_text("db")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("src.sync_manager.shutil.which", return_value="/usr/bin/rsync"), \
+             patch("src.sync_manager.ReportSyncer._remote_has_binary", return_value=True), \
+             patch("src.sync_manager.subprocess.run", side_effect=fake_run):
+            ok = ReportSyncer.sync_directory_to_remote(
+                local_dir=str(local),
+                base_dir=str(tmp_path),
+                user="deploy",
+                host="example.com",
+                dest_dir="/remote",
+                _capability_cache={"has_rsync": True, "control_socket": ""},
+            )
+
+        assert ok is True
+        remote_commands = [cmd[-1] for cmd in calls if cmd and cmd[0] == "ssh"]
+        assert any(".__staging__" in cmd and "cp -al" in cmd for cmd in remote_commands)
+        assert any("mv /remote/reports.__staging__ /remote/reports" in cmd for cmd in remote_commands)
+        rsync_calls = [cmd for cmd in calls if cmd and cmd[0] == "rsync"]
+        assert len(rsync_calls) == 1
+        assert "--inplace" not in rsync_calls[0]
+        assert "--compress-level=1" in rsync_calls[0]
+        assert rsync_calls[0][-1] == "deploy@example.com:/remote/reports.__staging__/"
+
+    def test_directory_tar_fallback_extracts_to_staging_then_swaps(self, tmp_path):
+        local = tmp_path / "reports"
+        local.mkdir()
+        (local / "summary.json").write_text("{}")
+        calls = []
+
+        class FakeStdout:
+            def close(self):
+                pass
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                calls.append(cmd)
+                self.stdout = FakeStdout()
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("src.sync_manager.shutil.which", return_value=None), \
+             patch("src.sync_manager.subprocess.Popen", FakePopen), \
+             patch("src.sync_manager.subprocess.run", side_effect=fake_run):
+            ok = ReportSyncer.sync_directory_to_remote(
+                local_dir=str(local),
+                base_dir=str(tmp_path),
+                user="deploy",
+                host="example.com",
+                dest_dir="/remote",
+                _capability_cache={"has_rsync": False, "control_socket": ""},
+            )
+
+        assert ok is True
+        remote_commands = [cmd[-1] for cmd in calls if cmd and cmd[0] == "ssh"]
+        assert any("tar -xzf - -C /remote/reports.__staging__" in cmd for cmd in remote_commands)
+        assert any("mv /remote/reports.__staging__ /remote/reports" in cmd for cmd in remote_commands)
+
+
 class TestAsyncSyncPipeline(SyncTestBase):
     """Kiểm tra AsyncSyncPipeline với nhiều file/dir đồng thời."""
 

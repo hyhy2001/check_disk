@@ -2,6 +2,7 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 
 import pytest
 
@@ -9,10 +10,42 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import disk_checker  # noqa: E402
 from scripts import export_user_reports  # noqa: E402
 from src.cli_interface import CLIInterface  # noqa: E402
 from src.disk_scanner import ScanResult  # noqa: E402
 from src.report_generator import ReportGenerator  # noqa: E402
+
+
+class _FakeSyncPipeline:
+    def __init__(self):
+        self.paths = []
+
+    def enqueue_file(self, path):
+        self.paths.append(path)
+
+
+def test_scan_status_heartbeat_syncs_periodically(tmp_path):
+    pipeline = _FakeSyncPipeline()
+    heartbeat = disk_checker._ScanStatusHeartbeat(
+        str(tmp_path),
+        started_at=time.time(),
+        sync_pipeline=pipeline,
+        interval=0.05,
+        sync_interval=0.12,
+    )
+    heartbeat.set_phase("scan", "Scanning")
+    heartbeat.start()
+    try:
+        time.sleep(0.28)
+    finally:
+        heartbeat.stop()
+
+    status_path = tmp_path / "scan_status.json"
+    assert status_path.exists()
+    assert str(status_path) in pipeline.paths
+    assert len(pipeline.paths) >= 2
+    assert len(pipeline.paths) <= 4
 
 
 def _build_unified_fixture(tmp_path):

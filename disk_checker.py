@@ -106,12 +106,22 @@ class _ScanStatusHeartbeat:
     while long phases are running. Caller controls the active phase via
     set_phase(). Calling stop() halts the thread."""
 
-    def __init__(self, out_dir: str, started_at: float, sync_pipeline=None, interval: float = 5.0):
+    def __init__(
+        self,
+        out_dir: str,
+        started_at: float,
+        sync_pipeline=None,
+        interval: float = 5.0,
+        sync_interval: float = 30.0,
+    ):
         import threading
+        import time
         self.out_dir = out_dir
         self.started_at = started_at
         self.sync_pipeline = sync_pipeline
         self.interval = interval
+        self.sync_interval = max(interval, sync_interval)
+        self._last_sync = time.monotonic()
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
         self._stage = "scan"
@@ -126,13 +136,19 @@ class _ScanStatusHeartbeat:
         _update_status(self.sync_pipeline, self.out_dir, stage, True, message, started_at=self.started_at)
 
     def _run(self):
+        import time
         while not self._stop_evt.wait(self.interval):
             with self._lock:
                 stage = self._stage
                 message = self._message
-            # Heartbeat write only updates `updated_at`, no sync enqueue
-            # to avoid spamming the sync pipeline. Sync still happens on phase changes.
-            _write_scan_status(self.out_dir, stage, True, message, started_at=self.started_at)
+            status_path = _write_scan_status(self.out_dir, stage, True, message, started_at=self.started_at)
+            now = time.monotonic()
+            if status_path and self.sync_pipeline and now - self._last_sync >= self.sync_interval:
+                try:
+                    self.sync_pipeline.enqueue_file(status_path)
+                    self._last_sync = now
+                except Exception:
+                    pass
 
     def start(self):
         self._thread.start()
