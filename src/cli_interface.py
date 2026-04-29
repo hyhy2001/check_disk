@@ -61,14 +61,14 @@ class CLIInterface:
         scan_group.add_argument(
             "--detail-fts",
             choices=["on", "off"],
-            default="off",
-            help="Enable/disable FTS4 indexes in detail user SQLite DBs (default: off).",
+            default="on",
+            help="Enable/disable FTS4 indexes in detail user SQLite DBs (default: on).",
         )
         scan_group.add_argument(
             "--detail-size-index",
             choices=["on", "off"],
-            default="off",
-            help="Enable/disable size-based index in detail user SQLite DBs for faster size queries (default: off).",
+            default="on",
+            help="Enable/disable size-based index in detail user SQLite DBs for faster size queries (default: on).",
         )
 
         # Report commands
@@ -253,6 +253,7 @@ class CLIInterface:
             {output_dir}/detail_users/{prefix}_detail_report_file_{user}.db|.ndjson|.json
         """
         detail_dir = os.path.join(output_dir, "detail_users")
+        unified_db_path = os.path.join(detail_dir, "data_detail.db")
 
         def _build_path(base: str, user: str) -> str:
             parts = [p for p in [prefix, base, user] if p]
@@ -261,6 +262,8 @@ class CLIInterface:
                 candidate = stem + ext
                 if os.path.exists(candidate):
                     return candidate
+            if os.path.exists(unified_db_path):
+                return unified_db_path
             return ""
 
         def _db_has_dirs(path: str) -> bool:

@@ -71,16 +71,8 @@ class DiskScanner:
         self.use_rust = config.get("use_rust", True) and _HAS_FAST_SCANNER
 
         if not self.use_rust:
-            if not _HAS_FAST_SCANNER:
-                print("  [fallback] Rust core 'fast_scanner' not loaded. Attempting to use pure-Python backup...")
-            try:
-                from .legacy_scanner_backup import LegacyDiskScanner
-                self._scanner = LegacyDiskScanner(config, max_workers, debug)
-            except ImportError as e:
-                print(f"  [error] Legacy fallback scanner backup not found! ({e})")
-                raise NotImplementedError("Rust core 'fast_scanner' is required but missing, and Legacy fallback is not installed.")
-        else:
-            self._scanner = None
+            raise NotImplementedError("Rust core 'fast_scanner' is required.")
+        self._scanner = None
 
     def scan(self) -> ScanResult:
         if self.use_rust:

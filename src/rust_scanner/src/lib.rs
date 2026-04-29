@@ -16,6 +16,9 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rayon::prelude::*;
 
+mod unified_db;
+pub use unified_db::build_unified_dbs;
+
 // Same list as Python's critical_skip_dirs
 const CRITICAL_SKIP_NAMES: &[&str] = &[
     ".snapshot", ".snapshots", ".zfs",
@@ -529,7 +532,7 @@ fn scan_disk(
 use std::io::{BufRead, BufReader};
 /// Sanitise a raw byte string (possibly lossy-decoded) so the result is
 /// valid UTF-8 JSON: replace any surrogate or invalid code points with U+FFFD.
-fn sanitise_path(raw: &str) -> String {
+pub(crate) fn sanitise_path(raw: &str) -> String {
     raw.chars()
         .map(|c| if c == '\u{FFFD}' || (c.is_control() && c != '\t') { '\u{FFFD}' } else { c })
         .collect()
@@ -813,20 +816,20 @@ fn _intern_xt_id(
     Ok(id)
 }
 
-struct MergeReaderState {
+pub(crate) struct MergeReaderState {
     reader: BufReader<fs::File>,
     line_buf: String,
 }
 
 impl MergeReaderState {
-    fn new(file: fs::File) -> Self {
+    pub(crate) fn new(file: fs::File) -> Self {
         Self {
             reader: BufReader::new(file),
             line_buf: String::with_capacity(256),
         }
     }
 
-    fn next_entry(&mut self) -> Option<(u64, String)> {
+    pub(crate) fn next_entry(&mut self) -> Option<(u64, String)> {
         loop {
             self.line_buf.clear();
             let n = self.reader.read_line(&mut self.line_buf).ok()?;
@@ -1357,14 +1360,14 @@ fn _merge_incremental_path(
 
 
 
-fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
+pub(crate) fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     let tab = line.find('\t')?;
     let size: u64 = line[..tab].trim().parse().ok()?;
     let path = line[tab + 1..].to_string();
     Some((size, path))
 }
 
-fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<String>> {
+pub(crate) fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<String>> {
     if uids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1512,7 +1515,7 @@ enum ShardItem {
 /// * `min_size_bytes`  – Children smaller than this are omitted from shards
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn generate_treemap_sqlite(
+pub(crate) fn generate_treemap_sqlite(
     py: Python<'_>,
     root_dir: String,
     dir_sizes: HashMap<String, HashMap<String, i64>>,
@@ -1979,7 +1982,7 @@ fn aggregate_dir_sizes(
 }
 
 /// Internal helper: read TSV files and aggregate into HashMap.
-fn _aggregate_tsv_to_map(
+pub(crate) fn _aggregate_tsv_to_map(
     tsv_files: &[String],
     uid_map: &HashMap<u32, String>,
 ) -> PyResult<HashMap<String, HashMap<String, i64>>> {
@@ -2094,11 +2097,12 @@ fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_treemap_sqlite, m)?)?;
     m.add_function(wrap_pyfunction!(aggregate_dir_sizes, m)?)?;
     m.add_function(wrap_pyfunction!(generate_treemap_from_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(build_unified_dbs, m)?)?;
     Ok(())
 }
 
 #[inline]
-fn split_path_for_stage(path: &str) -> (&str, &str, String) {
+pub(crate) fn split_path_for_stage(path: &str) -> (&str, &str, String) {
     let (dir, basename) = if let Some(slash_pos) = path.rfind('/') {
         let dir_part = &path[..slash_pos];
         let base_part = if slash_pos + 1 < path.len() {

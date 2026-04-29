@@ -63,6 +63,88 @@ def _resolve_output_path(
 
     return path, prefix_str, date_str
 
+
+def _write_scan_status(out_dir: str, stage: str, running: bool, message: str = "", error: str = "", started_at: float = 0):
+    try:
+        import json
+        import os
+        import socket
+        import time
+        status_path = os.path.join(out_dir, 'scan_status.json')
+        tmp_path = status_path + '.tmp'
+        payload = {
+            "running": running,
+            "stage": stage,
+            "started_at": int(started_at) if started_at else int(time.time()),
+            "updated_at": int(time.time()),
+            "finished_at": int(time.time()) if not running else 0,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "message": message,
+            "error": error
+        }
+        with open(tmp_path, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, status_path)
+        return status_path
+    except Exception:
+        pass
+    return None
+
+def _update_status(pipeline, out_dir: str, stage: str, running: bool, message: str = "", error: str = "", started_at: float = 0):
+    """Write status JSON and (if pipeline is configured) immediately enqueue it for sync."""
+    p = _write_scan_status(out_dir, stage, running, message, error, started_at)
+    if p and pipeline:
+        try:
+            pipeline.enqueue_file(p)
+        except Exception:
+            pass
+
+
+class _ScanStatusHeartbeat:
+    """Background thread that touches scan_status.json so updated_at moves
+    while long phases are running. Caller controls the active phase via
+    set_phase(). Calling stop() halts the thread."""
+
+    def __init__(self, out_dir: str, started_at: float, sync_pipeline=None, interval: float = 5.0):
+        import threading
+        self.out_dir = out_dir
+        self.started_at = started_at
+        self.sync_pipeline = sync_pipeline
+        self.interval = interval
+        self._stop_evt = threading.Event()
+        self._lock = threading.Lock()
+        self._stage = "scan"
+        self._message = ""
+        self._thread = threading.Thread(target=self._run, name="scan-status-heartbeat", daemon=True)
+
+    def set_phase(self, stage: str, message: str = ""):
+        with self._lock:
+            self._stage = stage
+            self._message = message
+        # Write immediately so the new phase shows up without waiting for next tick
+        _update_status(self.sync_pipeline, self.out_dir, stage, True, message, started_at=self.started_at)
+
+    def _run(self):
+        while not self._stop_evt.wait(self.interval):
+            with self._lock:
+                stage = self._stage
+                message = self._message
+            # Heartbeat write only updates `updated_at`, no sync enqueue
+            # to avoid spamming the sync pipeline. Sync still happens on phase changes.
+            _write_scan_status(self.out_dir, stage, True, message, started_at=self.started_at)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        try:
+            self._thread.join(timeout=2)
+        except Exception:
+            pass
+
+
 def main():
     """Main entry point for the disk usage checker application."""
 
@@ -176,6 +258,9 @@ def main():
             config['users'] = filtered_users
             config['target_users_only'] = True
 
+        heartbeat = None
+        out_dir = '.'
+        sync_pipeline = None
         try:
             # Safety check: refuse to scan if directory is not explicitly configured
             scan_dir = config.get('directory', '')
@@ -184,7 +269,6 @@ def main():
                 return
 
             # Initialize async sync pipeline early (if --sync flag is provided)
-            sync_pipeline = None
             if getattr(args, 'sync', False):
                 out_dir = os.path.dirname(config.get('output_file', 'disk_usage_report.json'))
                 if not out_dir:
@@ -197,6 +281,14 @@ def main():
                     password=getattr(args, 'sync_pass', None),
                 )
 
+            main_report_path = config.get('output_file', 'disk_usage_report.json')
+            out_dir = os.path.dirname(main_report_path) if main_report_path else '.'
+
+            # Initialize status heartbeat (touch every 5s so updated_at refreshes)
+            heartbeat = _ScanStatusHeartbeat(out_dir, run_started_at, sync_pipeline, interval=5.0)
+            heartbeat.set_phase("scan", "Scanning filesystem")
+            heartbeat.start()
+
             print("\n=== STARTING DISK USAGE SCAN ===")
             print(f"Target directory: {config.get('directory', '')}")
 
@@ -208,13 +300,11 @@ def main():
                 debug=args.debug,
             )
 
-            # Resolve output path for sync use (before scan to allow early enqueue)
-            main_report_path = config.get('output_file', 'disk_usage_report.json')
 
             scan_results = scanner.scan()
-            out_dir = os.path.dirname(main_report_path) if main_report_path else '.'
             prefix = config.get('output_prefix', '')
 
+            heartbeat.set_phase("report", "Generating main summary reports")
             print("\n=== GENERATING REPORTS ===")
 
             # Main summary report
@@ -234,8 +324,11 @@ def main():
 
             # Per-user detail reports (dir + file) - runs with same
             # concurrency level as the scanner (Phase 1 workers reused)
-            created = report_generator.generate_detail_reports(
+            heartbeat.set_phase("detail", "Generating user detail reports and TreeMap")
+            tree_level = getattr(args, 'level', 3)
+            created = report_generator.generate_detail_reports_with_level(
                 scan_results,
+                level=tree_level,
                 max_workers=scanner.max_workers,
             )
             # Batch-sync the detail_users/ directory (single rsync, much faster)
@@ -260,6 +353,7 @@ def main():
 
             # TreeMap report runs after detail export (Phase 3)
             if getattr(args, 'tree_map', False):
+                heartbeat.set_phase("treemap", "Generating interactive tree map")
                 level = getattr(args, 'level', 3)
                 tree_map_path = report_generator.generate_tree_map(
                     scan_results,
@@ -276,24 +370,37 @@ def main():
                     if os.path.isfile(tree_map_db):
                         sync_pipeline.enqueue_file(tree_map_db)
 
+            if sync_pipeline:
+                heartbeat.set_phase("sync", "Syncing reports to remote server")
+                print("[SYNC] Waiting for async pipeline to complete...")
+                sync_pipeline.wait()
+                sync_pipeline.close()
+                print("[SYNC] Async pipeline done")
+
+            heartbeat.stop()
+            _update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at)
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             total_elapsed = time.time() - run_started_at
             print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 
             if sync_pipeline:
-                print("[SYNC] Waiting for async pipeline to complete...")
-                sync_pipeline.wait()
-                sync_pipeline.close()
-                print("[SYNC] Async pipeline done")
+                # ensure final done status is pushed to remote destination
+                _update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at)
 
             if getattr(args, 'webhook_url', None):
                 from src.msteams_notifier import send_msteams_notification
                 send_msteams_notification(args.webhook_url, scan_results, config)
 
         except KeyboardInterrupt:
+            if heartbeat:
+                heartbeat.stop()
+            _update_status(sync_pipeline, out_dir, "error", False, "Scan interrupted by user", started_at=run_started_at)
             print("\nScan interrupted by user.")
             sys.exit(1)
         except Exception as e:
+            if heartbeat:
+                heartbeat.stop()
+            _update_status(sync_pipeline, out_dir, "error", False, f"Scan failed: {e}", str(e), started_at=run_started_at)
             print(f"\nUnexpected error: {e}")
             traceback.print_exc()
             sys.exit(1)

@@ -31,13 +31,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import src.sync_manager as sm
-from src.sync_manager import (
+import src.sync_manager as sm  # noqa: E402
+from src.sync_manager import (  # noqa: E402
+    _CONTROL_SOCKETS,
     AsyncSyncPipeline,
     ReportSyncer,
-    _CONTROL_SOCKETS,
     _should_compress,
 )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Kiểm tra nhanh xem SSH localhost có khả dụng không
@@ -66,7 +67,7 @@ def _remote_ls(remote_dir: str, key: str) -> set:
          f"find '{remote_dir}' -maxdepth 1 -type f -printf '%f\\n' 2>/dev/null || true"],
         capture_output=True, text=True, timeout=15,
     )
-    return {l.strip() for l in r.stdout.splitlines() if l.strip()}
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
 
 
 def _remote_read(remote_path: str, key: str) -> str:
@@ -206,7 +207,7 @@ class SyncTestBase(unittest.TestCase):
         # Xóa key test khỏi authorized_keys
         if os.path.exists(cls._AUTH_KEYS):
             lines = Path(cls._AUTH_KEYS).read_text().splitlines(keepends=True)
-            filtered = [l for l in lines if cls._MARKER not in l]
+            filtered = [line for line in lines if cls._MARKER not in line]
             Path(cls._AUTH_KEYS).write_text("".join(filtered))
 
         # Cleanup keypair dir
@@ -690,7 +691,7 @@ class TestAsyncSyncPipeline(SyncTestBase):
                  f"find '{remote_sub}' -type f -printf '%f\\n' 2>/dev/null || true"],
                 capture_output=True, text=True, timeout=15,
             )
-            remote_files = {l.strip() for l in r.stdout.splitlines() if l.strip()}
+            remote_files = {line.strip() for line in r.stdout.splitlines() if line.strip()}
             for i in range(5):
                 self.assertIn(f"r{i}.json", remote_files)
         finally:
@@ -731,7 +732,7 @@ class TestAsyncSyncPipeline(SyncTestBase):
 
             self.assertEqual(
                 errors, [],
-                f"Race condition hoặc corrupt file:\n" + "\n".join(errors)
+                "Race condition hoặc corrupt file:\n" + "\n".join(errors)
             )
         finally:
             shutil.rmtree(local, ignore_errors=True)

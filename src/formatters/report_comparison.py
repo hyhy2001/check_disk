@@ -6,9 +6,9 @@ Contains functionality for comparing multiple reports.
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..utils import format_size, format_timestamp
 from .base_formatter import BaseFormatter
 from .table_formatter import TableFormatter
-from ..utils import format_size, format_timestamp
 
 
 class ReportComparison(BaseFormatter):

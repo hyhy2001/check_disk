@@ -5,14 +5,15 @@ Contains the ReportFormatter class for formatting and displaying reports.
 """
 
 import json
+import os
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..utils import format_size, format_timestamp
 from .base_formatter import BaseFormatter
 from .config_display import ConfigDisplay
 from .report_comparison import ReportComparison
 from .table_formatter import TableFormatter
-from ..utils import format_size, format_timestamp
 
 
 class ReportFormatter(BaseFormatter):
@@ -248,24 +249,87 @@ class ReportFormatter(BaseFormatter):
         for user in users:
             dir_path  = dir_files.get(user)
             file_path = file_files.get(user)
-            dir_data  = self._load_detail_report(dir_path, is_dir=True) if dir_path else None
-            file_data = self._load_detail_report(file_path, is_dir=False) if file_path else None
+            dir_data  = self._load_detail_report(dir_path, is_dir=True, user=user) if dir_path else None
+            file_data = self._load_detail_report(file_path, is_dir=False, user=user) if file_path else None
             self.display_user_detail_report(user, dir_data, file_data, top)
 
-    def _load_detail_report(self, path: str, is_dir: bool) -> Dict[str, Any]:
+    def _load_detail_report(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
         """Load detail report from DB, NDJSON, or legacy JSON and normalize shape."""
         if path.endswith('.db'):
-            return self._load_detail_from_db(path, is_dir)
+            return self._load_detail_from_db(path, is_dir, user=user)
         if path.endswith('.ndjson'):
             return self._load_detail_from_ndjson(path, is_dir)
 
         from ..utils import load_json_report
         return load_json_report(path)
 
-    def _load_detail_from_db(self, path: str, is_dir: bool) -> Dict[str, Any]:
+    def _load_detail_from_db(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
         data: Dict[str, Any] = {}
         conn = sqlite3.connect(path)
         try:
+            user_filter = user or os.path.splitext(os.path.basename(path))[0]
+            if "detail_report_" in user_filter:
+                user_filter = user_filter.split("detail_report_")[-1]
+                if user_filter.startswith("dir_"):
+                    user_filter = user_filter[4:]
+                elif user_filter.startswith("file_"):
+                    user_filter = user_filter[5:]
+
+            is_unified = self._table_exists(conn, "user_meta") and self._table_exists(conn, "dir_detail")
+            if is_unified and user_filter:
+                user_row = conn.execute(
+                    "SELECT scan_date, username, total_dirs, total_files, total_used, user_id "
+                    "FROM user_meta WHERE username = ? LIMIT 1",
+                    (user_filter,),
+                ).fetchone()
+                if not user_row:
+                    return data
+                data["date"] = int(user_row[0] or 0)
+                data["user"] = user_row[1] or ""
+                data["total_dirs"] = int(user_row[2] or 0)
+                data["total_files"] = int(user_row[3] or 0)
+                data["total_used"] = int(user_row[4] or 0)
+                user_id = int(user_row[5])
+
+                has_domain_dict = self._table_exists(conn, "dirs_dict")
+                if is_dir:
+                    if has_domain_dict:
+                        rows = conn.execute(
+                            "SELECT dd.path, d.size "
+                            "FROM dir_detail d JOIN dirs_dict dd ON dd.dir_id = d.dir_id "
+                            "WHERE d.user_id = ? ORDER BY d.size DESC",
+                            (user_id,),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT s.val, d.size "
+                            "FROM dir_detail d JOIN strings_dict s ON s.id = d.dir_id "
+                            "WHERE d.user_id = ? ORDER BY d.size DESC",
+                            (user_id,),
+                        ).fetchall()
+                    data["dirs"] = [{"path": r[0], "used": int(r[1] or 0)} for r in rows]
+                else:
+                    if has_domain_dict:
+                        rows = conn.execute(
+                            "SELECT dd.path || '/' || bd.basename, f.size "
+                            "FROM file_detail f "
+                            "JOIN dirs_dict dd ON dd.dir_id = f.dir_id "
+                            "JOIN basename_dict bd ON bd.basename_id = f.basename_id "
+                            "WHERE f.user_id = ? ORDER BY f.size DESC",
+                            (user_id,),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT ds.val || '/' || bs.val, f.size "
+                            "FROM file_detail f "
+                            "JOIN strings_dict ds ON ds.id = f.dir_id "
+                            "JOIN strings_dict bs ON bs.id = f.basename_id "
+                            "WHERE f.user_id = ? ORDER BY f.size DESC",
+                            (user_id,),
+                        ).fetchall()
+                    data["files"] = [{"path": r[0], "size": int(r[1] or 0)} for r in rows]
+                return data
+
             if is_dir:
                 meta_row = conn.execute(
                     "SELECT date, user, total_dirs, total_used FROM meta_dirs LIMIT 1"

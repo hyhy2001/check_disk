@@ -50,9 +50,39 @@ def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
     return sub
 
 
+def _find_data_detail_db(detail_dir: str) -> str:
+    path = os.path.join(detail_dir, "data_detail.db")
+    return path if os.path.exists(path) else ""
+
+
+def _users_from_data_detail_db(db_path: str) -> list:
+    if not db_path:
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            table = "user_meta"
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name='user_meta' LIMIT 1"
+            ).fetchone()
+            if row is None:
+                table = "users"
+            rows = conn.execute(f"SELECT username FROM {table} ORDER BY username").fetchall()
+            return [str(r[0]) for r in rows if r and r[0]]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
 def find_users(input_dir: str, prefix: str) -> list:
-    """Return sorted list of usernames discovered from detail_report_*.json files."""
+    """Return sorted list of usernames discovered from detail reports or data_detail.db."""
     detail_dir = _resolve_detail_dir(input_dir, prefix)
+    data_detail_db = _find_data_detail_db(detail_dir)
+    db_users = _users_from_data_detail_db(data_detail_db)
+    if db_users:
+        return db_users
+
     pat_prefix = f"{prefix}_" if prefix else ""
 
     # Try looking for the unified detail_report_<user>.ndjson or .json pattern
@@ -125,6 +155,10 @@ def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
     """Return (unified_path, dir_path, file_path) auto-detecting layout."""
     detail_dir = _resolve_detail_dir(input_dir, prefix)
     pat_prefix = f"{prefix}_" if prefix else ""
+
+    data_detail_db = _find_data_detail_db(detail_dir)
+    if data_detail_db:
+        return (data_detail_db, "", "")
 
     unified_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_{user}")
     dir_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_dir_{user}")

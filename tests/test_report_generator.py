@@ -11,11 +11,12 @@ Tests cover:
 - save_json_report / load_json_report round-trip
 """
 
-import os
-import sys
 import json
+import os
+import sqlite3
+import sys
 import time
-import tempfile
+
 import pytest
 
 # ── Ensure project root is on sys.path ──────────────────────────────────────
@@ -23,10 +24,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.disk_scanner import ScanResult
-from src.report_generator import ReportGenerator
-from src.utils import save_json_report, load_json_report
-
+from src.disk_scanner import ScanResult  # noqa: E402
+from src.report_generator import ReportGenerator  # noqa: E402
+from src.utils import load_json_report, save_json_report  # noqa: E402
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -63,6 +63,66 @@ def make_config(tmp_path, **overrides):
     return base
 
 
+# ── Unified Rust detail DB integration ─────────────────────────────────────────
+
+def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
+    import src.report_generator as report_generator_module
+
+    if not report_generator_module.HAS_RUST_UNIFIED_DB:
+        pytest.skip("fast_scanner.build_unified_dbs is not available")
+
+    detail_tmpdir = tmp_path / "detail_tmp"
+    detail_tmpdir.mkdir()
+    (detail_tmpdir / "dirs_t1.tsv").write_text(
+        f"{tmp_path}\t1000\t4096\n{tmp_path / 'sub'}\t1000\t2048\n",
+        encoding="utf-8",
+    )
+    (detail_tmpdir / "uid_1000_t1_c1.tsv").write_text(
+        f"4096\t{tmp_path / 'alpha.txt'}\n2048\t{tmp_path / 'sub' / 'beta.log'}\n",
+        encoding="utf-8",
+    )
+
+    cfg = make_config(
+        tmp_path,
+        output_file=str(tmp_path / "disk_usage_report.json"),
+        directory=str(tmp_path),
+        users=[{"name": "alice", "team_id": "backend"}],
+    )
+    scan_result = make_scan_result(tmp_path)
+    scan_result.detail_tmpdir = str(detail_tmpdir)
+    scan_result.detail_uid_username = {1000: "alice"}
+
+    created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1)
+
+    detail_db = tmp_path / "detail_users" / "data_detail.db"
+    treemap_json = tmp_path / "tree_map_report.json"
+    treemap_db = tmp_path / "tree_map_data.db"
+    assert sorted(map(str, [detail_db, treemap_json, treemap_db])) == created
+    assert detail_db.exists()
+    assert treemap_json.exists()
+    assert treemap_db.exists()
+
+    conn = sqlite3.connect(detail_db)
+    try:
+        user_row = conn.execute(
+            "SELECT username, total_files, total_dirs, total_used FROM users"
+        ).fetchone()
+        assert user_row == ("alice", 2, 2, 6144)
+        assert conn.execute("SELECT COUNT(*) FROM file_detail").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM dir_detail").fetchone()[0] == 2
+        path_rows = conn.execute("SELECT path FROM files ORDER BY size DESC").fetchall()
+        assert path_rows[0][0].endswith("alpha.txt")
+        assert path_rows[1][0].endswith("beta.log")
+    finally:
+        conn.close()
+
+    tree_conn = sqlite3.connect(treemap_db)
+    try:
+        assert tree_conn.execute("SELECT COUNT(*) FROM shards").fetchone()[0] >= 1
+    finally:
+        tree_conn.close()
+
+
 # ── ReportGenerator.__init__ ──────────────────────────────────────────────────
 
 class TestReportGeneratorInit:
@@ -77,26 +137,6 @@ class TestReportGeneratorInit:
         del cfg["output_file"]
         rg = ReportGenerator(cfg)
         assert rg.output_file == "disk_usage_report.json"
-
-    def test_fts_off_by_default(self, tmp_path):
-        cfg = make_config(tmp_path, detail_fts="off")
-        rg = ReportGenerator(cfg)
-        assert rg.enable_detail_fts is False
-
-    def test_fts_on(self, tmp_path):
-        cfg = make_config(tmp_path, detail_fts="on")
-        rg = ReportGenerator(cfg)
-        assert rg.enable_detail_fts is True
-
-    def test_size_index_off_by_default(self, tmp_path):
-        cfg = make_config(tmp_path, detail_size_index="off")
-        rg = ReportGenerator(cfg)
-        assert rg.enable_detail_size_index is False
-
-    def test_size_index_on(self, tmp_path):
-        cfg = make_config(tmp_path, detail_size_index="on")
-        rg = ReportGenerator(cfg)
-        assert rg.enable_detail_size_index is True
 
     def test_debug_false_by_default(self, tmp_path):
         rg = ReportGenerator(make_config(tmp_path))

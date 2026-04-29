@@ -55,7 +55,7 @@ fn format_size(size_bytes: f64) -> String {
     }
 }
 
-fn parse_file_items(file_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
+fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
     if !Path::new(file_path).exists() {
         return;
     }
@@ -69,49 +69,99 @@ fn parse_file_items(file_path: &str, kind: &'static str, entries: &mut Vec<Expor
             }
         };
 
+        let has_users = conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name='users' LIMIT 1",
+            [],
+            |_| Ok(()),
+        ).is_ok();
+
         if kind == "dir " {
-            let mut stmt = match conn.prepare("SELECT path, used FROM dirs ORDER BY used DESC") {
+            let sql = if has_users {
+                "SELECT path, used FROM dirs WHERE user = ?1 ORDER BY used DESC"
+            } else {
+                "SELECT path, used FROM dirs ORDER BY used DESC"
+            };
+            let mut stmt = match conn.prepare(sql) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("  [rust-warn] Failed to query dirs in {}: {}", file_path, e);
                     return;
                 }
             };
-            let rows = match stmt.query_map([], |row| {
-                let path: String = row.get(0)?;
-                let size: u64 = row.get(1)?;
-                Ok((path, size))
-            }) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("  [rust-warn] Failed to iterate dirs in {}: {}", file_path, e);
-                    return;
+            if has_users {
+                let rows = match stmt.query_map([user], |row| {
+                    let path: String = row.get(0)?;
+                    let size: u64 = row.get(1)?;
+                    Ok((path, size))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  [rust-warn] Failed to iterate dirs in {}: {}", file_path, e);
+                        return;
+                    }
+                };
+                for r in rows.flatten() {
+                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
                 }
-            };
-            for r in rows.flatten() {
-                entries.push(ExportEntry { kind, path: r.0, size: r.1 });
+            } else {
+                let rows = match stmt.query_map([], |row| {
+                    let path: String = row.get(0)?;
+                    let size: u64 = row.get(1)?;
+                    Ok((path, size))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  [rust-warn] Failed to iterate dirs in {}: {}", file_path, e);
+                        return;
+                    }
+                };
+                for r in rows.flatten() {
+                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
+                }
             }
         } else {
-            let mut stmt = match conn.prepare("SELECT path, size FROM files ORDER BY size DESC") {
+            let sql = if has_users {
+                "SELECT path, size FROM files WHERE user = ?1 ORDER BY size DESC"
+            } else {
+                "SELECT path, size FROM files ORDER BY size DESC"
+            };
+            let mut stmt = match conn.prepare(sql) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("  [rust-warn] Failed to query files in {}: {}", file_path, e);
                     return;
                 }
             };
-            let rows = match stmt.query_map([], |row| {
-                let path: String = row.get(0)?;
-                let size: u64 = row.get(1)?;
-                Ok((path, size))
-            }) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("  [rust-warn] Failed to iterate files in {}: {}", file_path, e);
-                    return;
+            if has_users {
+                let rows = match stmt.query_map([user], |row| {
+                    let path: String = row.get(0)?;
+                    let size: u64 = row.get(1)?;
+                    Ok((path, size))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  [rust-warn] Failed to iterate files in {}: {}", file_path, e);
+                        return;
+                    }
+                };
+                for r in rows.flatten() {
+                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
                 }
-            };
-            for r in rows.flatten() {
-                entries.push(ExportEntry { kind, path: r.0, size: r.1 });
+            } else {
+                let rows = match stmt.query_map([], |row| {
+                    let path: String = row.get(0)?;
+                    let size: u64 = row.get(1)?;
+                    Ok((path, size))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  [rust-warn] Failed to iterate files in {}: {}", file_path, e);
+                        return;
+                    }
+                };
+                for r in rows.flatten() {
+                    entries.push(ExportEntry { kind, path: r.0, size: r.1 });
+                }
             }
         }
         return;
@@ -166,12 +216,12 @@ fn process(user: String, dir_path: String, file_path: String, out_path: String) 
 
     // 1. Read dir JSON/NDJSON/DB if exists
     if !dir_path.is_empty() {
-        parse_file_items(&dir_path, "dir ", &mut entries);
+        parse_file_items(&user, &dir_path, "dir ", &mut entries);
     }
 
     // 2. Read file JSON/NDJSON/DB if exists
     if !file_path.is_empty() {
-        parse_file_items(&file_path, "file", &mut entries);
+        parse_file_items(&user, &file_path, "file", &mut entries);
     }
 
     if entries.is_empty() {
