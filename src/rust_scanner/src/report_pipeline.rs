@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::pipe_events::{for_each_scan_event_in_file, get_scan_event_files, read_permission_events};
+use crate::pipe_events::{
+    for_each_dir_agg_in_file, for_each_scan_event_in_file, get_dir_agg_files, get_scan_event_files,
+    read_permission_events,
+};
 use crate::pipe_io::{ensure_dir, recreate_dir};
 use crate::pipe_permission::write_permission_issues_json;
 use crate::pipe_treemap::write_treemap_json_outputs;
@@ -61,6 +64,8 @@ pub fn build_pipeline_dbs_impl(
             rows_by_user: HashMap<String, Vec<(u64, String)>>,
         }
 
+        let dir_agg_paths = get_dir_agg_files(&tmpdir)?;
+        let has_dir_agg = !dir_agg_paths.is_empty();
         let (bin_paths, tsv_paths) = get_scan_event_files(&tmpdir)?;
         eprintln!("[Phase 2] Ingesting and mapping {} event streams...", bin_paths.len() + tsv_paths.len());
         let mut all_tasks = Vec::new();
@@ -88,9 +93,11 @@ pub fn build_pipeline_dbs_impl(
                             .entry(username.clone())
                             .or_default()
                             .push((event.size, event.path.clone()));
-                        if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
-                            let user_sizes = agg.dir_sizes.entry(parent).or_default();
-                            *user_sizes.entry(username).or_insert(0) += event.size as i64;
+                        if !has_dir_agg {
+                            if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
+                                let user_sizes = agg.dir_sizes.entry(parent).or_default();
+                                *user_sizes.entry(username).or_insert(0) += event.size as i64;
+                            }
                         }
                     });
                     agg
@@ -115,8 +122,40 @@ pub fn build_pipeline_dbs_impl(
                 },
             );
 
-        let dir_sizes: HashMap<String, Vec<(String, i64)>> = merged_agg
-            .dir_sizes
+        let dir_sizes_by_user = if has_dir_agg {
+            eprintln!(
+                "[Phase 2] Loading {} Phase 1 directory aggregate shards...",
+                dir_agg_paths.len()
+            );
+            dir_agg_paths
+                .into_par_iter()
+                .fold(HashMap::new, |mut dir_sizes: HashMap<String, HashMap<String, i64>>, path| {
+                    let _ = for_each_dir_agg_in_file(&path, |event| {
+                        let username = uids_map
+                            .get(&event.uid)
+                            .cloned()
+                            .unwrap_or_else(|| format!("uid-{}", event.uid));
+                        if event.size > 0 {
+                            let user_sizes = dir_sizes.entry(event.path.clone()).or_default();
+                            *user_sizes.entry(username).or_insert(0) += event.size;
+                        }
+                    });
+                    dir_sizes
+                })
+                .reduce(HashMap::new, |mut a, b| {
+                    for (dir, sizes_b) in b {
+                        let sizes_a = a.entry(dir).or_default();
+                        for (username, size) in sizes_b {
+                            *sizes_a.entry(username).or_insert(0) += size;
+                        }
+                    }
+                    a
+                })
+        } else {
+            merged_agg.dir_sizes
+        };
+
+        let dir_sizes: HashMap<String, Vec<(String, i64)>> = dir_sizes_by_user
             .into_iter()
             .map(|(dir, user_map)| (dir, user_map.into_iter().collect()))
             .collect();

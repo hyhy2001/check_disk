@@ -4,7 +4,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 
-use crate::pipe_types::{parse_permission_line, parse_scan_event_line, PermissionEvent, ScanEvent};
+use crate::pipe_types::{
+    parse_permission_line, parse_scan_event_line, DirAggEvent, PermissionEvent, ScanEvent,
+};
 
 pub fn get_scan_event_files(tmpdir: &str) -> PyResult<(Vec<PathBuf>, Vec<PathBuf>)> {
     let bin_pattern = format!("{}/scan_t*.bin", tmpdir);
@@ -24,7 +26,21 @@ pub fn get_scan_event_files(tmpdir: &str) -> PyResult<(Vec<PathBuf>, Vec<PathBuf
     Ok((bin_paths, tsv_paths))
 }
 
-pub fn for_each_scan_event_in_file<F>(path: &std::path::Path, is_bin: bool, mut on_event: F) -> PyResult<()>
+pub fn get_dir_agg_files(tmpdir: &str) -> PyResult<Vec<PathBuf>> {
+    let pattern = format!("{}/diragg_t*.bin", tmpdir);
+    let mut paths: Vec<PathBuf> = glob::glob(&pattern)
+        .map_err(|e| PyRuntimeError::new_err(format!("glob diragg: {}", e)))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+pub fn for_each_scan_event_in_file<F>(
+    path: &std::path::Path,
+    is_bin: bool,
+    mut on_event: F,
+) -> PyResult<()>
 where
     F: FnMut(ScanEvent),
 {
@@ -37,30 +53,83 @@ where
             match reader.read_exact(&mut header) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(PyRuntimeError::new_err(format!("read {}: {}", path.display(), e))),
+                Err(e) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "read {}: {}",
+                        path.display(),
+                        e
+                    )))
+                }
             }
             let tag = header[0];
             if tag != 1 {
-                return Err(PyRuntimeError::new_err(format!("invalid scan bin tag {} in {}", tag, path.display())));
+                return Err(PyRuntimeError::new_err(format!(
+                    "invalid scan bin tag {} in {}",
+                    tag,
+                    path.display()
+                )));
             }
             let uid = u32::from_le_bytes(header[1..5].try_into().unwrap());
             let size = u64::from_le_bytes(header[5..13].try_into().unwrap());
             let path_len = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
             let mut path_bytes = vec![0u8; path_len];
-            reader.read_exact(&mut path_bytes)
-                .map_err(|e| PyRuntimeError::new_err(format!("read path {}: {}", path.display(), e)))?;
+            reader.read_exact(&mut path_bytes).map_err(|e| {
+                PyRuntimeError::new_err(format!("read path {}: {}", path.display(), e))
+            })?;
             let path_str = String::from_utf8_lossy(&path_bytes).to_string();
-            on_event(ScanEvent { uid, size, path: path_str });
+            on_event(ScanEvent {
+                uid,
+                size,
+                path: path_str,
+            });
         }
     } else {
         let f = fs::File::open(path)
             .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path.display(), e)))?;
         for line in BufReader::new(f).lines() {
-            let line = line.map_err(|e| PyRuntimeError::new_err(format!("read {}: {}", path.display(), e)))?;
+            let line = line
+                .map_err(|e| PyRuntimeError::new_err(format!("read {}: {}", path.display(), e)))?;
             if let Some(event) = parse_scan_event_line(&line) {
                 on_event(event);
             }
         }
+    }
+    Ok(())
+}
+
+pub fn for_each_dir_agg_in_file<F>(path: &std::path::Path, mut on_event: F) -> PyResult<()>
+where
+    F: FnMut(DirAggEvent),
+{
+    let f = fs::File::open(path)
+        .map_err(|e| PyRuntimeError::new_err(format!("open diragg {}: {}", path.display(), e)))?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, f);
+    let mut header = [0u8; 16];
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "read diragg {}: {}",
+                    path.display(),
+                    e
+                )));
+            }
+        }
+        let uid = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let size = i64::from_le_bytes(header[4..12].try_into().unwrap());
+        let path_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let mut path_bytes = vec![0u8; path_len];
+        reader.read_exact(&mut path_bytes).map_err(|e| {
+            PyRuntimeError::new_err(format!("read diragg path {}: {}", path.display(), e))
+        })?;
+        let path_str = String::from_utf8_lossy(&path_bytes).to_string();
+        on_event(DirAggEvent {
+            uid,
+            size,
+            path: path_str,
+        });
     }
     Ok(())
 }
@@ -78,7 +147,9 @@ pub fn read_permission_events(tmpdir: &str) -> PyResult<Vec<PermissionEvent>> {
         let f = fs::File::open(&path)
             .map_err(|e| PyRuntimeError::new_err(format!("open perm {}: {}", path.display(), e)))?;
         for line in BufReader::new(f).lines() {
-            let line = line.map_err(|e| PyRuntimeError::new_err(format!("read perm {}: {}", path.display(), e)))?;
+            let line = line.map_err(|e| {
+                PyRuntimeError::new_err(format!("read perm {}: {}", path.display(), e))
+            })?;
             if let Some(evt) = parse_permission_line(&line) {
                 events.push(evt);
             }

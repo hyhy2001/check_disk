@@ -69,6 +69,12 @@ pub struct ScanEvent {
     pub path: String,
 }
 
+pub struct DirAggEvent {
+    pub uid: u32,
+    pub size: i64,
+    pub path: String,
+}
+
 /// Parse a scan event line from TSV (F\tuid\tsize\tpath)
 pub fn parse_scan_event_line(line: &str) -> Option<ScanEvent> {
     let mut parts = line.splitn(4, '\t');
@@ -91,7 +97,12 @@ pub fn parse_permission_line(line: &str) -> Option<PermissionEvent> {
     let kind = parts.next()?.to_string();
     let errcode = parts.next()?.to_string();
     let path = parts.next().map(str::to_string).unwrap_or_default();
-    Some(PermissionEvent { uid, kind, errcode, path })
+    Some(PermissionEvent {
+        uid,
+        kind,
+        errcode,
+        path,
+    })
 }
 
 /// Extract parent path (removes trailing slash)
@@ -108,11 +119,7 @@ pub fn parent_path(path: &str) -> Option<String> {
 }
 
 /// Push file into top-N binary heap (maintains largest by size)
-pub fn push_top_file(
-    heap: &mut BinaryHeap<Reverse<(u64, String)>>,
-    size: u64,
-    path: &str,
-) {
+pub fn push_top_file(heap: &mut BinaryHeap<Reverse<(u64, String)>>, size: u64, path: &str) {
     heap.push(Reverse((size, path.to_string())));
     if heap.len() > TOP_RECORDS {
         heap.pop();

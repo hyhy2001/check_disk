@@ -1,23 +1,23 @@
+use dashmap::DashSet;
+use ignore::{WalkBuilder, WalkState};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use ignore::{WalkBuilder, WalkState};
-use dashmap::DashSet;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::scan_constants::{
-    CRITICAL_SKIP_NAMES,
-    SCAN_EVENT_FLUSH_BYTES_THRESHOLD,
-    SCAN_EVENT_FLUSH_THRESHOLD,
+    CRITICAL_SKIP_NAMES, SCAN_EVENT_FLUSH_BYTES_THRESHOLD, SCAN_EVENT_FLUSH_THRESHOLD,
 };
 use crate::scan_state::{GlobalStats, ThreadLocalState};
-use crate::scan_utils::{error_code_from_message, format_num, format_rate, format_size, get_rss_mb};
+use crate::scan_utils::{
+    error_code_from_message, format_num, format_rate, format_size, get_rss_mb,
+};
 
 pub(crate) fn run_scan_core(
     py: Python,
@@ -36,13 +36,17 @@ pub(crate) fn run_scan_core(
     let _ = _tmpdir.keep(); // persist tmp dir; Python side cleans up later
 
     let global_stats = Arc::new(Mutex::new(GlobalStats {
-        total_files: 0, total_dirs: 0, total_inodes: 0, total_size: 0,
-        uid_sizes: HashMap::new(), uid_files: HashMap::new(),
+        total_files: 0,
+        total_dirs: 0,
+        total_inodes: 0,
+        total_size: 0,
+        uid_sizes: HashMap::new(),
+        uid_files: HashMap::new(),
         permission_issues_count: 0,
     }));
     let prog_files = Arc::new(AtomicU64::new(0));
-    let prog_dirs  = Arc::new(AtomicU64::new(0));
-    let prog_size  = Arc::new(AtomicU64::new(0));
+    let prog_dirs = Arc::new(AtomicU64::new(0));
+    let prog_size = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let prof_metadata_ns = Arc::new(AtomicU64::new(0));
     let prof_path_ns = Arc::new(AtomicU64::new(0));
@@ -75,14 +79,15 @@ pub(crate) fn run_scan_core(
     let pmaxr_clone = prof_max_event_buf_records.clone();
     let pmaxb_clone = prof_max_event_buf_bytes.clone();
 
-    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     // Keep a sane default and let CLI max_workers override explicitly.
     let default_threads = (cpus * 2).clamp(4, 32);
     let threads_count = max_workers.unwrap_or(default_threads).max(1);
     let thread_counter = Arc::new(AtomicUsize::new(0));
-    let target_uids_shared = Arc::new(
-        target_uids.map(|uids| uids.into_iter().collect::<HashSet<u32>>())
-    );
+    let target_uids_shared =
+        Arc::new(target_uids.map(|uids| uids.into_iter().collect::<HashSet<u32>>()));
     // Shared cross-worker hard-link deduplication — DashSet avoids Mutex bottleneck
     let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     // Shared directory loop/bind-mount deduplication — DashSet (16 shards by default)
@@ -102,9 +107,13 @@ pub(crate) fn run_scan_core(
             .run(|| {
                 let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
                 let mut state = ThreadLocalState {
-                    t_files: 0, t_dirs: 0, t_inodes: 0, t_size: 0,
+                    t_files: 0,
+                    t_dirs: 0,
+                    t_inodes: 0,
+                    t_size: 0,
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
+                    t_dir_sizes: HashMap::new(),
                     t_event_bin_buf: Vec::with_capacity(8 * 1024 * 1024),
                     t_event_buf_records: 0,
                     t_event_flush_count: 0,
@@ -112,11 +121,15 @@ pub(crate) fn run_scan_core(
                     t_perm_issues: 0,
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),
-                    prog_dirs:  pd_clone.clone(),
-                    prog_size:  ps_clone.clone(),
+                    prog_dirs: pd_clone.clone(),
+                    prog_size: ps_clone.clone(),
+                    pending_prog_files: 0,
+                    pending_prog_dirs: 0,
+                    pending_prog_size: 0,
                     tmpdir: tmpdir_clone.clone(),
                     target_uids: (*target_uids_shared).clone(),
                     thread_id: tid,
+                    profile_enabled: debug,
                     prof_metadata_ns: pm_clone.clone(),
                     prof_path_ns: pp_clone.clone(),
                     prof_flush_ns: pfns_clone.clone(),
@@ -126,6 +139,8 @@ pub(crate) fn run_scan_core(
                     prof_visited_dir_checks: pv_clone.clone(),
                     prof_max_event_buf_records: pmaxr_clone.clone(),
                     prof_max_event_buf_bytes: pmaxb_clone.clone(),
+                    perm_writer: None,
+                    dir_agg_writer: None,
                 };
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
@@ -138,12 +153,17 @@ pub(crate) fn run_scan_core(
                         Err(err) => {
                             let err_str = err.to_string();
                             // ignore::Error formats as: "/path/to/dir: Permission denied (os error 13)"
-                            let path_str = err_str.find(": ")
+                            let path_str = err_str
+                                .find(": ")
                                 .map(|idx| err_str[..idx].to_string())
                                 .unwrap_or_default();
-                            
+
                             state.t_perm_issues += 1;
-                            state.flush_permission_issue(&path_str, "directory", error_code_from_message(&err_str));
+                            state.flush_permission_issue(
+                                &path_str,
+                                "directory",
+                                error_code_from_message(&err_str),
+                            );
                             return WalkState::Continue;
                         }
                     };
@@ -177,11 +197,20 @@ pub(crate) fn run_scan_core(
                         }
 
                         // --- Bind mount / Loop deduplication ---
-                        let meta_start = Instant::now();
+                        let meta_start = debug.then(Instant::now);
                         if let Ok(meta) = entry.metadata() {
-                            state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            if let Some(start) = meta_start {
+                                state.prof_metadata_ns.fetch_add(
+                                    start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             let key = (meta.ino(), meta.dev());
-                            state.prof_visited_dir_checks.fetch_add(1, Ordering::Relaxed);
+                            if debug {
+                                state
+                                    .prof_visited_dir_checks
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             // DashSet.insert() returns false when key already exists
                             if !visited_dirs_shared.insert(key) {
                                 return WalkState::Skip;
@@ -194,38 +223,61 @@ pub(crate) fn run_scan_core(
                                 }
                             }
                         } else {
-                            state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            if let Some(start) = meta_start {
+                                state.prof_metadata_ns.fetch_add(
+                                    start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
 
                         state.t_dirs += 1;
                         state.t_inodes += 1;
-                        state.prog_dirs.fetch_add(1, Ordering::Relaxed);
+                        state.add_progress(0, 1, 0);
                     } else if ft.is_file() {
-                        let meta_start = Instant::now();
+                        let meta_start = debug.then(Instant::now);
                         let meta = match entry.metadata() {
                             Ok(m) => {
-                                state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                if let Some(start) = meta_start {
+                                    state.prof_metadata_ns.fetch_add(
+                                        start.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
                                 m
-                            },
+                            }
                             Err(e) => {
-                                state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                if let Some(start) = meta_start {
+                                    state.prof_metadata_ns.fetch_add(
+                                        start.elapsed().as_nanos() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
                                 state.t_perm_issues += 1;
                                 let path_str = path.to_string_lossy().into_owned();
-                                state.flush_permission_issue(&path_str, "file", error_code_from_message(&e.to_string()));
+                                state.flush_permission_issue(
+                                    &path_str,
+                                    "file",
+                                    error_code_from_message(&e.to_string()),
+                                );
                                 return WalkState::Continue;
                             }
                         };
 
                         // --- Hard-link deduplication ---
                         if meta.nlink() > 1 {
-                            state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
+                            if debug {
+                                state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
+                            }
                             let key = (meta.ino(), meta.dev());
-                            if !hardlinks_shared.insert(key) { return WalkState::Continue; }
+                            if !hardlinks_shared.insert(key) {
+                                return WalkState::Continue;
+                            }
                         }
 
                         // st_blocks * 512 = actual on-disk bytes, same as Python legacy
                         let size = meta.blocks() * 512;
-                        let uid  = meta.uid();
+                        let uid = meta.uid();
                         let is_target = match &state.target_uids {
                             Some(set) => set.contains(&uid),
                             None => true,
@@ -233,19 +285,32 @@ pub(crate) fn run_scan_core(
 
                         state.t_files += 1;
                         state.t_inodes += 1;
-                        state.t_size  += size;
+                        state.t_size += size;
 
                         if is_target {
                             *state.t_uid_sizes.entry(uid).or_insert(0) += size;
                             *state.t_uid_files.entry(uid).or_insert(0) += 1;
-                            let path_start = Instant::now();
+                            let path_start = debug.then(Instant::now);
                             let path_owned = path.to_string_lossy();
                             let path_str = path_owned.as_ref();
-                            state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            if let Some(start) = path_start {
+                                state.prof_path_ns.fetch_add(
+                                    start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             state.push_event_binary(1, uid, size, path_str);
+                            state.add_dir_size(uid, size, path_str);
                             state.t_event_buf_records += 1;
-                            state.prof_max_event_buf_records.fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
-                            state.prof_max_event_buf_bytes.fetch_max(state.t_event_bin_buf.len() as u64, Ordering::Relaxed);
+                            if debug {
+                                state
+                                    .prof_max_event_buf_records
+                                    .fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
+                                state.prof_max_event_buf_bytes.fetch_max(
+                                    state.t_event_bin_buf.len() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
                             if state.t_event_buf_records >= SCAN_EVENT_FLUSH_THRESHOLD
                                 || state.t_event_bin_buf.len() >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
                             {
@@ -254,8 +319,7 @@ pub(crate) fn run_scan_core(
                         }
 
                         // Progress tracking
-                        state.prog_files.fetch_add(1, Ordering::Relaxed);
-                        state.prog_size.fetch_add(size, Ordering::Relaxed);
+                        state.add_progress(1, 0, size);
                     }
 
                     WalkState::Continue
@@ -278,8 +342,8 @@ pub(crate) fn run_scan_core(
         let elapsed_secs = now.duration_since(last_report).as_secs();
         if elapsed_secs >= 10 {
             let total_files = prog_files.load(Ordering::Relaxed);
-            let total_dirs  = prog_dirs.load(Ordering::Relaxed);
-            let total_size  = prog_size.load(Ordering::Relaxed);
+            let total_dirs = prog_dirs.load(Ordering::Relaxed);
+            let total_size = prog_size.load(Ordering::Relaxed);
             let total_elapsed = now.duration_since(start_time).as_secs();
             let rate = total_files.saturating_sub(last_files) as f64 / elapsed_secs as f64;
             let mem_mb = get_rss_mb();
@@ -299,19 +363,23 @@ pub(crate) fn run_scan_core(
     let g = global_stats.lock().unwrap();
 
     let result = PyDict::new(py);
-    result.set_item("total_files",  g.total_files)?;
-    result.set_item("total_dirs",   g.total_dirs)?;
+    result.set_item("total_files", g.total_files)?;
+    result.set_item("total_dirs", g.total_dirs)?;
     result.set_item("total_inodes", g.total_inodes)?;
-    result.set_item("total_size",   g.total_size)?;
+    result.set_item("total_size", g.total_size)?;
     result.set_item("detail_tmpdir", &tmpdir_str)?;
     result.set_item("dir_tmpdir", &tmpdir_str)?;
 
     let py_uid = PyDict::new(py);
-    for (uid, size) in &g.uid_sizes { py_uid.set_item(uid, size)?; }
+    for (uid, size) in &g.uid_sizes {
+        py_uid.set_item(uid, size)?;
+    }
     result.set_item("uid_sizes", py_uid)?;
 
     let py_uid_files = PyDict::new(py);
-    for (uid, files) in &g.uid_files { py_uid_files.set_item(uid, files)?; }
+    for (uid, files) in &g.uid_files {
+        py_uid_files.set_item(uid, files)?;
+    }
     result.set_item("uid_files", py_uid_files)?;
 
     result.set_item("permission_issues_count", g.permission_issues_count)?;
@@ -335,16 +403,30 @@ pub(crate) fn run_scan_core(
         let visited_set_size = visited_dirs_profile.len();
         println!("\n[Phase 1 Profile]");
         println!("  Wall time:          {:.2}s", elapsed);
-        println!("  Metadata time:      {:.2}s aggregate ({:.1}% of worker time)", metadata_s, metadata_s * 100.0 / elapsed);
+        println!(
+            "  Metadata time:      {:.2}s aggregate ({:.1}% of worker time)",
+            metadata_s,
+            metadata_s * 100.0 / elapsed
+        );
         println!("  Path stringify:     {:.2}s aggregate", path_s);
         println!("  TSV flush time:     {:.2}s aggregate", flush_s);
         println!("  TSV flushes:        {}", format_num(flush_count));
         println!("  TSV bytes approx:   {}", format_size(flush_bytes));
         println!("  Hardlink checks:    {}", format_num(hardlink_checks));
         println!("  Visited dir checks: {}", format_num(visited_checks));
-        println!("  Max event buffer:   {} records / {}", format_num(max_buf_records), format_size(max_buf_bytes));
-        println!("  Hardlink set size:  {}", format_num(hardlink_set_size as u64));
-        println!("  Visited set size:   {}", format_num(visited_set_size as u64));
+        println!(
+            "  Max event buffer:   {} records / {}",
+            format_num(max_buf_records),
+            format_size(max_buf_bytes)
+        );
+        println!(
+            "  Hardlink set size:  {}",
+            format_num(hardlink_set_size as u64)
+        );
+        println!(
+            "  Visited set size:   {}",
+            format_num(visited_set_size as u64)
+        );
     }
 
     Ok(result.into())
