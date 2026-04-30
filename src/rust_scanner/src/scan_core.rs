@@ -20,6 +20,18 @@ use crate::scan_constants::{
 use crate::scan_state::{GlobalStats, ThreadLocalState};
 use crate::scan_utils::{error_code_from_message, format_num, format_rate, format_size, get_rss_mb};
 
+fn parent_path_ref(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed == "/" || trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(0) => Some("/"),
+        Some(idx) => Some(&trimmed[..idx]),
+        None => None,
+    }
+}
+
 pub(crate) fn run_scan_core(
     py: Python,
     directory: String,
@@ -243,11 +255,12 @@ pub(crate) fn run_scan_core(
                             *state.t_uid_files.entry(uid).or_insert(0) += 1;
                             let path_start = Instant::now();
                             let path_owned = path.to_string_lossy();
+                            let path_str = path_owned.as_ref();
                             state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            state.push_event_binary(1, uid, size, &path_owned);
+                            state.push_event_binary(1, uid, size, path_str);
                             state.t_event_buf_records += 1;
-                            if let Some(parent) = crate::pipe_types::parent_path(&path_owned) {
-                                state.add_dir_agg(uid, &parent, size);
+                            if let Some(parent) = parent_path_ref(path_str) {
+                                state.add_dir_agg(uid, parent, size);
                                 if state.dir_agg_map.len() >= SCAN_DIR_AGG_FLUSH_DIRS_THRESHOLD {
                                     state.flush_dir_agg();
                                 }
