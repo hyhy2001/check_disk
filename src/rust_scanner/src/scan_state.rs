@@ -75,12 +75,11 @@ impl ThreadLocalState {
             if self.event_bin_writer.is_none() {
                 let fp = format!("{}/scan_file_t{}.bin", self.tmpdir, self.thread_id);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                    self.event_bin_writer = Some(BufWriter::new(f));
+                    self.event_bin_writer = Some(BufWriter::with_capacity(16 * 1024 * 1024, f));
                 }
             }
             if let Some(writer) = self.event_bin_writer.as_mut() {
                 let _ = writer.write_all(&self.t_event_bin_buf);
-                let _ = writer.flush();
             }
         }
 
@@ -88,8 +87,8 @@ impl ThreadLocalState {
         self.prof_flush_bytes.fetch_add(bytes_written, Ordering::Relaxed);
         self.t_event_bin_buf.clear();
         self.t_event_buf_records = 0;
-        if self.t_event_bin_buf.capacity() > 64 * 1024 * 1024 {
-            self.t_event_bin_buf.shrink_to(8 * 1024 * 1024);
+        if self.t_event_bin_buf.capacity() > 128 * 1024 * 1024 {
+            self.t_event_bin_buf.shrink_to(64 * 1024 * 1024);
         }
     }
 
@@ -108,7 +107,7 @@ impl ThreadLocalState {
         if self.dir_bin_writer.is_none() {
             let fp = format!("{}/scan_dir_t{}.bin", self.tmpdir, self.thread_id);
             if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                self.dir_bin_writer = Some(BufWriter::new(f));
+                self.dir_bin_writer = Some(BufWriter::with_capacity(8 * 1024 * 1024, f));
             }
         }
         if let Some(writer) = self.dir_bin_writer.as_mut() {
@@ -123,7 +122,6 @@ impl ThreadLocalState {
                     let _ = writer.write_all(&path_bytes[..safe_len]);
                 }
             }
-            let _ = writer.flush();
         }
     }
 
