@@ -2,19 +2,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::pipe_events::{
-    for_each_dir_agg_in_file,
-    for_each_scan_event_in_file,
-    get_scan_dir_agg_files,
-    get_scan_event_files,
-    read_permission_events,
-};
+use crate::pipe_events::{for_each_scan_event_in_file, get_scan_event_files, read_permission_events};
 use crate::pipe_io::{ensure_dir, recreate_dir};
 use crate::pipe_permission::write_permission_issues_json;
 use crate::pipe_treemap::write_treemap_json_outputs;
@@ -67,14 +58,10 @@ pub fn build_pipeline_dbs_impl(
 
         struct LocalAgg {
             dir_sizes: HashMap<String, HashMap<String, i64>>,
-            fallback_dir_sizes: HashMap<String, HashMap<String, i64>>,
-            spool_files_by_user: HashMap<String, Vec<PathBuf>>,
-            spool_writers: HashMap<String, BufWriter<fs::File>>,
-            spill_worker_id: usize,
+            rows_by_user: HashMap<String, Vec<(u64, String)>>,
         }
 
         let (bin_paths, tsv_paths) = get_scan_event_files(&tmpdir)?;
-        let dir_agg_paths = get_scan_dir_agg_files(&tmpdir)?;
         eprintln!("[Phase 2] Ingesting and mapping {} event streams...", bin_paths.len() + tsv_paths.len());
         let mut all_tasks = Vec::new();
         for p in bin_paths {
@@ -84,16 +71,12 @@ pub fn build_pipeline_dbs_impl(
             all_tasks.push((p, false));
         }
 
-        let spill_id_counter = AtomicUsize::new(0);
-        let mut merged_agg = all_tasks
+        let merged_agg = all_tasks
             .into_par_iter()
             .fold(
                 || LocalAgg {
                     dir_sizes: HashMap::new(),
-                    fallback_dir_sizes: HashMap::new(),
-                    spool_files_by_user: HashMap::new(),
-                    spool_writers: HashMap::new(),
-                    spill_worker_id: spill_id_counter.fetch_add(1, Ordering::Relaxed),
+                    rows_by_user: HashMap::new(),
                 },
                 |mut agg, (path, is_bin)| {
                     let _ = for_each_scan_event_in_file(&path, is_bin, |event| {
@@ -101,40 +84,12 @@ pub fn build_pipeline_dbs_impl(
                             .get(&event.uid)
                             .cloned()
                             .unwrap_or_else(|| format!("uid-{}", event.uid));
-                        if event.tag == 1 {
-                            let safe_username = crate::pipe_io::safe_user_dir(&username);
-                            if !agg.spool_writers.contains_key(&username) {
-                                let fp = PathBuf::from(format!(
-                                    "{}/spill_{}_w{:04}.bin",
-                                    tmpdir, safe_username, agg.spill_worker_id
-                                ));
-                                if let Ok(file) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                                    agg.spool_files_by_user
-                                        .entry(username.clone())
-                                        .or_default()
-                                        .push(fp);
-                                    agg.spool_writers
-                                        .insert(username.clone(), BufWriter::with_capacity(4 * 1024 * 1024, file));
-                                }
-                            }
-                            if let Some(writer) = agg.spool_writers.get_mut(&username) {
-                                let pbytes = event.path.as_bytes();
-                                let plen = u32::try_from(pbytes.len()).unwrap_or(u32::MAX) as usize;
-                                let _ = writer.write_all(&event.size.to_le_bytes());
-                                let _ = writer.write_all(&(plen as u32).to_le_bytes());
-                                let _ = writer.write_all(&pbytes[..plen.min(pbytes.len())]);
-                            }
-                            if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
-                                let user_sizes = agg.fallback_dir_sizes.entry(parent).or_default();
-                                *user_sizes.entry(
-                                    uids_map
-                                        .get(&event.uid)
-                                        .cloned()
-                                        .unwrap_or_else(|| format!("uid-{}", event.uid))
-                                ).or_insert(0) += event.size as i64;
-                            }
-                        } else if event.tag == 2 {
-                            let user_sizes = agg.dir_sizes.entry(event.path).or_default();
+                        agg.rows_by_user
+                            .entry(username.clone())
+                            .or_default()
+                            .push((event.size, event.path.clone()));
+                        if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
+                            let user_sizes = agg.dir_sizes.entry(parent).or_default();
                             *user_sizes.entry(username).or_insert(0) += event.size as i64;
                         }
                     });
@@ -144,26 +99,14 @@ pub fn build_pipeline_dbs_impl(
             .reduce(
                 || LocalAgg {
                     dir_sizes: HashMap::new(),
-                    fallback_dir_sizes: HashMap::new(),
-                    spool_files_by_user: HashMap::new(),
-                    spool_writers: HashMap::new(),
-                    spill_worker_id: usize::MAX,
+                    rows_by_user: HashMap::new(),
                 },
                 |mut a, b| {
-                    for mut writer in b.spool_writers.into_values() {
-                        let _ = writer.flush();
-                    }
-                    for (user, mut files) in b.spool_files_by_user {
-                        a.spool_files_by_user.entry(user).or_default().append(&mut files);
+                    for (user, mut rows) in b.rows_by_user {
+                        a.rows_by_user.entry(user).or_default().append(&mut rows);
                     }
                     for (dir, sizes_b) in b.dir_sizes {
                         let sizes_a = a.dir_sizes.entry(dir).or_default();
-                        for (username, size) in sizes_b {
-                            *sizes_a.entry(username).or_insert(0) += size;
-                        }
-                    }
-                    for (dir, sizes_b) in b.fallback_dir_sizes {
-                        let sizes_a = a.fallback_dir_sizes.entry(dir).or_default();
                         for (username, size) in sizes_b {
                             *sizes_a.entry(username).or_insert(0) += size;
                         }
@@ -172,52 +115,12 @@ pub fn build_pipeline_dbs_impl(
                 },
             );
 
-        if !dir_agg_paths.is_empty() {
-            let reduced_dir_sizes = dir_agg_paths
-                .into_par_iter()
-                .fold(
-                    HashMap::<String, HashMap<String, i64>>::new,
-                    |mut local, path| {
-                        let _ = for_each_dir_agg_in_file(&path, |uid, size, dir_path| {
-                            let username = uids_map
-                                .get(&uid)
-                                .cloned()
-                                .unwrap_or_else(|| format!("uid-{}", uid));
-                            let m = local.entry(dir_path).or_default();
-                            *m.entry(username).or_insert(0) += size as i64;
-                        });
-                        local
-                    },
-                )
-                .reduce(
-                    HashMap::<String, HashMap<String, i64>>::new,
-                    |mut a, b| {
-                        for (dir, user_map) in b {
-                            let dst = a.entry(dir).or_default();
-                            for (user, size) in user_map {
-                                *dst.entry(user).or_insert(0) += size;
-                            }
-                        }
-                        a
-                    },
-                );
-            merged_agg.dir_sizes = reduced_dir_sizes;
-        }
-
-        for writer in merged_agg.spool_writers.values_mut() {
-            let _ = writer.flush();
-        }
-
-        let source_dir_sizes = if merged_agg.dir_sizes.is_empty() {
-            merged_agg.fallback_dir_sizes
-        } else {
-            merged_agg.dir_sizes
-        };
-        let dir_sizes: HashMap<String, Vec<(String, i64)>> = source_dir_sizes
+        let dir_sizes: HashMap<String, Vec<(String, i64)>> = merged_agg
+            .dir_sizes
             .into_iter()
             .map(|(dir, user_map)| (dir, user_map.into_iter().collect()))
             .collect();
-        let spool_files_by_user = merged_agg.spool_files_by_user;
+        let rows_by_user = merged_agg.rows_by_user;
 
         let mut dir_owner_map: HashMap<String, String> = HashMap::new();
         let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
@@ -248,7 +151,7 @@ pub fn build_pipeline_dbs_impl(
             }
         }
 
-        for username in spool_files_by_user.keys() {
+        for username in rows_by_user.keys() {
             users
                 .entry(username.clone())
                 .or_insert_with(|| UserOutputMeta {
@@ -259,9 +162,9 @@ pub fn build_pipeline_dbs_impl(
         t_dir_build = t1.elapsed().as_secs_f64();
 
         let t2 = Instant::now();
-        eprintln!("[Phase 2] Building file chunks & sorting per user ({} users)...", spool_files_by_user.len());
+        eprintln!("[Phase 2] Building file chunks & sorting per user ({} users)...", rows_by_user.len());
         let (user_metas, chunk_jobs) =
-            build_output_jobs(&detail_root, users, spool_files_by_user, &team_map, timestamp);
+            build_output_jobs(&detail_root, users, rows_by_user, &team_map, timestamp);
         t_output_jobs = t2.elapsed().as_secs_f64();
 
         let t3 = Instant::now();

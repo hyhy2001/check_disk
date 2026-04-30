@@ -27,8 +27,6 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_event_buf_records: usize,
     pub(crate) t_event_flush_count: u32,
     pub(crate) event_bin_writer: Option<BufWriter<fs::File>>,
-    pub(crate) dir_agg_map: HashMap<String, HashMap<u32, u64>>,
-    pub(crate) dir_bin_writer: Option<BufWriter<fs::File>>,
     pub(crate) t_perm_issues: u64,
     pub(crate) global_stats: Arc<Mutex<GlobalStats>>,
     pub(crate) prog_files: Arc<AtomicU64>,
@@ -73,7 +71,7 @@ impl ThreadLocalState {
 
         if !self.t_event_bin_buf.is_empty() {
             if self.event_bin_writer.is_none() {
-                let fp = format!("{}/scan_file_t{}.bin", self.tmpdir, self.thread_id);
+                let fp = format!("{}/scan_t{}.bin", self.tmpdir, self.thread_id);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
                     self.event_bin_writer = Some(BufWriter::with_capacity(16 * 1024 * 1024, f));
                 }
@@ -89,36 +87,6 @@ impl ThreadLocalState {
         self.t_event_buf_records = 0;
         if self.t_event_bin_buf.capacity() > 128 * 1024 * 1024 {
             self.t_event_bin_buf.shrink_to(64 * 1024 * 1024);
-        }
-    }
-
-    pub(crate) fn add_dir_agg_owned(&mut self, uid: u32, parent_path: String, size: u64) {
-        let by_uid = self.dir_agg_map.entry(parent_path).or_default();
-        *by_uid.entry(uid).or_insert(0) += size;
-    }
-
-    pub(crate) fn flush_dir_agg(&mut self) {
-        if self.dir_agg_map.is_empty() {
-            return;
-        }
-        if self.dir_bin_writer.is_none() {
-            let fp = format!("{}/scan_dir_t{}.bin", self.tmpdir, self.thread_id);
-            if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                self.dir_bin_writer = Some(BufWriter::with_capacity(8 * 1024 * 1024, f));
-            }
-        }
-        if let Some(writer) = self.dir_bin_writer.as_mut() {
-            for (dir_path, uid_sizes) in self.dir_agg_map.drain() {
-                let path_bytes = dir_path.as_bytes();
-                let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
-                let safe_len = usize::try_from(len).unwrap_or(path_bytes.len()).min(path_bytes.len());
-                for (uid, size) in uid_sizes {
-                    let _ = writer.write_all(&uid.to_le_bytes());
-                    let _ = writer.write_all(&size.to_le_bytes());
-                    let _ = writer.write_all(&len.to_le_bytes());
-                    let _ = writer.write_all(&path_bytes[..safe_len]);
-                }
-            }
         }
     }
 
@@ -138,11 +106,7 @@ impl ThreadLocalState {
 impl Drop for ThreadLocalState {
     fn drop(&mut self) {
         self.flush_events();
-        self.flush_dir_agg();
         if let Some(writer) = self.event_bin_writer.as_mut() {
-            let _ = writer.flush();
-        }
-        if let Some(writer) = self.dir_bin_writer.as_mut() {
             let _ = writer.flush();
         }
 

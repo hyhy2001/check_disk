@@ -13,24 +13,11 @@ use std::time::{Duration, Instant};
 
 use crate::scan_constants::{
     CRITICAL_SKIP_NAMES,
-    SCAN_DIR_AGG_FLUSH_DIRS_THRESHOLD,
     SCAN_EVENT_FLUSH_BYTES_THRESHOLD,
     SCAN_EVENT_FLUSH_THRESHOLD,
 };
 use crate::scan_state::{GlobalStats, ThreadLocalState};
 use crate::scan_utils::{error_code_from_message, format_num, format_rate, format_size, get_rss_mb};
-
-fn parent_path_owned_from_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed == "/" || trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(0) => Some("/".to_string()),
-        Some(idx) => Some(trimmed[..idx].to_string()),
-        None => None,
-    }
-}
 
 pub(crate) fn run_scan_core(
     py: Python,
@@ -122,8 +109,6 @@ pub(crate) fn run_scan_core(
                     t_event_buf_records: 0,
                     t_event_flush_count: 0,
                     event_bin_writer: None,
-                    dir_agg_map: HashMap::new(),
-                    dir_bin_writer: None,
                     t_perm_issues: 0,
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),
@@ -259,12 +244,6 @@ pub(crate) fn run_scan_core(
                             state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             state.push_event_binary(1, uid, size, path_str);
                             state.t_event_buf_records += 1;
-                            if let Some(parent) = parent_path_owned_from_path(path_str) {
-                                state.add_dir_agg_owned(uid, parent, size);
-                                if state.dir_agg_map.len() >= SCAN_DIR_AGG_FLUSH_DIRS_THRESHOLD {
-                                    state.flush_dir_agg();
-                                }
-                            }
                             state.prof_max_event_buf_records.fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
                             state.prof_max_event_buf_bytes.fetch_max(state.t_event_bin_buf.len() as u64, Ordering::Relaxed);
                             if state.t_event_buf_records >= SCAN_EVENT_FLUSH_THRESHOLD
