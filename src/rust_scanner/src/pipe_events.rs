@@ -6,8 +6,10 @@ use std::path::PathBuf;
 
 use crate::pipe_types::{parse_permission_line, parse_scan_event_line, PermissionEvent, ScanEvent};
 
-pub fn read_scan_events(tmpdir: &str) -> PyResult<Vec<ScanEvent>> {
-    // Prefer binary segments (production), fallback to TSV (compat).
+pub fn for_each_scan_event<F>(tmpdir: &str, mut on_event: F) -> PyResult<()>
+where
+    F: FnMut(ScanEvent),
+{
     let bin_pattern = format!("{}/scan_t*.bin", tmpdir);
     let mut bin_paths: Vec<PathBuf> = glob::glob(&bin_pattern)
         .map_err(|e| PyRuntimeError::new_err(format!("glob bin: {}", e)))?
@@ -16,7 +18,6 @@ pub fn read_scan_events(tmpdir: &str) -> PyResult<Vec<ScanEvent>> {
     bin_paths.sort();
 
     if !bin_paths.is_empty() {
-        let mut events = Vec::new();
         for path in bin_paths {
             let mut f = fs::File::open(&path)
                 .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path.display(), e)))?;
@@ -45,17 +46,12 @@ pub fn read_scan_events(tmpdir: &str) -> PyResult<Vec<ScanEvent>> {
                 let path_str = String::from_utf8_lossy(&data[offset..offset + path_len]).to_string();
                 offset += path_len;
 
-                events.push(ScanEvent {
-                    uid,
-                    size,
-                    path: path_str,
-                });
+                on_event(ScanEvent { uid, size, path: path_str });
             }
         }
-        return Ok(events);
+        return Ok(());
     }
 
-    // TSV fallback
     let tsv_pattern = format!("{}/scan_t*.tsv", tmpdir);
     let mut tsv_paths: Vec<PathBuf> = glob::glob(&tsv_pattern)
         .map_err(|e| PyRuntimeError::new_err(format!("glob: {}", e)))?
@@ -63,18 +59,17 @@ pub fn read_scan_events(tmpdir: &str) -> PyResult<Vec<ScanEvent>> {
         .collect();
     tsv_paths.sort();
 
-    let mut events = Vec::new();
     for path in tsv_paths {
         let f = fs::File::open(&path)
             .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path.display(), e)))?;
         for line in BufReader::new(f).lines() {
             let line = line.map_err(|e| PyRuntimeError::new_err(format!("read {}: {}", path.display(), e)))?;
             if let Some(event) = parse_scan_event_line(&line) {
-                events.push(event);
+                on_event(event);
             }
         }
     }
-    Ok(events)
+    Ok(())
 }
 
 pub fn read_permission_events(tmpdir: &str) -> PyResult<Vec<PermissionEvent>> {

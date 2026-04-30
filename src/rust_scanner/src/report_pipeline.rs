@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::pipe_events::{read_permission_events, read_scan_events};
+use crate::pipe_events::{for_each_scan_event, read_permission_events};
 use crate::pipe_io::{ensure_dir, recreate_dir};
 use crate::pipe_permission::write_permission_issues_json;
 use crate::pipe_treemap::write_treemap_json_outputs;
@@ -50,19 +50,17 @@ pub fn build_pipeline_dbs_impl(
         let tree_data_dir = PathBuf::from(&treemap_db);
         recreate_dir(&tree_data_dir)?;
 
-        let scan_events = read_scan_events(&tmpdir)?;
-
         let t0 = Instant::now();
         let perm_events = read_permission_events(&tmpdir).unwrap_or_default();
         t_perm_tsv = t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();
-        let mut dir_sizes: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let mut dir_sizes: HashMap<String, Vec<(String, i64)>> = HashMap::new();
         let mut dir_owner_map: HashMap<String, String> = HashMap::new();
         let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
         let mut rows_by_user: HashMap<String, Vec<(u64, String)>> = HashMap::new();
 
-        for event in scan_events {
+        for_each_scan_event(&tmpdir, |event| {
             let username = uids_map
                 .get(&event.uid)
                 .cloned()
@@ -73,19 +71,29 @@ pub fn build_pipeline_dbs_impl(
                 .push((event.size, event.path.clone()));
             if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
                 let user_sizes = dir_sizes.entry(parent).or_default();
-                *user_sizes.entry(username).or_default() += event.size as i64;
+                let mut found = false;
+                for item in user_sizes.iter_mut() {
+                    if item.0 == username {
+                        item.1 += event.size as i64;
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    user_sizes.push((username, event.size as i64));
+                }
             }
-        }
+        })?;
 
         for (dpath, user_sizes) in &dir_sizes {
             let mut d_max_size = 0_i64;
             let mut d_max_user = String::new();
-            for (owner, &size) in user_sizes {
-                if size <= 0 {
+            for (owner, size) in user_sizes {
+                if *size <= 0 {
                     continue;
                 }
-                if size > d_max_size {
-                    d_max_size = size;
+                if *size > d_max_size {
+                    d_max_size = *size;
                     d_max_user = owner.clone();
                 }
                 let entry = users.entry(owner.clone()).or_insert_with(|| UserOutputMeta {
@@ -93,8 +101,8 @@ pub fn build_pipeline_dbs_impl(
                     ..Default::default()
                 });
                 entry.total_dirs += 1;
-                entry.total_used += size;
-                entry.top_dirs.push((dpath.clone(), size));
+                entry.total_used += *size;
+                entry.top_dirs.push((dpath.clone(), *size));
             }
             if !d_max_user.is_empty() {
                 dir_owner_map.insert(dpath.clone(), d_max_user);

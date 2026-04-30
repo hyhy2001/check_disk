@@ -9,7 +9,7 @@ use crate::pipe_io::{recreate_dir, write_json_file, write_json_file_result};
 
 pub fn write_treemap_json_outputs(
     root_dir: &str,
-    dir_sizes: HashMap<String, HashMap<String, i64>>,
+    dir_sizes: HashMap<String, Vec<(String, i64)>>,
     dir_owner_map: HashMap<String, String>,
     json_path: &str,
     data_dir: &Path,
@@ -22,7 +22,7 @@ pub fn write_treemap_json_outputs(
     all_dirs.insert(root.clone(), ());
 
     for (dpath, uid_sizes) in &dir_sizes {
-        let total: i64 = uid_sizes.values().sum();
+        let total: i64 = uid_sizes.iter().map(|(_, size)| *size).sum();
         if total <= 0 {
             continue;
         }

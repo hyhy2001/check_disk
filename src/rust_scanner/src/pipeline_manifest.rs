@@ -5,41 +5,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn compact_user_manifest(user_manifest_path: &Path) -> Result<(), String> {
-    let txt = fs::read_to_string(user_manifest_path).map_err(|e| e.to_string())?;
-    let manifest: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
-
-    let username = manifest.get("username").and_then(|v| v.as_str()).unwrap_or("");
-    let scan_date = manifest.get("scan_date").and_then(|v| v.as_i64()).unwrap_or(0);
-
-    let summary = manifest.get("summary").cloned().unwrap_or(json!({}));
-    let team_id = manifest.get("team_id").cloned().unwrap_or(json!(""));
-
-    let compact_manifest = json!({
-        "schema": "check-disk-user",
-        "username": username,
-        "team_id": team_id,
-        "scan_date": scan_date,
-        "summary": {
-            "files": summary.get("files").or_else(|| summary.get("total_files")).and_then(|v| v.as_i64()).unwrap_or(0),
-            "dirs": summary.get("dirs").or_else(|| summary.get("total_dirs")).and_then(|v| v.as_i64()).unwrap_or(0),
-            "used": summary.get("used").or_else(|| summary.get("total_used")).and_then(|v| v.as_i64()).unwrap_or(0)
-        },
-        "top_files": manifest.get("top_files").cloned().unwrap_or(json!("top_files.json")),
-        "top_dirs": manifest.get("top_dirs").cloned().unwrap_or(json!("top_dirs.json")),
-        "extensions": manifest.get("extensions").cloned().unwrap_or(json!("extensions.json")),
-        "files": {
-            "parts": manifest.get("files").and_then(|v| v.get("parts")).cloned().unwrap_or(json!([]))
-        },
-        "dirs": manifest.get("dirs").cloned().unwrap_or(json!({"path":"dirs.ndjson"}))
-    });
-
-    fs::write(user_manifest_path, serde_json::to_string_pretty(&compact_manifest).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
 pub fn build_pipeline_impl(
     py: Python<'_>,
     tmpdir: String,
@@ -55,7 +20,7 @@ pub fn build_pipeline_impl(
     max_workers: usize,
     debug: bool,
 ) -> PyResult<u64> {
-    // Run pipeline DB builder, then compact outputs to production detail schema.
+    // Run pipeline DB builder, then build compact root manifest metadata.
     let fast_scanner = py.import("src.fast_scanner").or_else(|_| py.import("fast_scanner"))?;
     let f = fast_scanner
         .getattr("build_pipeline_dbs")
@@ -111,15 +76,9 @@ pub fn build_pipeline_impl(
     let mut users_out = Vec::<Value>::new();
 
     if let Some(users) = v.get("users").and_then(|x| x.as_array()) {
-        let total_users = users.len();
-        for (idx, u) in users.iter().enumerate() {
+        for u in users {
             let username = u.get("username").and_then(|x| x.as_str()).unwrap_or("");
             let manifest_rel = u.get("manifest").and_then(|x| x.as_str()).unwrap_or("");
-            let user_manifest_path = detail_root.join(manifest_rel);
-            if user_manifest_path.exists() {
-                compact_user_manifest(&user_manifest_path)
-                    .map_err(|e| PyRuntimeError::new_err(format!("compact user manifest: {}", e)))?;
-            }
             users_out.push(json!({
                 "username": username,
                 "uid": u.get("uid").cloned().unwrap_or(json!(0)),
@@ -130,11 +89,6 @@ pub fn build_pipeline_impl(
                 "used": u.get("total_used").cloned().unwrap_or(json!(0)),
                 "permission_issues": perm_count_by_user.get(username).copied().unwrap_or(0)
             }));
-
-            let done = idx + 1;
-            if done % 20 == 0 || done == total_users {
-                eprintln!("[Phase 2] Manifest compact: {}/{} users", done, total_users);
-            }
         }
     }
 
