@@ -116,23 +116,6 @@ pub fn build_pipeline_dbs_impl(
             build_output_jobs(&detail_root, users, rows_by_user, &team_map, timestamp);
         t_output_jobs = t2.elapsed().as_secs_f64();
 
-        let tree_handle = std::thread::spawn({
-            let treemap_root = treemap_root.clone();
-            let treemap_json = treemap_json.clone();
-            let tree_data_dir = tree_data_dir.clone();
-            move || {
-                write_treemap_json_outputs(
-                    &treemap_root,
-                    dir_sizes,
-                    dir_owner_map,
-                    &treemap_json,
-                    &tree_data_dir,
-                    max_level.max(1),
-                    min_size_bytes,
-                )
-            }
-        });
-
         let t3 = Instant::now();
         let detail_workers = max_workers.max(1).min(chunk_jobs.len().max(1));
         let pool = rayon::ThreadPoolBuilder::new()
@@ -155,12 +138,15 @@ pub fn build_pipeline_dbs_impl(
         t_finalize = t4.elapsed().as_secs_f64();
 
         let t5 = Instant::now();
-        match tree_handle.join() {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => return Err(PyRuntimeError::new_err("treemap writer thread panicked")),
-        }
+        write_treemap_json_outputs(
+            &treemap_root,
+            dir_sizes,
+            dir_owner_map,
+            &treemap_json,
+            &tree_data_dir,
+            max_level.max(1),
+            min_size_bytes,
+        )?;
         t_tree = t5.elapsed().as_secs_f64();
 
         user_results.sort_by(|a, b| a.username.cmp(&b.username));
@@ -193,7 +179,7 @@ pub fn build_pipeline_dbs_impl(
             println!("  Output jobs build:  {:.4}s", t_output_jobs);
             println!("  Chunk parallel:     {:.4}s", t_chunk_parallel);
             println!("  Finalize users:     {:.4}s", t_finalize);
-            println!("  TreeMap thread:     {:.4}s", t_tree);
+            println!("  TreeMap build:      {:.4}s", t_tree);
             println!("  Perm JSON write:    {:.4}s", t_perm_write);
             println!("  Peak RSS:           {:.1} MB", rss_mb);
         }
