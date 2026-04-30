@@ -11,7 +11,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::scan_constants::{CRITICAL_SKIP_NAMES, SCAN_EVENT_FLUSH_BYTES_THRESHOLD, SCAN_EVENT_FLUSH_THRESHOLD};
+use crate::scan_constants::{
+    CRITICAL_SKIP_NAMES,
+    SCAN_DIR_AGG_FLUSH_DIRS_THRESHOLD,
+    SCAN_EVENT_FLUSH_BYTES_THRESHOLD,
+    SCAN_EVENT_FLUSH_THRESHOLD,
+};
 use crate::scan_state::{GlobalStats, ThreadLocalState};
 use crate::scan_utils::{error_code_from_message, format_num, format_rate, format_size, get_rss_mb};
 
@@ -105,6 +110,8 @@ pub(crate) fn run_scan_core(
                     t_event_buf_records: 0,
                     t_event_flush_count: 0,
                     event_bin_writer: None,
+                    dir_agg_map: HashMap::new(),
+                    dir_bin_writer: None,
                     t_perm_issues: 0,
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),
@@ -240,8 +247,10 @@ pub(crate) fn run_scan_core(
                             state.push_event_binary(1, uid, size, &path_owned);
                             state.t_event_buf_records += 1;
                             if let Some(parent) = crate::pipe_types::parent_path(&path_owned) {
-                                state.push_event_binary(2, uid, size, &parent);
-                                state.t_event_buf_records += 1;
+                                state.add_dir_agg(uid, &parent, size);
+                                if state.dir_agg_map.len() >= SCAN_DIR_AGG_FLUSH_DIRS_THRESHOLD {
+                                    state.flush_dir_agg();
+                                }
                             }
                             state.prof_max_event_buf_records.fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
                             state.prof_max_event_buf_bytes.fetch_max(state.t_event_bin_buf.len() as u64, Ordering::Relaxed);

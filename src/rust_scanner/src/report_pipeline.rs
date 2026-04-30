@@ -8,7 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::pipe_events::{for_each_scan_event_in_file, get_scan_event_files, read_permission_events};
+use crate::pipe_events::{
+    for_each_dir_agg_in_file,
+    for_each_scan_event_in_file,
+    get_scan_dir_agg_files,
+    get_scan_event_files,
+    read_permission_events,
+};
 use crate::pipe_io::{ensure_dir, recreate_dir};
 use crate::pipe_permission::write_permission_issues_json;
 use crate::pipe_treemap::write_treemap_json_outputs;
@@ -68,6 +74,7 @@ pub fn build_pipeline_dbs_impl(
         }
 
         let (bin_paths, tsv_paths) = get_scan_event_files(&tmpdir)?;
+        let dir_agg_paths = get_scan_dir_agg_files(&tmpdir)?;
         eprintln!("[Phase 2] Ingesting and mapping {} event streams...", bin_paths.len() + tsv_paths.len());
         let mut all_tasks = Vec::new();
         for p in bin_paths {
@@ -164,6 +171,38 @@ pub fn build_pipeline_dbs_impl(
                     a
                 },
             );
+
+        if !dir_agg_paths.is_empty() {
+            let reduced_dir_sizes = dir_agg_paths
+                .into_par_iter()
+                .fold(
+                    HashMap::<String, HashMap<String, i64>>::new,
+                    |mut local, path| {
+                        let _ = for_each_dir_agg_in_file(&path, |uid, size, dir_path| {
+                            let username = uids_map
+                                .get(&uid)
+                                .cloned()
+                                .unwrap_or_else(|| format!("uid-{}", uid));
+                            let m = local.entry(dir_path).or_default();
+                            *m.entry(username).or_insert(0) += size as i64;
+                        });
+                        local
+                    },
+                )
+                .reduce(
+                    HashMap::<String, HashMap<String, i64>>::new,
+                    |mut a, b| {
+                        for (dir, user_map) in b {
+                            let dst = a.entry(dir).or_default();
+                            for (user, size) in user_map {
+                                *dst.entry(user).or_insert(0) += size;
+                            }
+                        }
+                        a
+                    },
+                );
+            merged_agg.dir_sizes = reduced_dir_sizes;
+        }
 
         for writer in merged_agg.spool_writers.values_mut() {
             let _ = writer.flush();

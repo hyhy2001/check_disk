@@ -7,12 +7,23 @@ use std::path::PathBuf;
 use crate::pipe_types::{parse_permission_line, parse_scan_event_line, PermissionEvent, ScanEvent};
 
 pub fn get_scan_event_files(tmpdir: &str) -> PyResult<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let bin_pattern = format!("{}/scan_t*.bin", tmpdir);
-    let mut bin_paths: Vec<PathBuf> = glob::glob(&bin_pattern)
+    let file_pattern = format!("{}/scan_file_t*.bin", tmpdir);
+    let mut new_file_paths: Vec<PathBuf> = glob::glob(&file_pattern)
         .map_err(|e| PyRuntimeError::new_err(format!("glob bin: {}", e)))?
         .filter_map(|entry| entry.ok())
         .collect();
-    bin_paths.sort();
+    new_file_paths.sort();
+    let bin_paths: Vec<PathBuf> = if !new_file_paths.is_empty() {
+        new_file_paths
+    } else {
+        let legacy_pattern = format!("{}/scan_t*.bin", tmpdir);
+        let mut legacy_paths: Vec<PathBuf> = glob::glob(&legacy_pattern)
+            .map_err(|e| PyRuntimeError::new_err(format!("glob bin legacy: {}", e)))?
+            .filter_map(|entry| entry.ok())
+            .collect();
+        legacy_paths.sort();
+        legacy_paths
+    };
 
     let tsv_pattern = format!("{}/scan_t*.tsv", tmpdir);
     let mut tsv_paths: Vec<PathBuf> = glob::glob(&tsv_pattern)
@@ -22,6 +33,50 @@ pub fn get_scan_event_files(tmpdir: &str) -> PyResult<(Vec<PathBuf>, Vec<PathBuf
     tsv_paths.sort();
 
     Ok((bin_paths, tsv_paths))
+}
+
+pub fn get_scan_dir_agg_files(tmpdir: &str) -> PyResult<Vec<PathBuf>> {
+    let pattern = format!("{}/scan_dir_t*.bin", tmpdir);
+    let mut paths: Vec<PathBuf> = glob::glob(&pattern)
+        .map_err(|e| PyRuntimeError::new_err(format!("glob dir agg: {}", e)))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+pub fn for_each_dir_agg_in_file<F>(path: &std::path::Path, mut on_row: F) -> PyResult<()>
+where
+    F: FnMut(u32, u64, String),
+{
+    let f = fs::File::open(path)
+        .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path.display(), e)))?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, f);
+    let mut uid_buf = [0u8; 4];
+    let mut size_buf = [0u8; 8];
+    let mut len_buf = [0u8; 4];
+    loop {
+        match reader.read_exact(&mut uid_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(PyRuntimeError::new_err(format!("read uid {}: {}", path.display(), e))),
+        }
+        reader
+            .read_exact(&mut size_buf)
+            .map_err(|e| PyRuntimeError::new_err(format!("read size {}: {}", path.display(), e)))?;
+        reader
+            .read_exact(&mut len_buf)
+            .map_err(|e| PyRuntimeError::new_err(format!("read len {}: {}", path.display(), e)))?;
+        let uid = u32::from_le_bytes(uid_buf);
+        let size = u64::from_le_bytes(size_buf);
+        let plen = u32::from_le_bytes(len_buf) as usize;
+        let mut pbuf = vec![0u8; plen];
+        reader
+            .read_exact(&mut pbuf)
+            .map_err(|e| PyRuntimeError::new_err(format!("read path {}: {}", path.display(), e)))?;
+        on_row(uid, size, String::from_utf8_lossy(&pbuf).to_string());
+    }
+    Ok(())
 }
 
 pub fn for_each_scan_event_in_file<F>(path: &std::path::Path, is_bin: bool, mut on_event: F) -> PyResult<()>
