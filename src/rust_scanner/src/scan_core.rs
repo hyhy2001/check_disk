@@ -104,6 +104,7 @@ pub(crate) fn run_scan_core(
                     t_event_bin_buf: Vec::with_capacity(8 * 1024 * 1024),
                     t_event_buf_records: 0,
                     t_event_flush_count: 0,
+                    event_bin_writer: None,
                     t_perm_issues: 0,
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),

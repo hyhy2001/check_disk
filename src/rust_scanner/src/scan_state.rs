@@ -26,6 +26,7 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_event_bin_buf: Vec<u8>,
     pub(crate) t_event_buf_records: usize,
     pub(crate) t_event_flush_count: u32,
+    pub(crate) event_bin_writer: Option<BufWriter<fs::File>>,
     pub(crate) t_perm_issues: u64,
     pub(crate) global_stats: Arc<Mutex<GlobalStats>>,
     pub(crate) prog_files: Arc<AtomicU64>,
@@ -69,10 +70,15 @@ impl ThreadLocalState {
         let bytes_written = self.t_event_bin_buf.len() as u64;
 
         if !self.t_event_bin_buf.is_empty() {
-            let fp = format!("{}/scan_t{}_c{}.bin", self.tmpdir, self.thread_id, self.t_event_flush_count);
-            if let Ok(f) = fs::File::create(&fp) {
-                let mut w = BufWriter::new(f);
-                let _ = w.write_all(&self.t_event_bin_buf);
+            if self.event_bin_writer.is_none() {
+                let fp = format!("{}/scan_t{}.bin", self.tmpdir, self.thread_id);
+                if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
+                    self.event_bin_writer = Some(BufWriter::new(f));
+                }
+            }
+            if let Some(writer) = self.event_bin_writer.as_mut() {
+                let _ = writer.write_all(&self.t_event_bin_buf);
+                let _ = writer.flush();
             }
         }
 
@@ -101,6 +107,9 @@ impl ThreadLocalState {
 impl Drop for ThreadLocalState {
     fn drop(&mut self) {
         self.flush_events();
+        if let Some(writer) = self.event_bin_writer.as_mut() {
+            let _ = writer.flush();
+        }
 
         if let Ok(mut g) = self.global_stats.lock() {
             g.total_files += self.t_files;

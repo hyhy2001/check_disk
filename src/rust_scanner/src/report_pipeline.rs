@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::pipe_events::{for_each_scan_event, read_permission_events};
+use crate::pipe_events::{for_each_scan_event_in_file, get_scan_event_files, read_permission_events};
 use crate::pipe_io::{ensure_dir, recreate_dir};
 use crate::pipe_permission::write_permission_issues_json;
 use crate::pipe_treemap::write_treemap_json_outputs;
@@ -55,35 +55,90 @@ pub fn build_pipeline_dbs_impl(
         t_perm_tsv = t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();
-        let mut dir_sizes: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+
+        struct LocalAgg {
+            dir_sizes: HashMap<String, Vec<(String, i64)>>,
+            rows_by_uid: HashMap<u32, Vec<(u64, String)>>,
+        }
+
+        let (bin_paths, tsv_paths) = get_scan_event_files(&tmpdir)?;
+        let mut all_tasks = Vec::new();
+        for p in bin_paths {
+            all_tasks.push((p, true));
+        }
+        for p in tsv_paths {
+            all_tasks.push((p, false));
+        }
+
+        let merged_agg = all_tasks
+            .into_par_iter()
+            .fold(
+                || LocalAgg {
+                    dir_sizes: HashMap::new(),
+                    rows_by_uid: HashMap::new(),
+                },
+                |mut agg, (path, is_bin)| {
+                    let _ = for_each_scan_event_in_file(&path, is_bin, |event| {
+                        agg.rows_by_uid
+                            .entry(event.uid)
+                            .or_default()
+                            .push((event.size, event.path.clone()));
+                        let username = uids_map
+                            .get(&event.uid)
+                            .cloned()
+                            .unwrap_or_else(|| format!("uid-{}", event.uid));
+                        if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
+                            let user_sizes = agg.dir_sizes.entry(parent).or_default();
+                            let mut found = false;
+                            for item in user_sizes.iter_mut() {
+                                if item.0 == username {
+                                    item.1 += event.size as i64;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                user_sizes.push((username, event.size as i64));
+                            }
+                        }
+                    });
+                    agg
+                },
+            )
+            .reduce(
+                || LocalAgg {
+                    dir_sizes: HashMap::new(),
+                    rows_by_uid: HashMap::new(),
+                },
+                |mut a, b| {
+                    for (uid, mut rows) in b.rows_by_uid {
+                        a.rows_by_uid.entry(uid).or_default().append(&mut rows);
+                    }
+                    for (dir, sizes_b) in b.dir_sizes {
+                        let sizes_a = a.dir_sizes.entry(dir).or_default();
+                        for (username, size) in sizes_b {
+                            let mut found = false;
+                            for item in sizes_a.iter_mut() {
+                                if item.0 == username {
+                                    item.1 += size;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                sizes_a.push((username, size));
+                            }
+                        }
+                    }
+                    a
+                },
+            );
+
+        let dir_sizes = merged_agg.dir_sizes;
+        let rows_by_uid = merged_agg.rows_by_uid;
+
         let mut dir_owner_map: HashMap<String, String> = HashMap::new();
         let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
-        let mut rows_by_user: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-
-        for_each_scan_event(&tmpdir, |event| {
-            let username = uids_map
-                .get(&event.uid)
-                .cloned()
-                .unwrap_or_else(|| format!("uid-{}", event.uid));
-            rows_by_user
-                .entry(username.clone())
-                .or_default()
-                .push((event.size, event.path.clone()));
-            if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
-                let user_sizes = dir_sizes.entry(parent).or_default();
-                let mut found = false;
-                for item in user_sizes.iter_mut() {
-                    if item.0 == username {
-                        item.1 += event.size as i64;
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    user_sizes.push((username, event.size as i64));
-                }
-            }
-        })?;
 
         for (dpath, user_sizes) in &dir_sizes {
             let mut d_max_size = 0_i64;
@@ -97,7 +152,7 @@ pub fn build_pipeline_dbs_impl(
                     d_max_user = owner.clone();
                 }
                 let entry = users.entry(owner.clone()).or_insert_with(|| UserOutputMeta {
-                    team_id: team_map.get(owner).cloned().unwrap_or_default(),
+                    team_id: team_map.get(owner.as_str()).cloned().unwrap_or_default(),
                     ..Default::default()
                 });
                 entry.total_dirs += 1;
@@ -107,6 +162,15 @@ pub fn build_pipeline_dbs_impl(
             if !d_max_user.is_empty() {
                 dir_owner_map.insert(dpath.clone(), d_max_user);
             }
+        }
+
+        let mut rows_by_user: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+        for (uid, rows) in rows_by_uid {
+            let username = uids_map
+                .get(&uid)
+                .cloned()
+                .unwrap_or_else(|| format!("uid-{}", uid));
+            rows_by_user.insert(username, rows);
         }
 
         for username in rows_by_user.keys() {
