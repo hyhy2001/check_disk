@@ -14,6 +14,7 @@ fn compact_file_row(path: &str, size: u64, ext: &str) -> serde_json::Value {
     json!({"p": path, "s": size, "x": ext})
 }
 
+#[allow(dead_code)]
 pub fn build_output_jobs(
     detail_root: &Path,
     users: HashMap<String, UserOutputMeta>,

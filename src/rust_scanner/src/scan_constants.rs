@@ -4,5 +4,5 @@ pub(crate) const CRITICAL_SKIP_NAMES: &[&str] = &[
     ".nfs",
 ];
 
-pub(crate) const SCAN_EVENT_FLUSH_THRESHOLD: usize = 500_000;
-pub(crate) const SCAN_EVENT_FLUSH_BYTES_THRESHOLD: usize = 64 * 1024 * 1024;
+pub(crate) const SCAN_EVENT_FLUSH_THRESHOLD: usize = 250_000;
+pub(crate) const SCAN_EVENT_FLUSH_BYTES_THRESHOLD: usize = 32 * 1024 * 1024;

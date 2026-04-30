@@ -55,7 +55,7 @@ pub(crate) struct ThreadLocalState {
 
 impl ThreadLocalState {
     const PROGRESS_FLUSH_THRESHOLD: u64 = 4096;
-    pub(crate) const EVENT_BUCKETS: usize = 4;
+    pub(crate) const EVENT_BUCKETS: usize = 3;
 
     fn bucket_for_uid(uid: u32) -> usize {
         (uid as usize) % Self::EVENT_BUCKETS

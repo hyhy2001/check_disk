@@ -328,6 +328,8 @@ def main():
 
             # Main summary report
             report_generator.generate_report(scan_results)
+            if main_report_path:
+                print(f"Main summary report saved to: {main_report_path}")
 
             # Enqueue main + sibling reports AFTER they are written to disk
             if sync_pipeline and main_report_path:
@@ -396,6 +398,8 @@ def main():
             heartbeat.stop()
             _update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at)
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
+            if main_report_path:
+                print(f"Main summary report: {main_report_path}")
             total_elapsed = time.time() - run_started_at
             print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 

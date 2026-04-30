@@ -6,6 +6,7 @@ Handles generating and saving disk usage reports.
 
 import os
 import shutil
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -331,12 +332,35 @@ class ReportGenerator:
         )
         if not hasattr(_fast_scanner, "build_pipeline"):
             raise RuntimeError("fast_scanner.build_pipeline is required")
-        try:
-            total_files = _fast_scanner.build_pipeline(*build_args, bool(self.debug))
-        except TypeError as exc:
-            if "positional arguments" not in str(exc):
-                raise
-            total_files = _fast_scanner.build_pipeline(*build_args)
+        print("[Phase 2] Rust pipeline started (large datasets may take a while)...")
+        build_started = time.time()
+        total_files_holder: Dict[str, int] = {"value": 0}
+        build_error_holder: Dict[str, Optional[Exception]] = {"error": None}
+
+        def _run_build_pipeline() -> None:
+            try:
+                try:
+                    total_files_holder["value"] = int(
+                        _fast_scanner.build_pipeline(*build_args, bool(self.debug))
+                    )
+                except TypeError as exc:
+                    if "positional arguments" not in str(exc):
+                        raise
+                    total_files_holder["value"] = int(_fast_scanner.build_pipeline(*build_args))
+            except Exception as exc:  # pragma: no cover - exception relay path
+                build_error_holder["error"] = exc
+
+        build_thread = threading.Thread(target=_run_build_pipeline, daemon=True)
+        build_thread.start()
+        while build_thread.is_alive():
+            build_thread.join(timeout=10.0)
+            if build_thread.is_alive():
+                elapsed = int(time.time() - build_started)
+                print(f"[Phase 2] Still processing... elapsed {elapsed}s")
+
+        if build_error_holder["error"] is not None:
+            raise build_error_holder["error"]
+        total_files = total_files_holder["value"]
 
         root_manifest_path = unified_path
 

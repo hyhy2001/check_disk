@@ -70,12 +70,19 @@ pub fn finalize_user_outputs(
             total_used: meta.total_used,
         });
 
-        let done = user_results.len();
-        let total = metas_count;
-        let percent = (done as f64 / total as f64) * 100.0;
-        eprint!("\r[Phase 2] Detail reports: {}/{} users ({:.1}%) ... ", done, total, percent);
+        if metas_count > 1 {
+            let done = user_results.len();
+            let total = metas_count;
+            let percent = (done as f64 / total as f64) * 100.0;
+            eprint!(
+                "\r[Phase 2] Detail reports: {}/{} users ({:.1}%) ... ",
+                done, total, percent
+            );
+        }
     }
-    eprintln!();
+    if metas_count > 1 {
+        eprintln!();
+    }
     Ok(user_results)
 }
 
