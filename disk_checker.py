@@ -260,6 +260,11 @@ def main():
         config['output_date_suffix'] = output_date
         config['debug'] = getattr(args, 'debug', False)
 
+        # Allow one-shot scan directory override with --run --dir
+        if getattr(args, 'dir', None):
+            config['directory'] = args.dir
+            print(f"Scan directory overridden for this run: {args.dir}")
+
         target_users = getattr(args, 'user', None)
         if target_users:
             original_users = {u['name']: u for u in config.get('users', [])}

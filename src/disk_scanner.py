@@ -96,8 +96,8 @@ class DiskScanner:
 
         print("Calling fast_scanner.scan_disk()...")
         start = time.time()
-        # New Rust ABI supports max_workers as the 4th arg.
-        # Keep backward compatibility with old prebuilt .so.
+        if not hasattr(fast_scanner, "scan_disk"):
+            raise RuntimeError("fast_scanner.scan_disk is required")
         try:
             result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers, self.debug)
         except TypeError:

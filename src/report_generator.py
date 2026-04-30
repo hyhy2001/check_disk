@@ -14,10 +14,10 @@ from .utils import save_json_report
 
 try:
     from src import fast_scanner as _fast_scanner
-    HAS_RUST_UNIFIED_DB = hasattr(_fast_scanner, 'build_unified_dbs')
+    HAS_RUST_PIPELINE = hasattr(_fast_scanner, 'build_pipeline')
 except ImportError:
     _fast_scanner = None  # type: ignore
-    HAS_RUST_UNIFIED_DB = False
+    HAS_RUST_PIPELINE = False
 
 
 class ReportGenerator:
@@ -242,10 +242,10 @@ class ReportGenerator:
         level: int = 3,
         max_workers: Optional[int] = None,
     ) -> str:
-        """Return the TreeMap report path built by the unified Rust pipeline."""
+        """Return the TreeMap report path built by the Rust pipeline."""
         self.config["tree_map_level"] = int(level)
         if self.debug and max_workers is not None and scan_result.detail_tmpdir:
-            print(f"[Phase 3] TreeMap already built by unified Rust pipeline ({max_workers}w)")
+            print(f"[Phase 3] TreeMap already built by Rust pipeline ({max_workers}w)")
         output_path = self._get_output_filename("tree_map_report")
         if os.path.exists(output_path):
             return output_path
@@ -279,10 +279,10 @@ class ReportGenerator:
                 "Phase 2 requires Rust streaming outputs (detail_tmpdir). "
                 "Python in-memory fallback has been removed."
             )
-        if not HAS_RUST_UNIFIED_DB:
+        if not HAS_RUST_PIPELINE:
             raise RuntimeError(
-                "Rust unified DB core is required. "
-                "Please build/install fast_scanner with build_unified_dbs."
+                "Rust pipeline core is required. "
+                "Please build/install fast_scanner with build_pipeline."
             )
 
         output_dir = os.path.dirname(self.output_file) or "."
@@ -329,29 +329,44 @@ class ReportGenerator:
             int(scan_result.timestamp),
             int(max(1, int(max_workers))),
         )
+        if not hasattr(_fast_scanner, "build_pipeline"):
+            raise RuntimeError("fast_scanner.build_pipeline is required")
         try:
-            total_files = _fast_scanner.build_unified_dbs(*build_args, bool(self.debug))
+            total_files = _fast_scanner.build_pipeline(*build_args, bool(self.debug))
         except TypeError as exc:
             if "positional arguments" not in str(exc):
                 raise
-            total_files = _fast_scanner.build_unified_dbs(*build_args)
+            total_files = _fast_scanner.build_pipeline(*build_args)
 
-        created = [unified_path, tree_json_path, os.path.join(tree_data_path, "manifest.json")]
+        root_manifest_path = unified_path
+
+        created = [root_manifest_path, tree_json_path, os.path.join(tree_data_path, "manifest.json")]
         self.cleanup_stale_detail_reports(created)
 
         detail_users_count = 0
+        root_manifest_data = None
         try:
             import json
-            with open(unified_path, "r", encoding="utf-8") as fh:
-                root_manifest = json.load(fh)
-            detail_users_count = len(root_manifest.get("users", []))
+            with open(root_manifest_path, "r", encoding="utf-8") as fh:
+                root_manifest_data = json.load(fh)
+            detail_users_count = len(root_manifest_data.get("users", []))
         except Exception:
             detail_users_count = 0
+
+        # Cleanup temporary Rust scan segments after Phase 2 completes.
+        try:
+            if scan_result.detail_tmpdir and os.path.isdir(scan_result.detail_tmpdir):
+                shutil.rmtree(scan_result.detail_tmpdir)
+                if self.debug:
+                    print(f"  [Phase 2] Cleaned temp scan segments: {scan_result.detail_tmpdir}")
+        except OSError as exc:
+            if self.debug:
+                print(f"  [Phase 2] Warning: failed to remove temp scan segments {scan_result.detail_tmpdir}: {exc}")
 
         phase2_elapsed = time.time() - phase2_start
         if self.debug:
             phase2_mem_end = self._get_rss_mb()
-            print(f"  [Phase 2] Detail manifest ready: {unified_path}")
+            print(f"  [Phase 2] Detail manifest ready: {root_manifest_path}")
             print(f"  [Phase 2] Users processed: {detail_users_count:,}")
             print(f"  [Phase 2] User details ready: {os.path.join(detail_dir, 'users')}")
             print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
@@ -362,7 +377,7 @@ class ReportGenerator:
             )
         else:
             print(f"Reports generated in {phase2_elapsed:.2f}s ({int(total_files):,} files, {detail_users_count:,} users):")
-            print(f"  Detail manifest: {unified_path}")
+            print(f"  Detail manifest: {root_manifest_path}")
             print(f"  Users processed: {detail_users_count:,}")
             print(f"  User details: {os.path.join(detail_dir, 'users')}")
             print(f"  TreeMap JSON: {tree_json_path}")
