@@ -85,6 +85,13 @@ pub fn build_unified_dbs(
 ) -> PyResult<u64> {
     py.allow_threads(move || -> PyResult<u64> {
         let t_all = Instant::now();
+        let t_perm_tsv: f64;
+        let t_dir_build: f64;
+        let t_output_jobs: f64;
+        let t_chunk_parallel: f64;
+        let t_finalize: f64;
+        let t_tree: f64;
+        let t_perm_write: f64;
 
         let detail_root = Path::new(&unified_db_path)
             .parent()
@@ -99,9 +106,11 @@ pub fn build_unified_dbs(
         let scan_events = read_scan_events(&tmpdir)?;
 
         // Read permission events from TSV (written by Phase 1)
+        let t0 = Instant::now();
         let perm_events = read_permission_events(&tmpdir).unwrap_or_default();
+        t_perm_tsv = t0.elapsed().as_secs_f64();
 
-
+        let t1 = Instant::now();
         let mut dir_sizes: HashMap<String, HashMap<String, i64>> = HashMap::new();
         let mut dir_owner_map: HashMap<String, String> = HashMap::new();
         let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
@@ -146,8 +155,11 @@ pub fn build_unified_dbs(
                 ..Default::default()
             });
         }
+        t_dir_build = t1.elapsed().as_secs_f64();
 
+        let t2 = Instant::now();
         let (user_metas, chunk_jobs) = build_output_jobs(&detail_root, users, rows_by_user, &team_map, timestamp);
+        t_output_jobs = t2.elapsed().as_secs_f64();
 
         let tree_handle = std::thread::spawn({
             let treemap_root = treemap_root.clone();
@@ -164,6 +176,7 @@ pub fn build_unified_dbs(
             )
         });
 
+        let t3 = Instant::now();
         let detail_workers = max_workers.max(1).min(chunk_jobs.len().max(1));
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(detail_workers)
@@ -175,27 +188,34 @@ pub fn build_unified_dbs(
                 .map(build_one_file_chunk)
                 .collect::<Result<Vec<_>, String>>()
         }).map_err(PyRuntimeError::new_err)?;
+        t_chunk_parallel = t3.elapsed().as_secs_f64();
+        
+        let t4 = Instant::now();
         let mut user_results = finalize_user_outputs(user_metas, chunk_results)
             .map_err(PyRuntimeError::new_err)?;
+        t_finalize = t4.elapsed().as_secs_f64();
 
+        let t5 = Instant::now();
         match tree_handle.join() {
             Ok(result) => {
                 result?;
             }
             Err(_) => return Err(PyRuntimeError::new_err("treemap writer thread panicked")),
         }
+        t_tree = t5.elapsed().as_secs_f64();
 
         user_results.sort_by(|a, b| a.username.cmp(&b.username));
         let total_files_processed: i64 = user_results.iter().map(|u| u.total_files).sum();
         write_detail_manifest(&detail_root, &user_results, &treemap_root, timestamp, total_files_processed)?;
 
         // Write permission issues report from Phase 1 TSV data
-        let perm_path = detail_root.parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        write_permission_issues_json(&perm_events, &uids_map, &perm_path, &treemap_root, timestamp)?;
+        let t6 = Instant::now();
+        let perm_out_dir = detail_root.parent().unwrap_or(Path::new(".")).to_path_buf();
+        write_permission_issues_json(&perm_events, &uids_map, &perm_out_dir, &treemap_root, timestamp)?;
+        t_perm_write = t6.elapsed().as_secs_f64();
 
         if debug {
+            let rss_mb = get_rss_mb();
             println!(
                 "JSON/NDJSON outputs built in {:.2}s with {} detail workers. Total files: {}, perms: {}",
                 t_all.elapsed().as_secs_f64(),
@@ -203,6 +223,15 @@ pub fn build_unified_dbs(
                 total_files_processed,
                 perm_events.len()
             );
+            println!("[Phase 2 Profile]");
+            println!("  Perm TSV read:      {:.4}s", t_perm_tsv);
+            println!("  Dir grouping:       {:.4}s", t_dir_build);
+            println!("  Output jobs build:  {:.4}s", t_output_jobs);
+            println!("  Chunk parallel:     {:.4}s", t_chunk_parallel);
+            println!("  Finalize users:     {:.4}s", t_finalize);
+            println!("  TreeMap thread:     {:.4}s", t_tree);
+            println!("  Perm JSON write:    {:.4}s", t_perm_write);
+            println!("  Peak RSS:           {:.1} MB", rss_mb);
         }
         Ok(total_files_processed as u64)
     })
@@ -825,6 +854,21 @@ fn write_permission_issues_json(
     write_json_file(&out_path, &report)?;
     Ok(())
 }
+fn get_rss_mb() -> f64 {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(kb) = line.split_whitespace().nth(1) {
+                    if let Ok(val) = kb.parse::<f64>() {
+                        return val / 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
+}
+
 fn tm_basename(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed == "/" || trimmed.is_empty() {
