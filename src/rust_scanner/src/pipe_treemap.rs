@@ -84,11 +84,15 @@ pub fn write_treemap_json_outputs(
     }
     let total_paths = paths.len().max(1);
     let progress = AtomicUsize::new(0);
+    let written = AtomicUsize::new(0);
     paths.par_iter().try_for_each(|path| -> Result<(), String> {
         let shard_id = path_to_shard.get(path).ok_or_else(|| format!("missing shard id for {}", path))?;
         let children = shard_children_json(path, &parent_to_children, &recursive_sizes, &dir_owner_map, &path_to_shard, min_size_bytes);
-        let prefix = if shard_id.len() >= 2 { &shard_id[..2] } else { "00" };
-        write_json_file_result(&shards_dir.join(prefix).join(format!("{}.json", shard_id)), &json!(children))?;
+        if !children.is_empty() || path == &root {
+            let prefix = if shard_id.len() >= 2 { &shard_id[..2] } else { "00" };
+            write_json_file_result(&shards_dir.join(prefix).join(format!("{}.json", shard_id)), &json!(children))?;
+            written.fetch_add(1, Ordering::Relaxed);
+        }
         let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
         if done % 10_000 == 0 || done == total_paths {
             let percent = (done as f64 / total_paths as f64) * 100.0;
@@ -97,7 +101,7 @@ pub fn write_treemap_json_outputs(
         Ok(())
     }).map_err(PyRuntimeError::new_err)?;
     eprintln!();
-    let shard_count = paths.len() as u64;
+    let shard_count = written.load(Ordering::Relaxed) as u64;
 
     let root_children = shard_children_json(&root, &parent_to_children, &recursive_sizes, &dir_owner_map, &path_to_shard, min_size_bytes);
     let root_node = json!({

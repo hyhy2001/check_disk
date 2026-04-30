@@ -47,10 +47,10 @@ pub(crate) struct ThreadLocalState {
 }
 
 impl ThreadLocalState {
-    pub(crate) fn push_event_binary(&mut self, uid: u32, size: u64, path: &str) {
+    pub(crate) fn push_event_binary(&mut self, tag: u8, uid: u32, size: u64, path: &str) {
         // Record format:
-        // [tag:u8=1][uid:u32 LE][size:u64 LE][path_len:u32 LE][path_bytes]
-        self.t_event_bin_buf.push(1u8);
+        // [tag:u8][uid:u32 LE][size:u64 LE][path_len:u32 LE][path_bytes]
+        self.t_event_bin_buf.push(tag);
         self.t_event_bin_buf.extend_from_slice(&uid.to_le_bytes());
         self.t_event_bin_buf.extend_from_slice(&size.to_le_bytes());
         let path_bytes = path.as_bytes();

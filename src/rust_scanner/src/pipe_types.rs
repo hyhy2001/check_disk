@@ -35,7 +35,7 @@ pub struct FileChunkJob {
     pub username: String,
     pub chunk_index: usize,
     pub output_dir: std::path::PathBuf,
-    pub rows: Vec<(u64, String)>,
+    pub spool_files: Vec<std::path::PathBuf>,
 }
 
 pub struct FileChunkResult {
@@ -64,6 +64,7 @@ pub struct PermissionEvent {
 }
 
 pub struct ScanEvent {
+    pub tag: u8,
     pub uid: u32,
     pub size: u64,
     pub path: String,
@@ -78,7 +79,7 @@ pub fn parse_scan_event_line(line: &str) -> Option<ScanEvent> {
     let uid: u32 = parts.next()?.trim().parse().ok()?;
     let size: u64 = parts.next()?.trim().parse().ok()?;
     let path = parts.next()?.to_string();
-    Some(ScanEvent { uid, size, path })
+    Some(ScanEvent { tag: 1, uid, size, path })
 }
 
 /// Parse a permission issue line from TSV (P\tuid\tkind\terrcode\tpath)

@@ -237,8 +237,12 @@ pub(crate) fn run_scan_core(
                             let path_start = Instant::now();
                             let path_owned = path.to_string_lossy();
                             state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            state.push_event_binary(uid, size, &path_owned);
+                            state.push_event_binary(1, uid, size, &path_owned);
                             state.t_event_buf_records += 1;
+                            if let Some(parent) = crate::pipe_types::parent_path(&path_owned) {
+                                state.push_event_binary(2, uid, size, &parent);
+                                state.t_event_buf_records += 1;
+                            }
                             state.prof_max_event_buf_records.fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
                             state.prof_max_event_buf_bytes.fetch_max(state.t_event_bin_buf.len() as u64, Ordering::Relaxed);
                             if state.t_event_buf_records >= SCAN_EVENT_FLUSH_THRESHOLD
