@@ -9,6 +9,14 @@ use std::path::Path;
 use crate::pipe_io::{json_line_result, safe_user_dir, write_json_file, write_json_file_result};
 use crate::pipe_types::{TOP_RECORDS, FileChunkResult, UserBuildResult, UserJobMeta};
 
+fn compact_file_row(path: &str, size: u64, ext: &str) -> serde_json::Value {
+    json!({"p": path, "s": size, "x": ext})
+}
+
+fn compact_dir_row(path: &str, used: i64) -> serde_json::Value {
+    json!({"p": path, "s": used})
+}
+
 pub fn finalize_user_outputs(
     user_metas: Vec<UserJobMeta>,
     chunk_results: Vec<FileChunkResult>,
@@ -79,12 +87,12 @@ fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result
     let file = fs::File::create(user_dir.join("dirs.ndjson")).map_err(|e| format!("create dirs.ndjson: {}", e))?;
     let mut writer = BufWriter::new(file);
     for (path, used) in top_dirs {
-        json_line_result(&mut writer, json!({"path": path, "used": used}))?;
+        json_line_result(&mut writer, compact_dir_row(path, *used))?;
     }
     writer.flush().map_err(|e| format!("flush dirs: {}", e))?;
 
     let top_dirs_json: Vec<_> = top_dirs.iter().take(TOP_RECORDS)
-        .map(|(path, used)| json!({"path": path, "used": used}))
+        .map(|(path, used)| compact_dir_row(path, *used))
         .collect();
     write_json_file_result(&user_dir.join("top_dirs.json"), &json!(top_dirs_json))
 }
@@ -99,7 +107,7 @@ fn write_user_metadata_result(
     let mut top_files_vec: Vec<(u64, String)> = top_files.into_iter().map(|Reverse(item)| item).collect();
     top_files_vec.sort_by(|a, b| b.0.cmp(&a.0));
     let top_files_json: Vec<_> = top_files_vec.iter()
-        .map(|(size, path)| json!({"path": path, "size": size, "ext": crate::pipe_types::extension_for_path(path)}))
+        .map(|(size, path)| compact_file_row(path, *size, &crate::pipe_types::extension_for_path(path)))
         .collect();
     write_json_file_result(&meta.tmp_dir.join("top_files.json"), &json!(top_files_json))?;
 
@@ -110,20 +118,20 @@ fn write_user_metadata_result(
     write_json_file_result(&meta.tmp_dir.join("extensions.json"), &json!(exts))?;
 
     let manifest = json!({
-        "version": 1,
+        "schema": "check-disk-user",
         "username": meta.username,
         "team_id": meta.team_id,
         "scan_date": meta.timestamp,
         "summary": {
-            "total_files": total_files,
-            "total_dirs": meta.total_dirs,
-            "total_used": meta.total_used
+            "files": total_files,
+            "dirs": meta.total_dirs,
+            "used": meta.total_used
         },
-        "dirs": {"path": "dirs.ndjson", "sort": "size_desc"},
-        "files": {"sort": "chunk_size_desc", "parts": file_parts},
         "top_files": "top_files.json",
         "top_dirs": "top_dirs.json",
-        "extensions": "extensions.json"
+        "extensions": "extensions.json",
+        "files": {"parts": file_parts},
+        "dirs": {"path": "dirs.ndjson"}
     });
     write_json_file_result(&meta.tmp_dir.join("manifest.json"), &manifest)
 }

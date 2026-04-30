@@ -3,104 +3,14 @@ use pyo3::prelude::*;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-
-fn to_compact_file_row(v: &Value) -> Value {
-    json!({
-        "p": v.get("path").and_then(|x| x.as_str()).unwrap_or(""),
-        "s": v.get("size").and_then(|x| x.as_i64()).unwrap_or(0),
-        "x": v.get("ext").or_else(|| v.get("xt")).and_then(|x| x.as_str()).unwrap_or("")
-    })
-}
-
-fn to_compact_dir_row(v: &Value) -> Value {
-    json!({
-        "p": v.get("path").and_then(|x| x.as_str()).unwrap_or(""),
-        "s": v.get("used").and_then(|x| x.as_i64()).unwrap_or(0)
-    })
-}
 
 fn compact_user_manifest(user_manifest_path: &Path) -> Result<(), String> {
     let txt = fs::read_to_string(user_manifest_path).map_err(|e| e.to_string())?;
     let manifest: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
-    let user_dir = user_manifest_path.parent().ok_or("invalid user manifest path")?;
 
     let username = manifest.get("username").and_then(|v| v.as_str()).unwrap_or("");
     let scan_date = manifest.get("scan_date").and_then(|v| v.as_i64()).unwrap_or(0);
-
-    // Convert top files to compact keys in-place for production
-    if let Some(top_files_rel) = manifest.get("top_files").and_then(|v| v.as_str()) {
-        let top_files_path = user_dir.join(top_files_rel);
-        if top_files_path.exists() {
-            let top_txt = fs::read_to_string(&top_files_path).map_err(|e| e.to_string())?;
-            let arr: Value = serde_json::from_str(&top_txt).map_err(|e| e.to_string())?;
-            if let Some(items) = arr.as_array() {
-                let compact: Vec<Value> = items.iter().map(to_compact_file_row).collect();
-                fs::write(&top_files_path, serde_json::to_string(&compact).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    if let Some(top_dirs_rel) = manifest.get("top_dirs").and_then(|v| v.as_str()) {
-        let top_dirs_path = user_dir.join(top_dirs_rel);
-        if top_dirs_path.exists() {
-            let top_txt = fs::read_to_string(&top_dirs_path).map_err(|e| e.to_string())?;
-            let arr: Value = serde_json::from_str(&top_txt).map_err(|e| e.to_string())?;
-            if let Some(items) = arr.as_array() {
-                let compact: Vec<Value> = items.iter().map(to_compact_dir_row).collect();
-                fs::write(&top_dirs_path, serde_json::to_string(&compact).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    // Convert NDJSON parts for files to compact format
-    if let Some(files) = manifest.get("files") {
-        if let Some(parts) = files.get("parts").and_then(|v| v.as_array()) {
-            for p in parts {
-                if let Some(rel) = p.get("path").and_then(|v| v.as_str()) {
-                    let part_path = user_dir.join(rel);
-                    if part_path.exists() {
-                        let input = fs::File::open(&part_path).map_err(|e| e.to_string())?;
-                        let reader = BufReader::new(input);
-                        let mut out = String::new();
-                        for line in reader.lines() {
-                            let line = line.map_err(|e| e.to_string())?;
-                            if line.trim().is_empty() { continue; }
-                            let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-                            let c = to_compact_file_row(&v);
-                            out.push_str(&serde_json::to_string(&c).map_err(|e| e.to_string())?);
-                            out.push('\n');
-                        }
-                        fs::write(&part_path, out).map_err(|e| e.to_string())?;
-                    }
-                }
-            }
-        }
-    }
-
-    // Convert dirs.ndjson
-    if let Some(dirs) = manifest.get("dirs") {
-        if let Some(rel) = dirs.get("path").and_then(|v| v.as_str()) {
-            let dirs_path = user_dir.join(rel);
-            if dirs_path.exists() {
-                let input = fs::File::open(&dirs_path).map_err(|e| e.to_string())?;
-                let reader = BufReader::new(input);
-                let mut out = String::new();
-                for line in reader.lines() {
-                    let line = line.map_err(|e| e.to_string())?;
-                    if line.trim().is_empty() { continue; }
-                    let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-                    let c = to_compact_dir_row(&v);
-                    out.push_str(&serde_json::to_string(&c).map_err(|e| e.to_string())?);
-                    out.push('\n');
-                }
-                fs::write(&dirs_path, out).map_err(|e| e.to_string())?;
-            }
-        }
-    }
 
     let summary = manifest.get("summary").cloned().unwrap_or(json!({}));
     let team_id = manifest.get("team_id").cloned().unwrap_or(json!(""));
@@ -111,9 +21,9 @@ fn compact_user_manifest(user_manifest_path: &Path) -> Result<(), String> {
         "team_id": team_id,
         "scan_date": scan_date,
         "summary": {
-            "files": summary.get("total_files").and_then(|v| v.as_i64()).unwrap_or(0),
-            "dirs": summary.get("total_dirs").and_then(|v| v.as_i64()).unwrap_or(0),
-            "used": summary.get("total_used").and_then(|v| v.as_i64()).unwrap_or(0)
+            "files": summary.get("files").or_else(|| summary.get("total_files")).and_then(|v| v.as_i64()).unwrap_or(0),
+            "dirs": summary.get("dirs").or_else(|| summary.get("total_dirs")).and_then(|v| v.as_i64()).unwrap_or(0),
+            "used": summary.get("used").or_else(|| summary.get("total_used")).and_then(|v| v.as_i64()).unwrap_or(0)
         },
         "top_files": manifest.get("top_files").cloned().unwrap_or(json!("top_files.json")),
         "top_dirs": manifest.get("top_dirs").cloned().unwrap_or(json!("top_dirs.json")),

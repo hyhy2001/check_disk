@@ -8,6 +8,10 @@ use std::path::Path;
 use crate::pipe_io::{json_line_result, safe_user_dir};
 use crate::pipe_types::{FILE_PART_RECORDS, FileChunkJob, FileChunkResult, UserJobMeta, UserOutputMeta};
 
+fn compact_file_row(path: &str, size: u64, ext: &str) -> serde_json::Value {
+    json!({"p": path, "s": size, "x": ext})
+}
+
 pub fn build_output_jobs(
     detail_root: &Path,
     users: HashMap<String, UserOutputMeta>,
@@ -85,10 +89,7 @@ pub fn build_one_file_chunk(job: FileChunkJob) -> Result<FileChunkResult, String
         stat.0 += 1;
         stat.1 += size as i64;
         crate::pipe_types::push_top_file(&mut top_files, size, &safe);
-        json_line_result(
-            current_writer.as_mut().expect("writer exists"),
-            json!({"path": safe, "size": size, "ext": ext}),
-        )?;
+        json_line_result(current_writer.as_mut().expect("writer exists"), compact_file_row(&safe, size, &ext))?;
         current_records += 1;
         total_files += 1;
     }
