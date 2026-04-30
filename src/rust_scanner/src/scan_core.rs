@@ -20,14 +20,14 @@ use crate::scan_constants::{
 use crate::scan_state::{GlobalStats, ThreadLocalState};
 use crate::scan_utils::{error_code_from_message, format_num, format_rate, format_size, get_rss_mb};
 
-fn parent_path_ref(path: &str) -> Option<&str> {
+fn parent_path_owned_from_path(path: &str) -> Option<String> {
     let trimmed = path.trim_end_matches('/');
     if trimmed == "/" || trimmed.is_empty() {
         return None;
     }
     match trimmed.rfind('/') {
-        Some(0) => Some("/"),
-        Some(idx) => Some(&trimmed[..idx]),
+        Some(0) => Some("/".to_string()),
+        Some(idx) => Some(trimmed[..idx].to_string()),
         None => None,
     }
 }
@@ -259,8 +259,8 @@ pub(crate) fn run_scan_core(
                             state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             state.push_event_binary(1, uid, size, path_str);
                             state.t_event_buf_records += 1;
-                            if let Some(parent) = parent_path_ref(path_str) {
-                                state.add_dir_agg(uid, parent, size);
+                            if let Some(parent) = parent_path_owned_from_path(path_str) {
+                                state.add_dir_agg_owned(uid, parent, size);
                                 if state.dir_agg_map.len() >= SCAN_DIR_AGG_FLUSH_DIRS_THRESHOLD {
                                     state.flush_dir_agg();
                                 }

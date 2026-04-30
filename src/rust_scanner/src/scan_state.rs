@@ -92,11 +92,8 @@ impl ThreadLocalState {
         }
     }
 
-    pub(crate) fn add_dir_agg(&mut self, uid: u32, parent_path: &str, size: u64) {
-        let by_uid = self
-            .dir_agg_map
-            .entry(parent_path.to_string())
-            .or_default();
+    pub(crate) fn add_dir_agg_owned(&mut self, uid: u32, parent_path: String, size: u64) {
+        let by_uid = self.dir_agg_map.entry(parent_path).or_default();
         *by_uid.entry(uid).or_insert(0) += size;
     }
 
