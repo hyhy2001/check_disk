@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 use pyo3::exceptions::PyRuntimeError;
 use ignore::{WalkBuilder, WalkState};
 use dashmap::DashSet;
@@ -82,8 +82,7 @@ struct GlobalStats {
     total_size: u64,
     uid_sizes: HashMap<u32, u64>,
     uid_files: HashMap<u32, u64>,
-    // dir_sizes removed — streamed to per-thread TSV files to bound peak RAM
-    permission_issues: Vec<(String, String, String, Option<u32>)>, // (path, kind, error, uid)
+    permission_issues_count: u64,
 }
 
 // ProgressStats replaced by 3 AtomicU64 (no lock, exact counts)
@@ -98,7 +97,7 @@ struct ThreadLocalState {
     t_uid_files: HashMap<u32, u64>,
     t_event_buf: Vec<(u32, u64, String)>,
     t_event_flush_count: u32,
-    t_perm_issues: Vec<(String, String, String, Option<u32>)>,
+    t_perm_issues: u64,
     global_stats: Arc<Mutex<GlobalStats>>,
     prog_files: Arc<AtomicU64>,
     prog_dirs:  Arc<AtomicU64>,
@@ -126,6 +125,18 @@ impl ThreadLocalState {
             self.t_event_buf.shrink_to_fit();
         }
     }
+
+    fn flush_permission_issue(&self, path: &str, kind: &str, error_code: &str) {
+        let fp = format!("{}/perm_t{}.tsv", self.tmpdir, self.thread_id);
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
+            let uid = if path.is_empty() {
+                0
+            } else {
+                fs::symlink_metadata(path).map(|m| m.uid()).unwrap_or(0)
+            };
+            let _ = writeln!(f, "P	{}	{}	{}	{}", uid, kind, error_code, path);
+        }
+    }
 }
 
 impl Drop for ThreadLocalState {
@@ -143,8 +154,20 @@ impl Drop for ThreadLocalState {
             for (uid, files) in &self.t_uid_files {
                 *g.uid_files.entry(*uid).or_insert(0) += files;
             }
-            g.permission_issues.extend(self.t_perm_issues.drain(..));
+            g.permission_issues_count += self.t_perm_issues;
         }
+    }
+}
+
+fn error_code_from_message(msg: &str) -> &'static str {
+    if msg.contains("os error 13") || msg.to_ascii_lowercase().contains("permission denied") {
+        "EACCES"
+    } else if msg.contains("os error 2") || msg.to_ascii_lowercase().contains("no such file") {
+        "ENOENT"
+    } else if msg.contains("os error 5") {
+        "EIO"
+    } else {
+        "EOTHER"
     }
 }
 
@@ -166,8 +189,7 @@ fn scan_disk(
     let global_stats = Arc::new(Mutex::new(GlobalStats {
         total_files: 0, total_dirs: 0, total_inodes: 0, total_size: 0,
         uid_sizes: HashMap::new(), uid_files: HashMap::new(),
-        // dir_sizes removed — streamed to per-thread TSV files
-        permission_issues: Vec::new(),
+        permission_issues_count: 0,
     }));
     let prog_files = Arc::new(AtomicU64::new(0));
     let prog_dirs  = Arc::new(AtomicU64::new(0));
@@ -216,7 +238,7 @@ fn scan_disk(
                     t_uid_files: HashMap::new(),
                     t_event_buf: Vec::new(),
                     t_event_flush_count: 0,
-                    t_perm_issues: Vec::new(),
+                    t_perm_issues: 0,
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),
                     prog_dirs:  pd_clone.clone(),
@@ -240,18 +262,8 @@ fn scan_disk(
                                 .map(|idx| err_str[..idx].to_string())
                                 .unwrap_or_default();
                             
-                            let uid_opt = if !path_str.is_empty() {
-                                fs::symlink_metadata(&path_str).map(|m| m.uid()).ok()
-                            } else {
-                                None
-                            };
-
-                            state.t_perm_issues.push((
-                                path_str,
-                                "directory".to_string(),
-                                err_str,
-                                uid_opt,
-                            ));
+                            state.t_perm_issues += 1;
+                            state.flush_permission_issue(&path_str, "directory", error_code_from_message(&err_str));
                             return WalkState::Continue;
                         }
                     };
@@ -307,13 +319,9 @@ fn scan_disk(
                         let meta = match entry.metadata() {
                             Ok(m) => m,
                             Err(e) => {
-                                let uid_opt = fs::symlink_metadata(path).map(|m| m.uid()).ok();
-                                state.t_perm_issues.push((
-                                    path.to_string_lossy().into_owned(),
-                                    "file".to_string(),
-                                    e.to_string(),
-                                    uid_opt,
-                                ));
+                                state.t_perm_issues += 1;
+                                let path_str = path.to_string_lossy().into_owned();
+                                state.flush_permission_issue(&path_str, "file", error_code_from_message(&e.to_string()));
                                 return WalkState::Continue;
                             }
                         };
@@ -406,21 +414,7 @@ fn scan_disk(
     for (uid, files) in &g.uid_files { py_uid_files.set_item(uid, files)?; }
     result.set_item("uid_files", py_uid_files)?;
 
-    // permission_issues as list of dicts (path, type, error, uid)
-    let py_perms = PyList::empty(py);
-    for (path, kind, err, uid_opt) in &g.permission_issues {
-        let d = PyDict::new(py);
-        d.set_item("path", path)?;
-        d.set_item("type", kind)?;
-        d.set_item("error", err)?;
-        if let Some(uid) = uid_opt {
-            d.set_item("uid", uid)?;
-        } else {
-            d.set_item("uid", py.None())?;
-        }
-        py_perms.append(d)?;
-    }
-    result.set_item("permission_issues", py_perms)?;
+    result.set_item("permission_issues_count", g.permission_issues_count)?;
 
     Ok(result.into())
 }

@@ -161,7 +161,12 @@ class ReportGenerator:
                 "other_usage": scan_result.other_usage
             }
 
-            if hasattr(scan_result, 'permission_issues'):
+            # Permission issues JSON is generated natively by Rust Phase 2 via TSV stream.
+            # Fall back to Python generation only if the file is absent.
+            perm_path = self._get_output_filename("permission_issues")
+            if os.path.exists(perm_path):
+                print(f"Permission issues report saved to: {perm_path}")
+            elif hasattr(scan_result, 'permission_issues'):
                 self.generate_permission_issues_report(scan_result)
 
             if hasattr(scan_result, 'user_inodes'):
@@ -338,6 +343,7 @@ class ReportGenerator:
         if self.debug:
             phase2_mem_end = self._get_rss_mb()
             print(f"  [Phase 2] Detail manifest ready: {unified_path}")
+            print(f"  [Phase 2] User details ready: {os.path.join(detail_dir, 'users')}")
             print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
             print(
                 f"[Phase 2] RAM end: {phase2_mem_end:.1f} MB "
@@ -347,6 +353,7 @@ class ReportGenerator:
         else:
             print(f"Reports generated in {phase2_elapsed:.2f}s ({int(total_files):,} files):")
             print(f"  Detail manifest: {unified_path}")
+            print(f"  User details: {os.path.join(detail_dir, 'users')}")
             print(f"  TreeMap JSON: {tree_json_path}")
             print(f"  TreeMap data: {tree_data_path}")
         return sorted(created)

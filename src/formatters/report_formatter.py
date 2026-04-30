@@ -280,6 +280,7 @@ class ReportFormatter(BaseFormatter):
         data: Dict[str, Any] = {
             "date": int(manifest.get("scan_date", root_manifest.get("scan", {}).get("timestamp", 0)) or 0),
             "user": user,
+            "directory": root_manifest.get("scan", {}).get("root", ""),
             "total_dirs": int(summary.get("total_dirs", 0) or 0),
             "total_files": int(summary.get("total_files", 0) or 0),
             "total_used": int(summary.get("total_used", 0) or 0),

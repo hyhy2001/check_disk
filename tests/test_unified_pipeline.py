@@ -69,6 +69,17 @@ def _build_unified_fixture(tmp_path):
         + "\n",
         encoding="utf-8",
     )
+    (detail_tmpdir / "perm_t1.tsv").write_text(
+        "\n".join(
+            [
+                f"P\t1000\tdirectory\tEACCES\t{tmp_path / 'secret'}",
+                f"P\t1001\tfile\tENOENT\t{tmp_path / 'ghost.txt'}",
+                f"P\t0\tdirectory\tEIO\t{tmp_path / 'bad_disk'}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     cfg = {
         "directory": str(tmp_path),
@@ -198,3 +209,27 @@ def test_cli_check_users_uses_data_detail_manifest(tmp_path):
     assert file_files["alice"] == expected
     assert dir_files["missing"] == expected
     assert file_files["missing"] == expected
+
+def test_unified_json_outputs_permission_issues(tmp_path):
+    _, _, detail_manifest, _, _ = _build_unified_fixture(tmp_path)
+    perm_path = detail_manifest.parent.parent / "permission_issues.json"
+    assert perm_path.exists()
+    
+    perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
+    issues = perm_data["permission_issues"]
+    assert issues["count"] == 3
+    
+    users = sorted(issues["users"], key=lambda u: u["name"])
+    assert len(users) == 2
+    assert users[0]["name"] == "alice"
+    assert users[0]["inaccessible_items"][0]["type"] == "directory"
+    assert users[0]["inaccessible_items"][0]["error"] == "EACCES"
+    
+    assert users[1]["name"] == "bob"
+    assert users[1]["inaccessible_items"][0]["type"] == "file"
+    assert users[1]["inaccessible_items"][0]["error"] == "ENOENT"
+    
+    unknown = issues["unknown_items"]
+    assert len(unknown) == 1
+    assert unknown[0]["type"] == "directory"
+    assert unknown[0]["error"] == "EIO"

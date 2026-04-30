@@ -48,6 +48,7 @@ struct FileChunkResult {
     top_files: Vec<(u64, String)>,
 }
 
+
 struct UserBuildResult {
     username: String,
     team_id: String,
@@ -55,6 +56,15 @@ struct UserBuildResult {
     total_files: i64,
     total_used: i64,
 }
+
+#[derive(Clone)]
+struct PermissionEvent {
+    uid: u32,
+    kind: String,
+    errcode: String,
+    path: String,
+}
+
 
 #[pyfunction(signature = (tmpdir, uids_map, team_map, unified_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, debug=false))]
 #[allow(clippy::too_many_arguments)]
@@ -87,6 +97,11 @@ pub fn build_unified_dbs(
         recreate_dir(&tree_data_dir)?;
 
         let scan_events = read_scan_events(&tmpdir)?;
+
+        // Read permission events from TSV (written by Phase 1)
+        let perm_events = read_permission_events(&tmpdir).unwrap_or_default();
+
+
         let mut dir_sizes: HashMap<String, HashMap<String, i64>> = HashMap::new();
         let mut dir_owner_map: HashMap<String, String> = HashMap::new();
         let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
@@ -174,12 +189,19 @@ pub fn build_unified_dbs(
         let total_files_processed: i64 = user_results.iter().map(|u| u.total_files).sum();
         write_detail_manifest(&detail_root, &user_results, &treemap_root, timestamp, total_files_processed)?;
 
+        // Write permission issues report from Phase 1 TSV data
+        let perm_path = detail_root.parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        write_permission_issues_json(&perm_events, &uids_map, &perm_path, &treemap_root, timestamp)?;
+
         if debug {
             println!(
-                "JSON/NDJSON outputs built in {:.2}s with {} detail workers. Total files: {}",
+                "JSON/NDJSON outputs built in {:.2}s with {} detail workers. Total files: {}, perms: {}",
                 t_all.elapsed().as_secs_f64(),
                 detail_workers,
-                total_files_processed
+                total_files_processed,
+                perm_events.len()
             );
         }
         Ok(total_files_processed as u64)
@@ -255,6 +277,42 @@ fn parent_path(path: &str) -> Option<String> {
     } else {
         Some(path[..slash_pos].to_string())
     }
+}
+
+
+fn read_permission_events(tmpdir: &str) -> PyResult<Vec<PermissionEvent>> {
+    let pattern = format!("{}/perm_t*.tsv", tmpdir);
+    let mut paths: Vec<PathBuf> = glob::glob(&pattern)
+        .map_err(|e| PyRuntimeError::new_err(format!("glob perm: {}", e)))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    paths.sort();
+
+    let mut events = Vec::new();
+    for path in paths {
+        let f = fs::File::open(&path)
+            .map_err(|e| PyRuntimeError::new_err(format!("open perm {}: {}", path.display(), e)))?;
+        for line in BufReader::new(f).lines() {
+            let line = line.map_err(|e| PyRuntimeError::new_err(format!("read perm {}: {}", path.display(), e)))?;
+            if let Some(evt) = parse_permission_line(&line) {
+                events.push(evt);
+            }
+        }
+    }
+    Ok(events)
+}
+
+fn parse_permission_line(line: &str) -> Option<PermissionEvent> {
+    // Format: P\tuid\tkind\terrcode\tpath
+    let mut parts = line.splitn(5, '\t');
+    if parts.next()? != "P" {
+        return None;
+    }
+    let uid = parts.next()?.parse::<u32>().ok()?;
+    let kind = parts.next()?.to_string();
+    let errcode = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    Some(PermissionEvent { uid, kind, errcode, path })
 }
 
 fn build_output_jobs(
@@ -709,6 +767,57 @@ fn tm_parent(path: &str) -> &str {
     }
 }
 
+
+
+
+fn write_permission_issues_json(
+    events: &[PermissionEvent],
+    uids_map: &HashMap<u32, String>,
+    output_dir: &Path,
+    directory: &str,
+    timestamp: i64,
+) -> PyResult<()> {
+    let out_path = output_dir.join("permission_issues.json");
+
+    let mut users_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut unknown_items: Vec<serde_json::Value> = Vec::new();
+
+    for evt in events {
+        let item = json!({
+            "path": evt.path,
+            "type": evt.kind,
+            "error": evt.errcode,
+        });
+        let owner = uids_map.get(&evt.uid)
+            .cloned()
+            .unwrap_or_else(|| if evt.uid == 0 { "unknown".to_string() } else { format!("uid-{}", evt.uid) });
+        if owner == "unknown" {
+            unknown_items.push(item);
+        } else {
+            users_map.entry(owner).or_default().push(item);
+        }
+    }
+
+    let mut users: Vec<serde_json::Value> = users_map
+        .into_iter()
+        .map(|(name, items)| json!({"name": name, "inaccessible_items": items}))
+        .collect();
+    users.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+
+    let report = json!({
+        "date": timestamp,
+        "directory": directory,
+        "permission_issues": {
+            "users": users,
+            "unknown_items": unknown_items,
+            "count": events.len(),
+        }
+    });
+
+    ensure_dir(out_path.parent().unwrap_or(Path::new(".")))?;
+    write_json_file(&out_path, &report)?;
+    Ok(())
+}
 fn tm_basename(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed == "/" || trimmed.is_empty() {

@@ -184,3 +184,60 @@ class TestFormatSize:
     ])
     def test_format_size_units(self, size, expected):
         assert format_size(size) == expected, f"format_size({size}) != {expected!r}"
+
+
+# ── Permission issues shaping ─────────────────────────────────────────────────
+
+class TestPermissionIssuesShape:
+    """Verify the ScanResult.permission_issues dict shape that downstream expects."""
+
+    def _make_result(self, perm_formatted):
+        return ScanResult(
+            general_system={"total": 1, "used": 1, "available": 0},
+            team_usage=[],
+            user_usage=[],
+            other_usage=[],
+            timestamp=0,
+            permission_issues=perm_formatted,
+        )
+
+    def test_permission_issues_has_users_key(self):
+        result = self._make_result({"users": [], "unknown_items": [], "count": 0})
+        assert "users" in result.permission_issues
+
+    def test_permission_issues_has_unknown_items_key(self):
+        result = self._make_result({"users": [], "unknown_items": [], "count": 0})
+        assert "unknown_items" in result.permission_issues
+
+    def test_permission_issues_has_count(self):
+        perm = {"users": [], "unknown_items": [], "count": 5}
+        result = self._make_result(perm)
+        assert result.permission_issues["count"] == 5
+
+    def test_permission_issues_user_entry_shape(self):
+        user_entry = {"name": "alice", "inaccessible_items": [{"path": "/x", "type": "file", "error": "EACCES"}]}
+        result = self._make_result({"users": [user_entry], "unknown_items": [], "count": 1})
+        user = result.permission_issues["users"][0]
+        assert "name" in user
+        assert "inaccessible_items" in user
+        item = user["inaccessible_items"][0]
+        assert "path" in item and "type" in item and "error" in item
+
+
+# ── display_targeted_summary smoke test ───────────────────────────────────────
+
+class TestTargetedScanDisplay:
+    """Smoke test that DiskScanner._display_targeted_summary runs without crash."""
+
+    def test_targeted_summary_no_crash(self, minimal_config):
+        if not _HAS_FAST_SCANNER:
+            pytest.skip("fast_scanner is not importable")
+        scanner = DiskScanner(minimal_config, max_workers=1)
+        scanner.general_system = {"total": 100, "used": 50, "available": 50}
+        scanner.user_usage_results = {"root": 40}
+        scanner.user_inode_list = [{"name": "root", "inodes": 100}]
+        scanner.team_usage_results = {}
+        scanner.other_usage_results = {}
+        scanner.permission_issues = {}
+        # Should not raise
+        scanner._display_targeted_summary()

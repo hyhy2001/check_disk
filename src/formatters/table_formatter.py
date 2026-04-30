@@ -38,34 +38,54 @@ class TableFormatter(BaseFormatter):
         # Assemble the table
         return self._assemble_table(headers, rows, col_widths, table_components, title)
 
+    # Minimum guaranteed width for "small" columns (size, percent, count …)
+    _SMALL_COL_MIN = 12
+
     def _calculate_column_widths(self, headers: List[str], rows: List[List[str]], max_width: int) -> List[int]:
-        """Calculate and adjust column widths based on content and terminal constraints."""
-        # Calculate initial column widths
+        """Calculate and adjust column widths based on content and terminal constraints.
+
+        Strategy:
+        - First compute natural widths.
+        - Identify which columns hold short numeric/size values (≤ _SMALL_COL_MIN chars)
+          and protect them from reduction.
+        - Only shrink long path/name columns to satisfy the max_width budget.
+        """
+        # 1. Natural widths
         col_widths = [len(h) for h in headers]
         for row in rows:
             for i, cell in enumerate(row):
                 if i < len(col_widths):
                     col_widths[i] = max(col_widths[i], len(str(cell)))
 
-        # Adjust column widths if the table is too wide
         total_width = sum(col_widths) + (3 * len(headers)) - 1
-        if total_width > max_width:
-            # Calculate how much we need to reduce
-            excess = total_width - max_width
+        if total_width <= max_width:
+            return col_widths
 
-            # Distribute the reduction proportionally among columns
-            total_width_original = total_width
-            for i in range(len(col_widths)):
-                proportion = col_widths[i] / total_width_original
-                reduction = int(excess * proportion)
-                col_widths[i] = max(5, col_widths[i] - reduction)  # Ensure minimum width of 5
+        # 2. Mark columns that must stay at their natural width (they are small / numeric).
+        #    A column is "protected" when its natural width is ≤ _SMALL_COL_MIN, meaning it
+        #    already fits nicely and truncating would make it unreadable.
+        protected = [w <= self._SMALL_COL_MIN for w in col_widths]
 
-            # Recalculate total width
-            total_width = sum(col_widths) + (3 * len(headers)) - 1
+        # 3. Only shrink un-protected columns, largest first.
+        excess = total_width - max_width
+        shrinkable = sorted(
+            [(i, col_widths[i]) for i, prot in enumerate(protected) if not prot],
+            key=lambda x: -x[1]
+        )
 
-            # If still too wide, reduce the last column more
-            if total_width > max_width and len(col_widths) > 0:
-                col_widths[-1] = max(5, col_widths[-1] - (total_width - max_width))
+        for idx, natural_w in shrinkable:
+            if excess <= 0:
+                break
+            # Maximum we can remove from this column (keep at least 10 chars for readability)
+            can_remove = max(0, col_widths[idx] - 10)
+            remove = min(can_remove, excess)
+            col_widths[idx] -= remove
+            excess -= remove
+
+        # 4. If still over budget (all shrinkable cols are at min), take from last col
+        total_width = sum(col_widths) + (3 * len(headers)) - 1
+        if total_width > max_width and len(col_widths) > 0:
+            col_widths[0] = max(5, col_widths[0] - (total_width - max_width))
 
         return col_widths
 

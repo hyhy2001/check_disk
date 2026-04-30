@@ -1,7 +1,6 @@
 """
 Disk Scanner Module - Optimized Version
 """
-import glob as glob_module
 import os
 import time
 from collections import defaultdict
@@ -61,7 +60,6 @@ class DiskScanner:
     """Proxy class routing scanning to the high-performance Rust core or Python fallback"""
 
     def __init__(self, config: Dict[str, Any], max_workers: int = None, debug: bool = False):
-        import os
         self.config = config
         self.max_workers = (
             max_workers if max_workers
@@ -182,7 +180,6 @@ class DiskScanner:
 
             uid_value = item.get("uid")
             if uid_value is not None:
-                # Dùng uid trực tiếp kết hợp bộ đệm `uid_cache` để lấy chuẩn user name
                 owner = uid_cache.get(uid_value, get_username_from_uid(uid_value, uid_cache))
             else:
                 owner = "unknown"
@@ -191,10 +188,14 @@ class DiskScanner:
                 continue
             perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
 
-        # Format into users and unknown_items exactly like legacy Python expected output
+        # New Rust path: Phase 1 may only return permission_issues_count to keep RAM bounded.
+        # Keep backward-compatible report shape by exposing empty lists plus count.
+        permission_issues_count = int(result.get("permission_issues_count", len(rust_perm_flat)))
+
         perm_formatted = {
             "users": [],
-            "unknown_items": perm_by_user.get("unknown", [])
+            "unknown_items": perm_by_user.get("unknown", []),
+            "count": permission_issues_count,
         }
         for owner, issues in sorted(perm_by_user.items()):
             if owner != "unknown":
@@ -220,8 +221,12 @@ class DiskScanner:
         self.team_usage_results = team_usage_results
         self.user_usage_results = user_usage_results
         self.other_usage_results = other_usage_results
+        self.user_inode_list = user_inode_list
         self.permission_issues = perm_by_user
-        self._display_scan_summary()
+        if self.config.get('target_users_only', False):
+            self._display_targeted_summary()
+        else:
+            self._display_scan_summary()
 
         return ScanResult(
             general_system=system_info,
@@ -238,6 +243,32 @@ class DiskScanner:
         )
 
 
+
+    def _display_targeted_summary(self) -> None:
+        """Display a specialized summary for targeted scans (--user)."""
+        from .formatters.table_formatter import TableFormatter
+        table_formatter = TableFormatter()
+
+        target_names = [u["name"] for u in self.config.get("users", [])]
+        print(f"\nTargeted scan summary for user(s): {', '.join(target_names)}")
+
+        headers = ["Username", "Disk Usage", "Inodes", "Percent"]
+        rows = []
+        total_capacity = self.general_system.get('total', 1)
+
+        # Get inode counts mapped by username
+        inode_map = {item["name"]: item["inodes"] for item in getattr(self, "user_inode_list", [])}
+
+        for user in target_names:
+            size = self.user_usage_results.get(user, 0)
+            inodes = inode_map.get(user, 0)
+            percent = (size / total_capacity) * 100
+            usage_bar = self._create_usage_bar(percent, width=15)
+            rows.append([user, format_size(size), f"{inodes:,}", f"{usage_bar} {percent:.1f}%"])
+
+        if rows:
+            table = table_formatter.format_table(headers, rows, title="Targeted User Usage")
+            print(table)
     def _display_scan_summary(self) -> None:
         """Display a summary of the scan results."""
         # Import TableFormatter here to avoid circular imports
