@@ -23,7 +23,6 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_size: u64,
     pub(crate) t_uid_sizes: HashMap<u32, u64>,
     pub(crate) t_uid_files: HashMap<u32, u64>,
-    pub(crate) t_event_buf: String,
     pub(crate) t_event_bin_buf: Vec<u8>,
     pub(crate) t_event_buf_records: usize,
     pub(crate) t_event_flush_count: u32,
@@ -61,13 +60,13 @@ impl ThreadLocalState {
     }
 
     pub(crate) fn flush_events(&mut self) {
-        if self.t_event_buf.is_empty() && self.t_event_bin_buf.is_empty() {
+        if self.t_event_bin_buf.is_empty() {
             return;
         }
         self.t_event_flush_count += 1;
         self.prof_flush_count.fetch_add(1, Ordering::Relaxed);
         let flush_start = Instant::now();
-        let bytes_written = (self.t_event_buf.len() + self.t_event_bin_buf.len()) as u64;
+        let bytes_written = self.t_event_bin_buf.len() as u64;
 
         if !self.t_event_bin_buf.is_empty() {
             let fp = format!("{}/scan_t{}_c{}.bin", self.tmpdir, self.thread_id, self.t_event_flush_count);
@@ -77,22 +76,10 @@ impl ThreadLocalState {
             }
         }
 
-        if !self.t_event_buf.is_empty() {
-            let fp = format!("{}/scan_t{}_c{}.tsv", self.tmpdir, self.thread_id, self.t_event_flush_count);
-            if let Ok(f) = fs::File::create(&fp) {
-                let mut w = BufWriter::new(f);
-                let _ = w.write_all(self.t_event_buf.as_bytes());
-            }
-        }
-
         self.prof_flush_ns.fetch_add(flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.prof_flush_bytes.fetch_add(bytes_written, Ordering::Relaxed);
-        self.t_event_buf.clear();
         self.t_event_bin_buf.clear();
         self.t_event_buf_records = 0;
-        if self.t_event_buf.capacity() > 64 * 1024 * 1024 {
-            self.t_event_buf.shrink_to(8 * 1024 * 1024);
-        }
         if self.t_event_bin_buf.capacity() > 64 * 1024 * 1024 {
             self.t_event_bin_buf.shrink_to(8 * 1024 * 1024);
         }

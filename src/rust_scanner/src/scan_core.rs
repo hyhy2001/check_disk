@@ -4,7 +4,6 @@ use pyo3::types::PyDict;
 use ignore::{WalkBuilder, WalkState};
 use dashmap::DashSet;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
@@ -102,7 +101,6 @@ pub(crate) fn run_scan_core(
                     t_files: 0, t_dirs: 0, t_inodes: 0, t_size: 0,
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
-                    t_event_buf: String::with_capacity(8 * 1024 * 1024),
                     t_event_bin_buf: Vec::with_capacity(8 * 1024 * 1024),
                     t_event_buf_records: 0,
                     t_event_flush_count: 0,
@@ -238,14 +236,12 @@ pub(crate) fn run_scan_core(
                             let path_start = Instant::now();
                             let path_owned = path.to_string_lossy();
                             state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            // Keep TSV for compatibility fallback and write binary production segments in parallel.
-                            let _ = writeln!(&mut state.t_event_buf, "F\t{}\t{}\t{}", uid, size, path_owned);
                             state.push_event_binary(uid, size, &path_owned);
                             state.t_event_buf_records += 1;
                             state.prof_max_event_buf_records.fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
-                            state.prof_max_event_buf_bytes.fetch_max(state.t_event_buf.len() as u64, Ordering::Relaxed);
+                            state.prof_max_event_buf_bytes.fetch_max(state.t_event_bin_buf.len() as u64, Ordering::Relaxed);
                             if state.t_event_buf_records >= SCAN_EVENT_FLUSH_THRESHOLD
-                                || state.t_event_buf.len() >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
+                                || state.t_event_bin_buf.len() >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
                             {
                                 state.flush_events();
                             }
