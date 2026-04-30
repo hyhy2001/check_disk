@@ -48,7 +48,7 @@ where
         let f = fs::File::open(path)
             .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", path.display(), e)))?;
         let mut reader = BufReader::with_capacity(8 * 1024 * 1024, f);
-        let mut header = [0u8; 17];
+        let mut header = [0u8; 16];
         loop {
             match reader.read_exact(&mut header) {
                 Ok(_) => {}
@@ -61,17 +61,9 @@ where
                     )))
                 }
             }
-            let tag = header[0];
-            if tag != 1 {
-                return Err(PyRuntimeError::new_err(format!(
-                    "invalid scan bin tag {} in {}",
-                    tag,
-                    path.display()
-                )));
-            }
-            let uid = u32::from_le_bytes(header[1..5].try_into().unwrap());
-            let size = u64::from_le_bytes(header[5..13].try_into().unwrap());
-            let path_len = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
+            let uid = u32::from_le_bytes(header[0..4].try_into().unwrap());
+            let size = u64::from_le_bytes(header[4..12].try_into().unwrap());
+            let path_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
             let mut path_bytes = vec![0u8; path_len];
             reader.read_exact(&mut path_bytes).map_err(|e| {
                 PyRuntimeError::new_err(format!("read path {}: {}", path.display(), e))

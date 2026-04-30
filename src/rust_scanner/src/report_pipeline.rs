@@ -201,7 +201,10 @@ pub fn build_pipeline_dbs_impl(
         t_dir_build = t1.elapsed().as_secs_f64();
 
         let t2 = Instant::now();
-        eprintln!("[Phase 2] Building file chunks & sorting per user ({} users)...", rows_by_user.len());
+        eprintln!(
+            "[Phase 2] Building file chunks per user ({} users)...",
+            rows_by_user.len()
+        );
         let (user_metas, chunk_jobs) =
             build_output_jobs(&detail_root, users, rows_by_user, &team_map, timestamp);
         t_output_jobs = t2.elapsed().as_secs_f64();

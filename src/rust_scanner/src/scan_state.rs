@@ -24,10 +24,10 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_uid_sizes: HashMap<u32, u64>,
     pub(crate) t_uid_files: HashMap<u32, u64>,
     pub(crate) t_dir_sizes: HashMap<(u32, String), i64>,
-    pub(crate) t_event_bin_buf: Vec<u8>,
-    pub(crate) t_event_buf_records: usize,
+    pub(crate) t_event_bin_bufs: Vec<Vec<u8>>,
+    pub(crate) t_event_buf_records: Vec<usize>,
     pub(crate) t_event_flush_count: u32,
-    pub(crate) event_bin_writer: Option<BufWriter<fs::File>>,
+    pub(crate) event_bin_writers: Vec<Option<BufWriter<fs::File>>>,
     pub(crate) t_perm_issues: u64,
     pub(crate) global_stats: Arc<Mutex<GlobalStats>>,
     pub(crate) prog_files: Arc<AtomicU64>,
@@ -55,6 +55,11 @@ pub(crate) struct ThreadLocalState {
 
 impl ThreadLocalState {
     const PROGRESS_FLUSH_THRESHOLD: u64 = 4096;
+    pub(crate) const EVENT_BUCKETS: usize = 4;
+
+    fn bucket_for_uid(uid: u32) -> usize {
+        (uid as usize) % Self::EVENT_BUCKETS
+    }
 
     pub(crate) fn add_progress(&mut self, files: u64, dirs: u64, size: u64) {
         self.pending_prog_files += files;
@@ -84,18 +89,19 @@ impl ThreadLocalState {
         }
     }
 
-    pub(crate) fn push_event_binary(&mut self, tag: u8, uid: u32, size: u64, path: &str) {
+    pub(crate) fn push_event_binary(&mut self, _tag: u8, uid: u32, size: u64, path: &str) {
         // Record format:
-        // [tag:u8][uid:u32 LE][size:u64 LE][path_len:u32 LE][path_bytes]
-        self.t_event_bin_buf.push(tag);
-        self.t_event_bin_buf.extend_from_slice(&uid.to_le_bytes());
-        self.t_event_bin_buf.extend_from_slice(&size.to_le_bytes());
+        // [uid:u32 LE][size:u64 LE][path_len:u32 LE][path_bytes]
+        let bucket = Self::bucket_for_uid(uid);
+        let buf = &mut self.t_event_bin_bufs[bucket];
+        buf.extend_from_slice(&uid.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
         let path_bytes = path.as_bytes();
         let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
-        self.t_event_bin_buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
         let safe_len = usize::try_from(len).unwrap_or(path_bytes.len());
-        self.t_event_bin_buf
-            .extend_from_slice(&path_bytes[..safe_len.min(path_bytes.len())]);
+        buf.extend_from_slice(&path_bytes[..safe_len.min(path_bytes.len())]);
+        self.t_event_buf_records[bucket] += 1;
     }
 
     pub(crate) fn add_dir_size(&mut self, uid: u32, size: u64, path: &str) {
@@ -109,39 +115,54 @@ impl ThreadLocalState {
     }
 
     pub(crate) fn flush_events(&mut self) {
-        if self.t_event_bin_buf.is_empty() {
+        if self.event_buffer_bytes() == 0 {
             return;
         }
-        self.t_event_flush_count += 1;
-        if self.profile_enabled {
-            self.prof_flush_count.fetch_add(1, Ordering::Relaxed);
-        }
         let flush_start = self.profile_enabled.then(Instant::now);
-        let bytes_written = self.t_event_bin_buf.len() as u64;
+        let mut bytes_written: u64 = 0;
+        let mut flushes: u64 = 0;
 
-        if !self.t_event_bin_buf.is_empty() {
-            if self.event_bin_writer.is_none() {
-                let fp = format!("{}/scan_t{}.bin", self.tmpdir, self.thread_id);
+        for bucket in 0..Self::EVENT_BUCKETS {
+            if self.t_event_bin_bufs[bucket].is_empty() {
+                continue;
+            }
+            if self.event_bin_writers[bucket].is_none() {
+                let fp = format!("{}/scan_t{}_b{}.bin", self.tmpdir, self.thread_id, bucket);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                    self.event_bin_writer = Some(BufWriter::with_capacity(16 * 1024 * 1024, f));
+                    self.event_bin_writers[bucket] =
+                        Some(BufWriter::with_capacity(16 * 1024 * 1024, f));
                 }
             }
-            if let Some(writer) = self.event_bin_writer.as_mut() {
-                let _ = writer.write_all(&self.t_event_bin_buf);
+            if let Some(writer) = self.event_bin_writers[bucket].as_mut() {
+                let _ = writer.write_all(&self.t_event_bin_bufs[bucket]);
+                bytes_written += self.t_event_bin_bufs[bucket].len() as u64;
+                self.t_event_bin_bufs[bucket].clear();
+                self.t_event_buf_records[bucket] = 0;
+                flushes += 1;
+            }
+            if self.t_event_bin_bufs[bucket].capacity() > 128 * 1024 * 1024 {
+                self.t_event_bin_bufs[bucket].shrink_to(64 * 1024 * 1024);
             }
         }
+        self.t_event_flush_count += flushes as u32;
 
         if let Some(start) = flush_start {
+            if self.profile_enabled {
+                self.prof_flush_count.fetch_add(flushes, Ordering::Relaxed);
+            }
             self.prof_flush_ns
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             self.prof_flush_bytes
                 .fetch_add(bytes_written, Ordering::Relaxed);
         }
-        self.t_event_bin_buf.clear();
-        self.t_event_buf_records = 0;
-        if self.t_event_bin_buf.capacity() > 128 * 1024 * 1024 {
-            self.t_event_bin_buf.shrink_to(64 * 1024 * 1024);
-        }
+    }
+
+    pub(crate) fn event_buffer_bytes(&self) -> usize {
+        self.t_event_bin_bufs.iter().map(Vec::len).sum()
+    }
+
+    pub(crate) fn event_records(&self) -> usize {
+        self.t_event_buf_records.iter().sum()
     }
 
     pub(crate) fn flush_permission_issue(&mut self, path: &str, kind: &str, error_code: &str) {
@@ -191,8 +212,10 @@ impl Drop for ThreadLocalState {
         self.flush_progress();
         self.flush_events();
         self.flush_dir_aggregates();
-        if let Some(writer) = self.event_bin_writer.as_mut() {
-            let _ = writer.flush();
+        for writer in &mut self.event_bin_writers {
+            if let Some(w) = writer.as_mut() {
+                let _ = w.flush();
+            }
         }
         if let Some(writer) = self.perm_writer.as_mut() {
             let _ = writer.flush();

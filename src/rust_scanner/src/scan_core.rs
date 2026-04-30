@@ -114,10 +114,12 @@ pub(crate) fn run_scan_core(
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
                     t_dir_sizes: HashMap::new(),
-                    t_event_bin_buf: Vec::with_capacity(8 * 1024 * 1024),
-                    t_event_buf_records: 0,
+                    t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
+                        .map(|_| Vec::with_capacity(1024 * 1024))
+                        .collect(),
+                    t_event_buf_records: vec![0; ThreadLocalState::EVENT_BUCKETS],
                     t_event_flush_count: 0,
-                    event_bin_writer: None,
+                    event_bin_writers: (0..ThreadLocalState::EVENT_BUCKETS).map(|_| None).collect(),
                     t_perm_issues: 0,
                     global_stats: g_clone.clone(),
                     prog_files: pf_clone.clone(),
@@ -301,18 +303,18 @@ pub(crate) fn run_scan_core(
                             }
                             state.push_event_binary(1, uid, size, path_str);
                             state.add_dir_size(uid, size, path_str);
-                            state.t_event_buf_records += 1;
+                            let total_records = state.event_records();
+                            let total_bytes = state.event_buffer_bytes();
                             if debug {
                                 state
                                     .prof_max_event_buf_records
-                                    .fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
-                                state.prof_max_event_buf_bytes.fetch_max(
-                                    state.t_event_bin_buf.len() as u64,
-                                    Ordering::Relaxed,
-                                );
+                                    .fetch_max(total_records as u64, Ordering::Relaxed);
+                                state
+                                    .prof_max_event_buf_bytes
+                                    .fetch_max(total_bytes as u64, Ordering::Relaxed);
                             }
-                            if state.t_event_buf_records >= SCAN_EVENT_FLUSH_THRESHOLD
-                                || state.t_event_bin_buf.len() >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
+                            if total_records >= SCAN_EVENT_FLUSH_THRESHOLD
+                                || total_bytes >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
                             {
                                 state.flush_events();
                             }
