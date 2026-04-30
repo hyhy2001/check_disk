@@ -422,6 +422,7 @@ fn finalize_user_outputs(
     metas: Vec<UserJobMeta>,
     chunk_results: Vec<FileChunkResult>,
 ) -> Result<Vec<UserBuildResult>, String> {
+    let metas_count = metas.len();
     let mut results_by_user: HashMap<String, Vec<FileChunkResult>> = HashMap::new();
     for result in chunk_results {
         results_by_user.entry(result.username.clone()).or_default().push(result);
@@ -462,13 +463,19 @@ fn finalize_user_outputs(
             .map_err(|e| format!("rename {} -> {}: {}", meta.tmp_dir.display(), meta.final_dir.display(), e))?;
 
         user_results.push(UserBuildResult {
-            username: meta.username,
+            username: meta.username.clone(),
             team_id: meta.team_id,
             total_dirs: meta.total_dirs,
             total_files,
             total_used: meta.total_used,
         });
+        
+        let done = user_results.len();
+        let total = metas_count;
+        let percent = (done as f64 / total as f64) * 100.0;
+        eprint!("\r[Phase 2] Detail reports: {}/{} users ({:.1}%) ... ", done, total, percent);
     }
+    eprintln!(); // newline after progress completes
     Ok(user_results)
 }
 

@@ -339,20 +339,31 @@ class ReportGenerator:
         created = [unified_path, tree_json_path, os.path.join(tree_data_path, "manifest.json")]
         self.cleanup_stale_detail_reports(created)
 
+        detail_users_count = 0
+        try:
+            import json
+            with open(unified_path, "r", encoding="utf-8") as fh:
+                root_manifest = json.load(fh)
+            detail_users_count = len(root_manifest.get("users", []))
+        except Exception:
+            detail_users_count = 0
+
         phase2_elapsed = time.time() - phase2_start
         if self.debug:
             phase2_mem_end = self._get_rss_mb()
             print(f"  [Phase 2] Detail manifest ready: {unified_path}")
+            print(f"  [Phase 2] Users processed: {detail_users_count:,}")
             print(f"  [Phase 2] User details ready: {os.path.join(detail_dir, 'users')}")
             print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
             print(
                 f"[Phase 2] RAM end: {phase2_mem_end:.1f} MB "
                 f"(delta: {phase2_mem_end - phase2_mem_start:+.1f} MB, elapsed: {phase2_elapsed:.2f}s, "
-                f"files: {int(total_files):,})"
+                f"files: {int(total_files):,}, users: {detail_users_count:,})"
             )
         else:
-            print(f"Reports generated in {phase2_elapsed:.2f}s ({int(total_files):,} files):")
+            print(f"Reports generated in {phase2_elapsed:.2f}s ({int(total_files):,} files, {detail_users_count:,} users):")
             print(f"  Detail manifest: {unified_path}")
+            print(f"  Users processed: {detail_users_count:,}")
             print(f"  User details: {os.path.join(detail_dir, 'users')}")
             print(f"  TreeMap JSON: {tree_json_path}")
             print(f"  TreeMap data: {tree_data_path}")

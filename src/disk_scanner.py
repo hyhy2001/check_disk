@@ -99,9 +99,12 @@ class DiskScanner:
         # New Rust ABI supports max_workers as the 4th arg.
         # Keep backward compatibility with old prebuilt .so.
         try:
-            result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers)
+            result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers, self.debug)
         except TypeError:
-            result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
+            try:
+                result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers)
+            except TypeError:
+                result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
         duration = time.time() - start
 
         from .utils import format_size

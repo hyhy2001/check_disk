@@ -6,6 +6,7 @@ use dashmap::DashSet;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::fs;
+use std::fmt::Write as FmtWrite;
 use std::io::{Write, BufWriter};
 use std::time::{Instant, Duration};
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@ const CRITICAL_SKIP_NAMES: &[&str] = &[
     ".nfs",
 ];
 /// Max in-memory raw file events per scan worker before flushing to disk.
-const SCAN_EVENT_FLUSH_THRESHOLD: usize = 500_000;
+const SCAN_EVENT_FLUSH_THRESHOLD: usize = 100_000;
 
 fn format_num(mut n: u64) -> String {
     if n == 0 { return "0".to_string(); }
@@ -95,7 +96,8 @@ struct ThreadLocalState {
     t_size: u64,
     t_uid_sizes: HashMap<u32, u64>,
     t_uid_files: HashMap<u32, u64>,
-    t_event_buf: Vec<(u32, u64, String)>,
+    t_event_buf: String,
+    t_event_buf_records: usize,
     t_event_flush_count: u32,
     t_perm_issues: u64,
     global_stats: Arc<Mutex<GlobalStats>>,
@@ -105,6 +107,15 @@ struct ThreadLocalState {
     tmpdir: String,
     target_uids: Option<HashSet<u32>>,
     thread_id: usize,
+    prof_metadata_ns: Arc<AtomicU64>,
+    prof_path_ns: Arc<AtomicU64>,
+    prof_flush_ns: Arc<AtomicU64>,
+    prof_flush_bytes: Arc<AtomicU64>,
+    prof_flush_count: Arc<AtomicU64>,
+    prof_hardlink_checks: Arc<AtomicU64>,
+    prof_visited_dir_checks: Arc<AtomicU64>,
+    prof_max_event_buf_records: Arc<AtomicU64>,
+    prof_max_event_buf_bytes: Arc<AtomicU64>,
 }
 
 impl ThreadLocalState {
@@ -113,16 +124,20 @@ impl ThreadLocalState {
             return;
         }
         self.t_event_flush_count += 1;
+        self.prof_flush_count.fetch_add(1, Ordering::Relaxed);
+        let flush_start = Instant::now();
+        let bytes_written = self.t_event_buf.len() as u64;
         let fp = format!("{}/scan_t{}_c{}.tsv", self.tmpdir, self.thread_id, self.t_event_flush_count);
         if let Ok(f) = fs::File::create(&fp) {
             let mut w = BufWriter::new(f);
-            for (uid, size, path) in self.t_event_buf.iter() {
-                let _ = writeln!(w, "F\t{}\t{}\t{}", uid, size, path);
-            }
+            let _ = w.write_all(self.t_event_buf.as_bytes());
         }
+        self.prof_flush_ns.fetch_add(flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.prof_flush_bytes.fetch_add(bytes_written, Ordering::Relaxed);
         self.t_event_buf.clear();
-        if self.t_event_buf.capacity() > SCAN_EVENT_FLUSH_THRESHOLD * 2 {
-            self.t_event_buf.shrink_to_fit();
+        self.t_event_buf_records = 0;
+        if self.t_event_buf.capacity() > 64 * 1024 * 1024 {
+            self.t_event_buf.shrink_to(8 * 1024 * 1024);
         }
     }
 
@@ -160,9 +175,9 @@ impl Drop for ThreadLocalState {
 }
 
 fn error_code_from_message(msg: &str) -> &'static str {
-    if msg.contains("os error 13") || msg.to_ascii_lowercase().contains("permission denied") {
+    if msg.contains("os error 13") || msg.contains("Permission denied") || msg.contains("permission denied") {
         "EACCES"
-    } else if msg.contains("os error 2") || msg.to_ascii_lowercase().contains("no such file") {
+    } else if msg.contains("os error 2") || msg.contains("No such file") || msg.contains("no such file") {
         "ENOENT"
     } else if msg.contains("os error 5") {
         "EIO"
@@ -171,13 +186,14 @@ fn error_code_from_message(msg: &str) -> &'static str {
     }
 }
 
-#[pyfunction]
+#[pyfunction(signature = (directory, skip_dirs, target_uids, max_workers=None, debug=false))]
 fn scan_disk(
     py: Python,
     directory: String,
     skip_dirs: Vec<String>,
     target_uids: Option<Vec<u32>>,
     max_workers: Option<usize>,
+    debug: bool,
 ) -> PyResult<PyObject> {
     let _tmpdir = tempfile::Builder::new()
         .prefix("checkdisk_rust_")
@@ -195,6 +211,15 @@ fn scan_disk(
     let prog_dirs  = Arc::new(AtomicU64::new(0));
     let prog_size  = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
+    let prof_metadata_ns = Arc::new(AtomicU64::new(0));
+    let prof_path_ns = Arc::new(AtomicU64::new(0));
+    let prof_flush_ns = Arc::new(AtomicU64::new(0));
+    let prof_flush_bytes = Arc::new(AtomicU64::new(0));
+    let prof_flush_count = Arc::new(AtomicU64::new(0));
+    let prof_hardlink_checks = Arc::new(AtomicU64::new(0));
+    let prof_visited_dir_checks = Arc::new(AtomicU64::new(0));
+    let prof_max_event_buf_records = Arc::new(AtomicU64::new(0));
+    let prof_max_event_buf_bytes = Arc::new(AtomicU64::new(0));
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
@@ -207,6 +232,15 @@ fn scan_disk(
     let dir_clone = directory.clone();
     let skips = skip_dirs.clone();
     let tmpdir_clone = tmpdir_str.clone();
+    let pm_clone = prof_metadata_ns.clone();
+    let pp_clone = prof_path_ns.clone();
+    let pfns_clone = prof_flush_ns.clone();
+    let pfb_clone = prof_flush_bytes.clone();
+    let pfc_clone = prof_flush_count.clone();
+    let ph_clone = prof_hardlink_checks.clone();
+    let pv_clone = prof_visited_dir_checks.clone();
+    let pmaxr_clone = prof_max_event_buf_records.clone();
+    let pmaxb_clone = prof_max_event_buf_bytes.clone();
 
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     // Keep a sane default and let CLI max_workers override explicitly.
@@ -220,6 +254,8 @@ fn scan_disk(
     let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     // Shared directory loop/bind-mount deduplication — DashSet (16 shards by default)
     let visited_dirs: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
+    let hardlink_inodes_profile = hardlink_inodes.clone();
+    let visited_dirs_profile = visited_dirs.clone();
 
     let _walk_thread = thread::spawn(move || {
         WalkBuilder::new(&dir_clone)
@@ -236,7 +272,8 @@ fn scan_disk(
                     t_files: 0, t_dirs: 0, t_inodes: 0, t_size: 0,
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
-                    t_event_buf: Vec::new(),
+                    t_event_buf: String::with_capacity(8 * 1024 * 1024),
+                    t_event_buf_records: 0,
                     t_event_flush_count: 0,
                     t_perm_issues: 0,
                     global_stats: g_clone.clone(),
@@ -246,6 +283,15 @@ fn scan_disk(
                     tmpdir: tmpdir_clone.clone(),
                     target_uids: (*target_uids_shared).clone(),
                     thread_id: tid,
+                    prof_metadata_ns: pm_clone.clone(),
+                    prof_path_ns: pp_clone.clone(),
+                    prof_flush_ns: pfns_clone.clone(),
+                    prof_flush_bytes: pfb_clone.clone(),
+                    prof_flush_count: pfc_clone.clone(),
+                    prof_hardlink_checks: ph_clone.clone(),
+                    prof_visited_dir_checks: pv_clone.clone(),
+                    prof_max_event_buf_records: pmaxr_clone.clone(),
+                    prof_max_event_buf_bytes: pmaxb_clone.clone(),
                 };
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
@@ -297,8 +343,11 @@ fn scan_disk(
                         }
 
                         // --- Bind mount / Loop deduplication ---
+                        let meta_start = Instant::now();
                         if let Ok(meta) = entry.metadata() {
+                            state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             let key = (meta.ino(), meta.dev());
+                            state.prof_visited_dir_checks.fetch_add(1, Ordering::Relaxed);
                             // DashSet.insert() returns false when key already exists
                             if !visited_dirs_shared.insert(key) {
                                 return WalkState::Skip;
@@ -310,15 +359,22 @@ fn scan_disk(
                                     return WalkState::Skip;
                                 }
                             }
+                        } else {
+                            state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
 
                         state.t_dirs += 1;
                         state.t_inodes += 1;
                         state.prog_dirs.fetch_add(1, Ordering::Relaxed);
                     } else if ft.is_file() {
+                        let meta_start = Instant::now();
                         let meta = match entry.metadata() {
-                            Ok(m) => m,
+                            Ok(m) => {
+                                state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                m
+                            },
                             Err(e) => {
+                                state.prof_metadata_ns.fetch_add(meta_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                                 state.t_perm_issues += 1;
                                 let path_str = path.to_string_lossy().into_owned();
                                 state.flush_permission_issue(&path_str, "file", error_code_from_message(&e.to_string()));
@@ -328,6 +384,7 @@ fn scan_disk(
 
                         // --- Hard-link deduplication ---
                         if meta.nlink() > 1 {
+                            state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
                             let key = (meta.ino(), meta.dev());
                             if !hardlinks_shared.insert(key) { return WalkState::Continue; }
                         }
@@ -347,8 +404,14 @@ fn scan_disk(
                         if is_target {
                             *state.t_uid_sizes.entry(uid).or_insert(0) += size;
                             *state.t_uid_files.entry(uid).or_insert(0) += 1;
-                            state.t_event_buf.push((uid, size, path.to_string_lossy().into_owned()));
-                            if state.t_event_buf.len() >= SCAN_EVENT_FLUSH_THRESHOLD {
+                            let path_start = Instant::now();
+                            let path_owned = path.to_string_lossy();
+                            state.prof_path_ns.fetch_add(path_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            let _ = writeln!(&mut state.t_event_buf, "F\t{}\t{}\t{}", uid, size, path_owned);
+                            state.t_event_buf_records += 1;
+                            state.prof_max_event_buf_records.fetch_max(state.t_event_buf_records as u64, Ordering::Relaxed);
+                            state.prof_max_event_buf_bytes.fetch_max(state.t_event_buf.len() as u64, Ordering::Relaxed);
+                            if state.t_event_buf_records >= SCAN_EVENT_FLUSH_THRESHOLD {
                                 state.flush_events();
                             }
                         }
@@ -415,6 +478,33 @@ fn scan_disk(
     result.set_item("uid_files", py_uid_files)?;
 
     result.set_item("permission_issues_count", g.permission_issues_count)?;
+
+    if debug {
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+        let metadata_s = prof_metadata_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        let path_s = prof_path_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        let flush_s = prof_flush_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+        let flush_bytes = prof_flush_bytes.load(Ordering::Relaxed);
+        let flush_count = prof_flush_count.load(Ordering::Relaxed);
+        let hardlink_checks = prof_hardlink_checks.load(Ordering::Relaxed);
+        let visited_checks = prof_visited_dir_checks.load(Ordering::Relaxed);
+        let max_buf_records = prof_max_event_buf_records.load(Ordering::Relaxed);
+        let max_buf_bytes = prof_max_event_buf_bytes.load(Ordering::Relaxed);
+        let hardlink_set_size = hardlink_inodes_profile.len();
+        let visited_set_size = visited_dirs_profile.len();
+        println!("\n[Phase 1 Profile]");
+        println!("  Wall time:          {:.2}s", elapsed);
+        println!("  Metadata time:      {:.2}s aggregate ({:.1}% of worker time)", metadata_s, metadata_s * 100.0 / elapsed);
+        println!("  Path stringify:     {:.2}s aggregate", path_s);
+        println!("  TSV flush time:     {:.2}s aggregate", flush_s);
+        println!("  TSV flushes:        {}", format_num(flush_count));
+        println!("  TSV bytes approx:   {}", format_size(flush_bytes));
+        println!("  Hardlink checks:    {}", format_num(hardlink_checks));
+        println!("  Visited dir checks: {}", format_num(visited_checks));
+        println!("  Max event buffer:   {} records / {}", format_num(max_buf_records), format_size(max_buf_bytes));
+        println!("  Hardlink set size:  {}", format_num(hardlink_set_size as u64));
+        println!("  Visited set size:   {}", format_num(visited_set_size as u64));
+    }
 
     Ok(result.into())
 }
