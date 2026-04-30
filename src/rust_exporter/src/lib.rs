@@ -8,11 +8,24 @@ use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Default)]
 struct JsonItem {
+    #[serde(alias = "p")]
     path: Option<String>,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
     used: Option<u64>,
+    #[serde(default, rename = "s")]
+    short_size: Option<u64>,
+}
+
+impl JsonItem {
+    fn file_size(&self) -> u64 {
+        self.size.or(self.short_size).unwrap_or(0)
+    }
+
+    fn dir_used(&self) -> u64 {
+        self.used.or(self.short_size).unwrap_or(0)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -114,15 +127,17 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
     } else if kind == "dir " {
         if let Ok(data) = serde_json::from_reader::<_, ReportDir>(BufReader::new(f)) {
             for d in data.dirs {
+                let size = d.dir_used();
                 if let Some(path) = d.path {
-                    entries.push(ExportEntry { kind, path, size: d.used.unwrap_or(0) });
+                    entries.push(ExportEntry { kind, path, size });
                 }
             }
         }
     } else if let Ok(data) = serde_json::from_reader::<_, ReportFile>(BufReader::new(f)) {
         for file in data.files {
+            let size = file.file_size();
             if let Some(path) = file.path {
-                entries.push(ExportEntry { kind, path, size: file.size.unwrap_or(0) });
+                entries.push(ExportEntry { kind, path, size });
             }
         }
     }
@@ -131,8 +146,8 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
 fn parse_ndjson_reader(file: File, kind: &'static str, entries: &mut Vec<ExportEntry>) {
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if let Ok(item) = serde_json::from_str::<JsonItem>(&line) {
+            let size = if kind == "dir " { item.dir_used() } else { item.file_size() };
             if let Some(path) = item.path {
-                let size = if kind == "dir " { item.used.unwrap_or(0) } else { item.size.unwrap_or(0) };
                 entries.push(ExportEntry { kind, path, size });
             }
         }

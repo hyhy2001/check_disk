@@ -57,7 +57,7 @@ pub fn build_pipeline_dbs_impl(
         let t1 = Instant::now();
 
         struct LocalAgg {
-            dir_sizes: HashMap<String, Vec<(String, i64)>>,
+            dir_sizes: HashMap<String, HashMap<String, i64>>,
             rows_by_uid: HashMap<u32, Vec<(u64, String)>>,
         }
 
@@ -89,17 +89,7 @@ pub fn build_pipeline_dbs_impl(
                             .unwrap_or_else(|| format!("uid-{}", event.uid));
                         if let Some(parent) = crate::pipe_types::parent_path(&event.path) {
                             let user_sizes = agg.dir_sizes.entry(parent).or_default();
-                            let mut found = false;
-                            for item in user_sizes.iter_mut() {
-                                if item.0 == username {
-                                    item.1 += event.size as i64;
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                user_sizes.push((username, event.size as i64));
-                            }
+                            *user_sizes.entry(username).or_insert(0) += event.size as i64;
                         }
                     });
                     agg
@@ -117,24 +107,18 @@ pub fn build_pipeline_dbs_impl(
                     for (dir, sizes_b) in b.dir_sizes {
                         let sizes_a = a.dir_sizes.entry(dir).or_default();
                         for (username, size) in sizes_b {
-                            let mut found = false;
-                            for item in sizes_a.iter_mut() {
-                                if item.0 == username {
-                                    item.1 += size;
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                sizes_a.push((username, size));
-                            }
+                            *sizes_a.entry(username).or_insert(0) += size;
                         }
                     }
                     a
                 },
             );
 
-        let dir_sizes = merged_agg.dir_sizes;
+        let dir_sizes: HashMap<String, Vec<(String, i64)>> = merged_agg
+            .dir_sizes
+            .into_iter()
+            .map(|(dir, user_map)| (dir, user_map.into_iter().collect()))
+            .collect();
         let rows_by_uid = merged_agg.rows_by_uid;
 
         let mut dir_owner_map: HashMap<String, String> = HashMap::new();
@@ -209,6 +193,8 @@ pub fn build_pipeline_dbs_impl(
             .map_err(PyRuntimeError::new_err)?;
         t_finalize = t4.elapsed().as_secs_f64();
 
+        eprintln!("[Phase 2] Detail reports completed. Starting TreeMap build...");
+
         let t5 = Instant::now();
         write_treemap_json_outputs(
             &treemap_root,
@@ -220,6 +206,7 @@ pub fn build_pipeline_dbs_impl(
             min_size_bytes,
         )?;
         t_tree = t5.elapsed().as_secs_f64();
+        eprintln!("[Phase 2] TreeMap build completed in {:.2}s", t_tree);
 
         user_results.sort_by(|a, b| a.username.cmp(&b.username));
         let total_files_processed: i64 = user_results.iter().map(|u| u.total_files).sum();

@@ -27,6 +27,9 @@ pub fn build_output_jobs(
         rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let tmp_dir = detail_root.join("users").join(format!(".tmp_{}", safe));
         let final_dir = detail_root.join("users").join(&safe);
+        if tmp_dir.exists() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
         for (chunk_index, chunk_rows) in rows.chunks(FILE_PART_RECORDS).enumerate() {
             chunk_jobs.push(FileChunkJob {
                 username: username.clone(),

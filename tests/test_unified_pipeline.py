@@ -51,24 +51,24 @@ def test_scan_status_heartbeat_syncs_periodically(tmp_path):
 def _build_unified_fixture(tmp_path):
     import src.report_generator as report_generator_module
 
-    if not report_generator_module.HAS_RUST_UNIFIED_DB:
-        pytest.skip("fast_scanner.build_unified_dbs is not available")
+    if not report_generator_module.HAS_RUST_PIPELINE:
+        pytest.skip("fast_scanner.build_pipeline is not available")
 
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()
-    (detail_tmpdir / "scan_t1_c1.tsv").write_text(
-        "\n".join(
-            [
-                f"F\t1000\t4096\t{tmp_path / 'alpha.txt'}",
-                f"F\t1000\t2048\t{tmp_path / 'sub' / 'shared.log'}",
-                f"F\t1000\t512\t{tmp_path / 'sub' / 'same.bin'}",
-                f"F\t1001\t8192\t{tmp_path / 'other' / 'alpha.txt'}",
-                f"F\t1001\t1024\t{tmp_path / 'other' / 'logs' / 'shared.log'}",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        def write_bin(uid, size, path_str):
+            f.write(b'\x01')
+            f.write(uid.to_bytes(4, 'little'))
+            f.write(size.to_bytes(8, 'little'))
+            p = path_str.encode('utf-8')
+            f.write(len(p).to_bytes(4, 'little'))
+            f.write(p)
+        write_bin(1000, 4096, str(tmp_path / 'alpha.txt'))
+        write_bin(1000, 2048, str(tmp_path / 'sub' / 'shared.log'))
+        write_bin(1000, 512, str(tmp_path / 'sub' / 'same.bin'))
+        write_bin(1001, 8192, str(tmp_path / 'other' / 'alpha.txt'))
+        write_bin(1001, 1024, str(tmp_path / 'other' / 'logs' / 'shared.log'))
     (detail_tmpdir / "perm_t1.tsv").write_text(
         "\n".join(
             [
@@ -110,7 +110,7 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
 
     detail = json.loads(detail_manifest.read_text(encoding="utf-8"))
     users = sorted(
-        (u["username"], u["total_files"], u["total_dirs"], u["total_used"])
+        (u["username"], u["files"], u["dirs"], u["used"])
         for u in detail["users"]
     )
     assert users == [("alice", 3, 2, 6656), ("bob", 2, 2, 9216)]
@@ -122,22 +122,22 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
         json.loads(line)
         for line in (alice_dir / alice_part).read_text(encoding="utf-8").splitlines()
     ]
-    assert [row["size"] for row in alice_files] == [4096, 2048, 512]
-    assert [row["size"] for row in alice_files if row["ext"] == "log"] == [2048]
-    assert any(row["path"].endswith("alpha.txt") for row in alice_files)
+    assert [row["s"] for row in alice_files] == [4096, 2048, 512]
+    assert [row["s"] for row in alice_files if row["x"] == "log"] == [2048]
+    assert any(row["p"].endswith("alpha.txt") for row in alice_files)
 
     bob_dir = detail_manifest.parent / "users" / "bob"
     bob_dirs = [
         json.loads(line)
         for line in (bob_dir / "dirs.ndjson").read_text(encoding="utf-8").splitlines()
     ]
-    assert [row["used"] for row in bob_dirs] == [8192, 1024]
+    assert sorted(row["s"] for row in bob_dirs) == [1024, 8192]
 
     tree = json.loads(tree_manifest.read_text(encoding="utf-8"))
     assert tree["shard_count"] >= 1
 
 
-def test_build_unified_dbs_accepts_legacy_and_debug_signatures(tmp_path):
+def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
     from src import fast_scanner
 
     args = (
@@ -155,9 +155,9 @@ def test_build_unified_dbs_accepts_legacy_and_debug_signatures(tmp_path):
     )
     for call_args in (args, (*args, False)):
         try:
-            fast_scanner.build_unified_dbs(*call_args)
+            fast_scanner.build_pipeline(*call_args)
         except TypeError as exc:
-            pytest.fail(f"build_unified_dbs rejected {len(call_args)} args: {exc}")
+            pytest.fail(f"build_pipeline rejected {len(call_args)} args: {exc}")
         except RuntimeError:
             pass
 

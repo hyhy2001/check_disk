@@ -30,10 +30,6 @@ pub fn finalize_user_outputs(
     let mut user_results = Vec::with_capacity(metas_count);
 
     for meta in user_metas {
-        if meta.tmp_dir.exists() {
-            fs::remove_dir_all(&meta.tmp_dir)
-                .map_err(|e| format!("rm tmp dir {}: {}", meta.tmp_dir.display(), e))?;
-        }
         fs::create_dir_all(&meta.tmp_dir).map_err(|e| format!("mkdir tmp dir {}: {}", meta.tmp_dir.display(), e))?;
         fs::create_dir_all(meta.tmp_dir.join("files")).map_err(|e| format!("mkdir files dir: {}", e))?;
 

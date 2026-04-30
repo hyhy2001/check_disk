@@ -65,15 +65,21 @@ def make_config(tmp_path, **overrides):
 def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
     import src.report_generator as report_generator_module
 
-    if not report_generator_module.HAS_RUST_UNIFIED_DB:
-        pytest.skip("fast_scanner.build_unified_dbs is not available")
+    if not report_generator_module.HAS_RUST_PIPELINE:
+        pytest.skip("fast_scanner.build_pipeline is not available")
 
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()
-    (detail_tmpdir / "scan_t1_c1.tsv").write_text(
-        f"F\t1000\t4096\t{tmp_path / 'alpha.txt'}\nF\t1000\t2048\t{tmp_path / 'sub' / 'beta.log'}\n",
-        encoding="utf-8",
-    )
+    with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        def write_bin(uid, size, path_str):
+            f.write(b'\x01')
+            f.write(uid.to_bytes(4, 'little'))
+            f.write(size.to_bytes(8, 'little'))
+            p = path_str.encode('utf-8')
+            f.write(len(p).to_bytes(4, 'little'))
+            f.write(p)
+        write_bin(1000, 4096, str(tmp_path / 'alpha.txt'))
+        write_bin(1000, 2048, str(tmp_path / 'sub' / 'beta.log'))
 
     cfg = make_config(
         tmp_path,
@@ -97,17 +103,17 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
 
     detail = json.loads(detail_manifest.read_text(encoding="utf-8"))
     assert detail["users"][0]["username"] == "alice"
-    assert detail["users"][0]["total_files"] == 2
-    assert detail["users"][0]["total_dirs"] == 2
-    assert detail["users"][0]["total_used"] == 6144
+    assert detail["users"][0]["files"] == 2
+    assert detail["users"][0]["dirs"] == 2
+    assert detail["users"][0]["used"] == 6144
 
     user_dir = tmp_path / "detail_users" / "users" / "alice"
     user_manifest = json.loads((user_dir / "manifest.json").read_text(encoding="utf-8"))
     part_path = user_manifest["files"]["parts"][0]["path"]
-    file_rows = (user_dir / part_path).read_text(encoding="utf-8").splitlines()
+    file_rows = [json.loads(x) for x in (user_dir / part_path).read_text(encoding="utf-8").splitlines()]
     assert len(file_rows) == 2
-    assert "alpha.txt" in file_rows[0]
-    assert "beta.log" in file_rows[1]
+    assert any(r["p"].endswith("alpha.txt") for r in file_rows)
+    assert any(r["p"].endswith("beta.log") for r in file_rows)
 
     tree_manifest = json.loads(treemap_manifest.read_text(encoding="utf-8"))
     assert tree_manifest["shard_count"] >= 1
