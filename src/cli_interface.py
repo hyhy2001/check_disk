@@ -66,10 +66,10 @@ class CLIInterface:
 
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
-        report_group.add_argument("--check-users", "--check-user", metavar="USER", nargs="+",
+        report_group.add_argument("--check-users", metavar="USER", nargs="+",
                                 help="Display detail reports for specific user(s) from generated JSON/NDJSON detail data.")
         report_group.add_argument("--top", type=int, default=30,
-                                help="Top N rows to display for both directory and file breakdown in --check-user(s) (default: 30).")
+                                help="Top N rows to display for both directory and file breakdown in --check-users (default: 30).")
 
         # Report filtering options
         filter_group = parser.add_argument_group('Report Filtering Options')

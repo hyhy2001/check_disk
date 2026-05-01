@@ -256,7 +256,7 @@ fn scan_disk(
     scan_core::run_scan_core(py, directory, skip_dirs, target_uids, max_workers, debug, "production")
 }
 
-#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, debug=false))]
+#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
 #[allow(clippy::too_many_arguments)]
 fn build_pipeline(
     py: Python<'_>,
@@ -271,15 +271,16 @@ fn build_pipeline(
     min_size_bytes: i64,
     timestamp: i64,
     max_workers: usize,
+    build_treemap: bool,
     debug: bool,
 ) -> PyResult<u64> {
     build_pipeline_impl(
         py, tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db,
-        treemap_root, max_level, min_size_bytes, timestamp, max_workers, debug
+        treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap, debug
     )
 }
 
-#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, debug=false))]
+#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
 #[allow(clippy::too_many_arguments)]
 fn build_pipeline_dbs(
     py: Python<'_>,
@@ -294,11 +295,12 @@ fn build_pipeline_dbs(
     min_size_bytes: i64,
     timestamp: i64,
     max_workers: usize,
+    build_treemap: bool,
     debug: bool,
 ) -> PyResult<u64> {
     report_pipeline::build_pipeline_dbs_impl(
         py, tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db,
-        treemap_root, max_level, min_size_bytes, timestamp, max_workers, debug
+        treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap, debug
     )
 }
 

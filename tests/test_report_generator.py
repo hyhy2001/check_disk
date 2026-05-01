@@ -71,8 +71,8 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()
     with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        f.write(b"CDSKSEV1")
         def write_bin(uid, size, path_str):
-            f.write(b'\x01')
             f.write(uid.to_bytes(4, 'little'))
             f.write(size.to_bytes(8, 'little'))
             p = path_str.encode('utf-8')
@@ -91,7 +91,7 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
     scan_result.detail_tmpdir = str(detail_tmpdir)
     scan_result.detail_uid_username = {1000: "alice"}
 
-    created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1)
+    created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=True)
 
     detail_manifest = tmp_path / "detail_users" / "data_detail.json"
     treemap_json = tmp_path / "tree_map_report.json"

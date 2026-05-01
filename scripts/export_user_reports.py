@@ -16,8 +16,7 @@ import glob
 import json
 import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 try:
     # Ensure src package is accessible
@@ -125,6 +124,18 @@ def _pick_existing_path(detail_dir: str, base_name: str) -> str:
             return p
     return ""
 
+def _get_rss_mb() -> float:
+    """Best-effort current process RSS in MB (Linux)."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = float(line.split()[1])
+                    return kb / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
 
 def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
     """Return (unified_path, dir_path, file_path) auto-detecting layout."""
@@ -147,63 +158,31 @@ def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
 # Core
 # ---------------------------------------------------------------------------
 
+def build_jobs(users: list, input_dir: str, output_dir: str, prefix: str) -> list:
+    """Build Rust batch jobs: (user, unified, dir, file, output_dir, prefix)."""
+    jobs = []
+    for user in users:
+        unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
+        if not any([os.path.exists(unified_path), os.path.exists(dir_path), os.path.exists(file_path)]):
+            print(f"  [skip] No data found for user: {user}", file=sys.stderr)
+            continue
+        jobs.append((user, unified_path, dir_path, file_path, output_dir, prefix))
+    return jobs
+
 def export_user(user: str,
                 input_dir: str,
                 output_dir: str,
                 prefix: str,
-                sem: threading.Semaphore) -> list:
-    """
-    Load JSON/NDJSON reports for user and write plain-text report using Rust.
-    Outputs TWO separate files: one for directories (dir) and one for files (file).
-    """
+                sem=None) -> list:
+    """Compatibility wrapper for older callers/tests; now delegates to Rust batch internals."""
     unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
-
-    # Check what exists
-    has_unified = os.path.exists(unified_path)
-    has_dir = os.path.exists(dir_path)
-    has_file = os.path.exists(file_path)
-    if not has_unified and not has_dir and not has_file:
+    if not any([os.path.exists(unified_path), os.path.exists(dir_path), os.path.exists(file_path)]):
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
         return []
-
-    results = []
-    base_parts = [p for p in [prefix, "usage"] if p]
-
-    def _collect_output(out_path: str, result_path: str) -> None:
-        if result_path and os.path.exists(result_path):
-            results.append(result_path)
-        elif out_path and os.path.exists(out_path):
-            results.append(out_path)
-
-    with sem:
-        try:
-            if has_unified:
-                source_path = unified_path
-                out_dir_fname = "_".join(base_parts + ["dir", user]) + ".txt"
-                out_dir_path = os.path.join(output_dir, out_dir_fname)
-                dir_result = export_rust.process(user, source_path, "", out_dir_path)
-                _collect_output(out_dir_path, dir_result)
-
-                out_file_fname = "_".join(base_parts + ["file", user]) + ".txt"
-                out_file_path = os.path.join(output_dir, out_file_fname)
-                file_result = export_rust.process(user, "", source_path, out_file_path)
-                _collect_output(out_file_path, file_result)
-            else:
-                if has_dir:
-                    out_dir_fname = "_".join(base_parts + ["dir", user]) + ".txt"
-                    out_dir_path = os.path.join(output_dir, out_dir_fname)
-                    dir_result = export_rust.process(user, dir_path, "", out_dir_path)
-                    _collect_output(out_dir_path, dir_result)
-
-                if has_file:
-                    out_file_fname = "_".join(base_parts + ["file", user]) + ".txt"
-                    out_file_path = os.path.join(output_dir, out_file_fname)
-                    file_result = export_rust.process(user, "", file_path, out_file_path)
-                    _collect_output(out_file_path, file_result)
-
-            return results
-        except Exception as e:
-            raise RuntimeError(f"Rust export failed for {user}: {e}")
+    try:
+        return export_rust.process_jobs([(user, unified_path, dir_path, file_path, output_dir, prefix)], 1)
+    except Exception as exc:
+        raise RuntimeError(f"Rust export failed for {user}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +204,6 @@ def parse_args() -> argparse.Namespace:
                    help="Only export specific user(s). Default: all discovered users.")
     p.add_argument("--workers",     type=int, default=4,
                    help="Number of parallel worker threads (default: 4).")
-    p.add_argument("--max-readers", type=int, default=4,
-                   help="Max workers that may read detail files simultaneously (default: 4).")
     return p.parse_args()
 
 
@@ -237,9 +214,6 @@ def main() -> None:
     output_dir  = os.path.abspath(args.output_dir) if args.output_dir else input_dir
     prefix      = args.prefix
     workers     = max(1, args.workers)
-    max_readers = max(1, args.max_readers)
-
-    read_sem = threading.Semaphore(max_readers)
 
     users = args.users if args.users else find_users(input_dir, prefix)
 
@@ -247,41 +221,49 @@ def main() -> None:
         print(f"No user detail reports found in: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
+    start_ts = time.time()
+    rss_start = _get_rss_mb()
+    peak_rss = rss_start
+    progress_every = 5
+
     print(f"Exporting {len(users)} user(s) using Rust Core [parallel {workers}w] -> {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
+    print(f"Workers selected: --workers={workers}")
+    print("Tip: change concurrency with --workers N")
+    print(f"Memory (start RSS): {rss_start:.1f} MB")
+    try:
+        if os.path.exists(output_dir) and not os.path.isdir(output_dir):
+            raise NotADirectoryError(f"--output-dir must be a directory, got file path: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as exc:
+        print(f"[error] Invalid output directory: {exc}", file=sys.stderr)
+        sys.exit(2)
 
-    results: list = []
-    failed:  list = []
+    jobs = build_jobs(users, input_dir, output_dir, prefix)
+    total = len(jobs)
+    if not jobs:
+        print("No valid export jobs found.", file=sys.stderr)
+        sys.exit(1)
 
-    completed = 0
-    total = len(users)
+    try:
+        written_paths = export_rust.process_jobs(jobs, workers)
+    except Exception as exc:
+        print(f"[error] Rust batch export failed: {exc}", file=sys.stderr)
+        sys.exit(3)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(export_user, u, input_dir, output_dir, prefix, read_sem): u
-            for u in users
-        }
-        for fut in as_completed(futures):
-            user = futures[fut]
-            completed += 1
-            try:
-                out = fut.result()
-                if out:
-                    results.append((user, out))
-            except Exception as exc:
-                failed.append(user)
-                print(f"  [warn] {user}: {exc}", file=sys.stderr, flush=True)
-            finally:
-                # Keep console output compact on large user sets.
-                print(f"\rProgress: {completed}/{total} users processed", end="", flush=True)
+    rss_now = _get_rss_mb()
+    peak_rss = max(peak_rss, rss_now)
+    print(
+        f"\rProgress: {total}/{total} users processed | RSS: {rss_now:.1f} MB | Peak: {peak_rss:.1f} MB",
+        end="",
+        flush=True,
+    )
 
     print("")
 
-    if failed:
-        print(f"\n  [warn] {len(failed)} export(s) failed: {failed}", file=sys.stderr)
-
-    written_files = sum(len(paths) for _, paths in results)
-    print(f"Done. {len(results)}/{len(users)} user(s) exported, {written_files} TXT file(s) written.")
+    written_files = len(written_paths)
+    print(f"Done. {total}/{total} user job(s) exported, {written_files} TXT file(s) written.")
+    print(f"Memory (peak RSS): {peak_rss:.1f} MB")
+    print(f"Elapsed: {time.time() - start_ts:.2f}s")
 
 
 if __name__ == "__main__":

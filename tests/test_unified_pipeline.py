@@ -57,8 +57,8 @@ def _build_unified_fixture(tmp_path):
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()
     with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        f.write(b"CDSKSEV1")
         def write_bin(uid, size, path_str):
-            f.write(b'\x01')
             f.write(uid.to_bytes(4, 'little'))
             f.write(size.to_bytes(8, 'little'))
             p = path_str.encode('utf-8')
@@ -100,7 +100,7 @@ def _build_unified_fixture(tmp_path):
         detail_uid_username={1000: "alice", 1001: "bob"},
     )
 
-    created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1)
+    created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=True)
     detail_manifest = tmp_path / "detail_users" / "data_detail.json"
     return cfg, created, detail_manifest, tmp_path / "tree_map_report.json", tmp_path / "tree_map_data" / "manifest.json"
 
@@ -153,7 +153,7 @@ def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
         0,
         1,
     )
-    for call_args in (args, (*args, False)):
+    for call_args in (args, (*args, False), (*args, False, False)):
         try:
             fast_scanner.build_pipeline(*call_args)
         except TypeError as exc:

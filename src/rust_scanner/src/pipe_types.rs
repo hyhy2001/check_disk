@@ -76,17 +76,6 @@ pub struct DirAggEvent {
 }
 
 /// Parse a scan event line from TSV (F\tuid\tsize\tpath)
-pub fn parse_scan_event_line(line: &str) -> Option<ScanEvent> {
-    let mut parts = line.splitn(4, '\t');
-    if parts.next()? != "F" {
-        return None;
-    }
-    let uid: u32 = parts.next()?.trim().parse().ok()?;
-    let size: u64 = parts.next()?.trim().parse().ok()?;
-    let path = parts.next()?.to_string();
-    Some(ScanEvent { uid, size, path })
-}
-
 /// Parse a permission issue line from TSV (P\tuid\tkind\terrcode\tpath)
 pub fn parse_permission_line(line: &str) -> Option<PermissionEvent> {
     let mut parts = line.splitn(5, '\t');

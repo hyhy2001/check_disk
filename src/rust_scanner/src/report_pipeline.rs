@@ -13,7 +13,7 @@ use crate::pipe_events::{
     for_each_dir_agg_in_file, for_each_scan_event_in_file, get_dir_agg_files, get_scan_event_files,
     read_permission_events,
 };
-use crate::pipe_io::{ensure_dir, recreate_dir, safe_user_dir};
+use crate::pipe_io::{ensure_dir, recreate_dir, safe_user_dir, swap_dir_atomic};
 use crate::pipe_permission::write_permission_issues_json;
 use crate::pipe_treemap::write_treemap_json_outputs;
 use crate::pipe_types::{FileChunkJob, UserJobMeta, UserOutputMeta, FILE_PART_RECORDS};
@@ -21,6 +21,26 @@ use crate::pipe_user_finalize::{finalize_user_outputs, write_detail_manifest};
 use crate::pipe_user_jobs::build_one_file_chunk;
 
 const ROW_SPILL_THRESHOLD: usize = 200_000;
+
+fn cleanup_stale_build_dirs(parent: &Path, prefix: &str, active_path: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == active_path || !path.is_dir() {
+            continue;
+        }
+        let name_ok = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(prefix))
+            .unwrap_or(false);
+        if name_ok {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
 
 fn spill_rows_to_disk(
     spool_root: &Path,
@@ -116,7 +136,7 @@ fn build_chunk_jobs_from_spills(
     Ok(jobs)
 }
 
-#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, debug=false))]
+#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_dbs_impl(
     py: Python<'_>,
@@ -131,6 +151,7 @@ pub fn build_pipeline_dbs_impl(
     min_size_bytes: i64,
     timestamp: i64,
     max_workers: usize,
+    build_treemap: bool,
     debug: bool,
 ) -> PyResult<u64> {
     py.allow_threads(move || -> PyResult<u64> {
@@ -140,18 +161,38 @@ pub fn build_pipeline_dbs_impl(
         let t_output_jobs: f64;
         let t_chunk_parallel: f64;
         let t_finalize: f64;
-        let t_tree: f64;
+        let mut t_tree: f64 = 0.0;
         let t_perm_write: f64;
 
         let detail_root = Path::new(&pipeline_db_path)
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("detail_users"));
-        recreate_dir(&detail_root)?;
-        ensure_dir(&detail_root.join("users"))?;
+        let detail_parent = detail_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        ensure_dir(&detail_parent)?;
+        let detail_work_root = detail_parent.join(format!(
+            ".detail_users_build_{}",
+            std::process::id()
+        ));
+        cleanup_stale_build_dirs(&detail_parent, ".detail_users_build_", &detail_work_root);
+        recreate_dir(&detail_work_root)?;
+        ensure_dir(&detail_work_root.join("users"))?;
 
         let tree_data_dir = PathBuf::from(&treemap_db);
-        recreate_dir(&tree_data_dir)?;
+        let tree_parent = tree_data_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        ensure_dir(&tree_parent)?;
+        let tree_work_dir = tree_parent.join(format!(
+            ".tree_map_data_build_{}",
+            std::process::id()
+        ));
+        cleanup_stale_build_dirs(&tree_parent, ".tree_map_data_build_", &tree_work_dir);
+        recreate_dir(&tree_work_dir)?;
 
         let t0 = Instant::now();
         let perm_events = read_permission_events(&tmpdir).unwrap_or_default();
@@ -165,23 +206,16 @@ pub fn build_pipeline_dbs_impl(
             row_spills: HashMap<String, Vec<PathBuf>>,
             row_count: usize,
         }
-        let spool_root = detail_root.join(".rows_spill");
+        let spool_root = detail_work_root.join(".rows_spill");
         recreate_dir(&spool_root)?;
         let spill_seq = Arc::new(AtomicU64::new(0));
 
         let dir_agg_paths = get_dir_agg_files(&tmpdir)?;
         let has_dir_agg = !dir_agg_paths.is_empty();
-        let (bin_paths, tsv_paths) = get_scan_event_files(&tmpdir)?;
-        println!("[Phase 2] Ingesting and mapping {} event streams...", bin_paths.len() + tsv_paths.len());
-        let mut all_tasks = Vec::new();
-        for p in bin_paths {
-            all_tasks.push((p, true));
-        }
-        for p in tsv_paths {
-            all_tasks.push((p, false));
-        }
+        let bin_paths = get_scan_event_files(&tmpdir)?;
+        println!("[Phase 2] Ingesting and mapping {} event streams...", bin_paths.len());
 
-        let merged_agg = all_tasks
+        let merged_agg = bin_paths
             .into_par_iter()
             .fold(
                 || LocalAgg {
@@ -190,9 +224,9 @@ pub fn build_pipeline_dbs_impl(
                     row_spills: HashMap::new(),
                     row_count: 0,
                 },
-                |mut agg, (path, is_bin)| {
+                |mut agg, path| {
                     let spill_seq_ref = &spill_seq;
-                    let _ = for_each_scan_event_in_file(&path, is_bin, |event| {
+                    let _ = for_each_scan_event_in_file(&path, |event| {
                         let username = uids_map
                             .get(&event.uid)
                             .cloned()
@@ -355,8 +389,8 @@ pub fn build_pipeline_dbs_impl(
                 .remove(&username)
                 .unwrap_or_default();
             let safe = safe_user_dir(&username);
-            let tmp_dir = detail_root.join("users").join(format!(".tmp_{}", safe));
-            let final_dir = detail_root.join("users").join(&safe);
+            let tmp_dir = detail_work_root.join("users").join(format!(".tmp_{}", safe));
+            let final_dir = detail_work_root.join("users").join(&safe);
             if tmp_dir.exists() {
                 let _ = fs::remove_dir_all(&tmp_dir);
             }
@@ -376,7 +410,7 @@ pub fn build_pipeline_dbs_impl(
             };
             let spills = row_spills.remove(&username).unwrap_or_default();
             let chunk_jobs =
-                build_chunk_jobs_from_spills(&detail_root, &username, &spills).map_err(PyRuntimeError::new_err)?;
+                build_chunk_jobs_from_spills(&detail_work_root, &username, &spills).map_err(PyRuntimeError::new_err)?;
             for path in spills {
                 let _ = fs::remove_file(path);
             }
@@ -405,25 +439,29 @@ pub fn build_pipeline_dbs_impl(
         let t4 = Instant::now();
         t_finalize = t4.elapsed().as_secs_f64();
 
-        println!("[Phase 2] Detail reports completed. Starting TreeMap build...");
+        if build_treemap {
+            println!("[Phase 2] Detail reports completed. Starting TreeMap build...");
 
-        let t5 = Instant::now();
-        write_treemap_json_outputs(
-            &treemap_root,
-            dir_sizes,
-            dir_owner_map,
-            &treemap_json,
-            &tree_data_dir,
-            max_level.max(1),
-            min_size_bytes,
-        )?;
-        t_tree = t5.elapsed().as_secs_f64();
-        println!("[Phase 2] TreeMap build completed in {:.2}s", t_tree);
+            let t5 = Instant::now();
+            write_treemap_json_outputs(
+                &treemap_root,
+                dir_sizes,
+                dir_owner_map,
+                &treemap_json,
+                &tree_work_dir,
+                max_level.max(1),
+                min_size_bytes,
+            )?;
+            t_tree = t5.elapsed().as_secs_f64();
+            println!("[Phase 2] TreeMap build completed in {:.2}s", t_tree);
+        } else {
+            let _ = fs::remove_dir_all(&tree_work_dir);
+        }
 
         user_results.sort_by(|a, b| a.username.cmp(&b.username));
         let total_files_processed: i64 = user_results.iter().map(|u| u.total_files).sum();
         write_detail_manifest(
-            &detail_root,
+            &detail_work_root,
             &user_results,
             &treemap_root,
             timestamp,
@@ -431,10 +469,15 @@ pub fn build_pipeline_dbs_impl(
         )?;
 
         let t6 = Instant::now();
-        let perm_out_dir = detail_root.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let perm_out_dir = detail_work_root.parent().unwrap_or(Path::new(".")).to_path_buf();
         write_permission_issues_json(&perm_events, &uids_map, &perm_out_dir, &treemap_root, timestamp)?;
         t_perm_write = t6.elapsed().as_secs_f64();
         let _ = fs::remove_dir_all(&spool_root);
+
+        swap_dir_atomic(&detail_work_root, &detail_root)?;
+        if build_treemap {
+            swap_dir_atomic(&tree_work_dir, &tree_data_dir)?;
+        }
 
         if debug {
             let rss_mb = crate::pipe_types::get_rss_mb();

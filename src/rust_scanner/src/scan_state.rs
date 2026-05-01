@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::scan_constants::{DIR_AGG_BIN_MAGIC_V1, SCAN_EVENT_BIN_MAGIC_V1};
+
 pub(crate) struct GlobalStats {
     pub(crate) total_files: u64,
     pub(crate) total_dirs: u64,
@@ -129,8 +131,12 @@ impl ThreadLocalState {
             if self.event_bin_writers[bucket].is_none() {
                 let fp = format!("{}/scan_t{}_b{}.bin", self.tmpdir, self.thread_id, bucket);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                    self.event_bin_writers[bucket] =
-                        Some(BufWriter::with_capacity(16 * 1024 * 1024, f));
+                    let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
+                    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, f);
+                    if write_header {
+                        let _ = writer.write_all(&SCAN_EVENT_BIN_MAGIC_V1);
+                    }
+                    self.event_bin_writers[bucket] = Some(writer);
                 }
             }
             if let Some(writer) = self.event_bin_writers[bucket].as_mut() {
@@ -190,7 +196,12 @@ impl ThreadLocalState {
         if self.dir_agg_writer.is_none() {
             let fp = format!("{}/diragg_t{}.bin", self.tmpdir, self.thread_id);
             if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
-                self.dir_agg_writer = Some(BufWriter::with_capacity(8 * 1024 * 1024, f));
+                let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
+                let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, f);
+                if write_header {
+                    let _ = writer.write_all(&DIR_AGG_BIN_MAGIC_V1);
+                }
+                self.dir_agg_writer = Some(writer);
             }
         }
         if let Some(writer) = self.dir_agg_writer.as_mut() {

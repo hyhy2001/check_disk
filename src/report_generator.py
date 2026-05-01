@@ -273,6 +273,7 @@ class ReportGenerator:
         self,
         scan_result: ScanResult,
         max_workers: int = 1,
+        build_treemap: bool = False,
     ) -> List[str]:
         """Generate JSON/NDJSON detail data and TreeMap outputs via Rust."""
         if not scan_result.detail_tmpdir:
@@ -293,15 +294,18 @@ class ReportGenerator:
         unified_path = os.path.join(detail_dir, "data_detail.json")
         tree_json_path = self._get_output_filename("tree_map_report")
         tree_data_path = os.path.join(output_dir, "tree_map_data")
-        stale_paths = (
-            unified_path,
-            tree_json_path,
-            tree_data_path,
-        )
-        for stale_path in stale_paths:
-            if os.path.isdir(stale_path):
-                shutil.rmtree(stale_path)
-            elif os.path.exists(stale_path):
+        if not build_treemap:
+            if os.path.isfile(tree_json_path):
+                os.remove(tree_json_path)
+            if os.path.isdir(tree_data_path):
+                shutil.rmtree(tree_data_path)
+        # Avoid expensive pre-clean for huge runs. Rust Phase 2 pipeline already
+        # recreates/overwrites its working output directories atomically.
+        stale_targets = [unified_path]
+        if build_treemap:
+            stale_targets.append(tree_json_path)
+        for stale_path in stale_targets:
+            if os.path.isfile(stale_path):
                 os.remove(stale_path)
         phase2_start = time.time()
         phase2_mem_start = self._get_rss_mb() if self.debug else 0.0
@@ -329,6 +333,7 @@ class ReportGenerator:
             0,
             int(scan_result.timestamp),
             int(max(1, int(max_workers))),
+            bool(build_treemap),
         )
         if not hasattr(_fast_scanner, "build_pipeline"):
             raise RuntimeError("fast_scanner.build_pipeline is required")
@@ -364,7 +369,9 @@ class ReportGenerator:
 
         root_manifest_path = unified_path
 
-        created = [root_manifest_path, tree_json_path, os.path.join(tree_data_path, "manifest.json")]
+        created = [root_manifest_path]
+        if build_treemap:
+            created.extend([tree_json_path, os.path.join(tree_data_path, "manifest.json")])
         self.cleanup_stale_detail_reports(created)
 
         detail_users_count = 0
@@ -393,7 +400,8 @@ class ReportGenerator:
             print(f"  [Phase 2] Detail manifest ready: {root_manifest_path}")
             print(f"  [Phase 2] Users processed: {detail_users_count:,}")
             print(f"  [Phase 2] User details ready: {os.path.join(detail_dir, 'users')}")
-            print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
+            if build_treemap:
+                print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
             print(
                 f"[Phase 2] RAM end: {phase2_mem_end:.1f} MB "
                 f"(delta: {phase2_mem_end - phase2_mem_start:+.1f} MB, elapsed: {phase2_elapsed:.2f}s, "
@@ -404,8 +412,9 @@ class ReportGenerator:
             print(f"  Detail manifest: {root_manifest_path}")
             print(f"  Users processed: {detail_users_count:,}")
             print(f"  User details: {os.path.join(detail_dir, 'users')}")
-            print(f"  TreeMap JSON: {tree_json_path}")
-            print(f"  TreeMap data: {tree_data_path}")
+            if build_treemap:
+                print(f"  TreeMap JSON: {tree_json_path}")
+                print(f"  TreeMap data: {tree_data_path}")
         return sorted(created)
 
     def generate_detail_reports_with_level(
@@ -413,6 +422,11 @@ class ReportGenerator:
         scan_result: ScanResult,
         level: int,
         max_workers: int = 1,
+        build_treemap: bool = False,
     ) -> List[str]:
         self.config["tree_map_level"] = int(level)
-        return self.generate_detail_reports(scan_result, max_workers=max_workers)
+        return self.generate_detail_reports(
+            scan_result,
+            max_workers=max_workers,
+            build_treemap=build_treemap,
+        )

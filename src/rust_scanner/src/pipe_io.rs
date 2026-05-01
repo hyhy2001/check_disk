@@ -11,6 +11,55 @@ pub fn recreate_dir(path: &Path) -> PyResult<()> {
     fs::create_dir_all(path).map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", path.display(), e)))
 }
 
+pub fn swap_dir_atomic(work_dir: &Path, final_dir: &Path) -> PyResult<()> {
+    let parent = final_dir
+        .parent()
+        .ok_or_else(|| PyRuntimeError::new_err(format!("no parent for {}", final_dir.display())))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", parent.display(), e)))?;
+
+    let backup = parent.join(format!(
+        ".swap_old_{}",
+        final_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dir")
+    ));
+    if backup.exists() {
+        fs::remove_dir_all(&backup)
+            .map_err(|e| PyRuntimeError::new_err(format!("rm backup {}: {}", backup.display(), e)))?;
+    }
+
+    if final_dir.exists() {
+        fs::rename(final_dir, &backup).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "rename {} -> {}: {}",
+                final_dir.display(),
+                backup.display(),
+                e
+            ))
+        })?;
+    }
+
+    if let Err(e) = fs::rename(work_dir, final_dir) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, final_dir);
+        }
+        return Err(PyRuntimeError::new_err(format!(
+            "rename {} -> {}: {}",
+            work_dir.display(),
+            final_dir.display(),
+            e
+        )));
+    }
+
+    if backup.exists() {
+        fs::remove_dir_all(&backup)
+            .map_err(|e| PyRuntimeError::new_err(format!("rm old {}: {}", backup.display(), e)))?;
+    }
+    Ok(())
+}
+
 pub fn ensure_dir(path: &Path) -> PyResult<()> {
     fs::create_dir_all(path).map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", path.display(), e)))
 }

@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +19,7 @@ pub fn build_pipeline_impl(
     min_size_bytes: i64,
     timestamp: i64,
     max_workers: usize,
+    build_treemap: bool,
     debug: bool,
 ) -> PyResult<u64> {
     // Run pipeline DB builder, then build compact root manifest metadata.
@@ -25,8 +27,12 @@ pub fn build_pipeline_impl(
     let f = fast_scanner
         .getattr("build_pipeline_dbs")
         .or_else(|_| fast_scanner.getattr("build_pipeline_dbs"))?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("build_treemap", build_treemap)?;
+    kwargs.set_item("debug", debug)?;
     let total_files: u64 = f
-        .call1((
+        .call(
+            (
             tmpdir.clone(),
             uids_map.clone(),
             team_map.clone(),
@@ -38,8 +44,9 @@ pub fn build_pipeline_impl(
             min_size_bytes,
             timestamp,
             max_workers,
-            debug,
-        ))?
+            ),
+            Some(kwargs),
+        )?
         .extract()?;
 
     // Compact data_detail.json and per-user manifest.json in-place

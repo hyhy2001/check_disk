@@ -59,6 +59,15 @@ pub fn finalize_user_outputs(
         }
 
         write_user_metadata_result(&meta, total_files, file_parts, extension_stats, top_files)?;
+        if meta.final_dir.exists() {
+            fs::remove_dir_all(&meta.final_dir).map_err(|e| {
+                format!(
+                    "rm final dir {} before rename: {}",
+                    meta.final_dir.display(),
+                    e
+                )
+            })?;
+        }
         fs::rename(&meta.tmp_dir, &meta.final_dir)
             .map_err(|e| format!("rename {} -> {}: {}", meta.tmp_dir.display(), meta.final_dir.display(), e))?;
 
