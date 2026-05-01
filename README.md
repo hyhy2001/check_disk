@@ -61,7 +61,7 @@ python3 scripts/export_user_reports.py \
   - Builds detail reports from scan TSV chunks in Rust.
   - Uses a global Rust/Rayon chunk worker pool so very large users can still use multiple workers.
   - Writes user detail data as manifest-driven JSON/NDJSON, not SQLite.
-  - Writes TreeMap data as JSON root + shard files for fast frontend lazy loading.
+  - Writes TreeMap data as JSON root + shard files for fast frontend lazy loading when `--tree-map` is enabled.
 
 - **Fast per-user inspection**
   - `--check-users` reads `detail_users/data_detail.json` and per-user top indexes.
@@ -197,8 +197,7 @@ python3 scripts/export_user_reports.py \
   --input-dir /reports \
   --output-dir /reports/exports \
   --users root www \
-  --workers 4 \
-  --max-readers 4
+  --workers 4
 ```
 
 `--input-dir` may point either to the report root or directly to `detail_users/`.
@@ -222,9 +221,11 @@ The current report format is JSON/NDJSON. SQLite report databases are no longer 
 | `detail_users/users/<user>/top_dirs.json` | Fast top-directory index for UI/CLI display. |
 | `detail_users/users/<user>/top_files.json` | Fast top-file index for UI/CLI display. |
 | `detail_users/users/<user>/extensions.json` | Per-extension counts and byte totals. |
-| `tree_map_report.json` | TreeMap root JSON used by the dashboard. |
-| `tree_map_data/manifest.json` | TreeMap shard manifest. |
-| `tree_map_data/shards/<prefix>/<shard_id>.json` | Lazy-load TreeMap shard JSON files. |
+| `tree_map_report.json` | TreeMap root JSON used by the dashboard (generated only with `--tree-map`). |
+| `tree_map_data/manifest.json` | TreeMap shard manifest (generated only with `--tree-map`). |
+| `tree_map_data/shards/<prefix>/<shard_id>.json` | Lazy-load TreeMap shard JSON files (generated only with `--tree-map`). |
+
+When `--run` is executed **without** `--tree-map`, stale `tree_map_report.json` and `tree_map_data/` are auto-cleaned.
 
 ### Detail manifest structure
 
@@ -272,7 +273,7 @@ Precompiled PyO3 scanner/report builder.
 - `scan_disk()` runs the parallel Rust filesystem scan and writes bounded TSV chunks.
 - `build_unified_dbs()` is the compatibility-named Python API that now builds JSON/NDJSON detail data and TreeMap JSON shards. The name is preserved for Python API stability, but it no longer writes SQLite DB files.
 
-### `src/rust_scanner/src/unified_output.rs`
+### `src/rust_scanner/src/report_pipeline.rs`
 
 Rust JSON/NDJSON output pipeline.
 
@@ -280,8 +281,8 @@ Rust JSON/NDJSON output pipeline.
 - Builds global file-chunk jobs across all users.
 - Processes file chunks with Rayon.
 - Finalizes per-user manifests and top indexes.
-- Writes the root detail manifest after successful user output and TreeMap generation.
-- Writes TreeMap shards as independent JSON files.
+- Writes the root detail manifest after successful detail output generation; TreeMap artifacts are produced only when `--tree-map` is enabled.
+- Writes TreeMap shards as independent JSON files when enabled.
 
 ### `src/export_rust.abi3.so`
 
@@ -331,9 +332,9 @@ Recommended report root layout:
 <report_root>/scan_status.json
 <report_root>/detail_users/data_detail.json
 <report_root>/detail_users/users/<user>/manifest.json
-<report_root>/tree_map_report.json
-<report_root>/tree_map_data/manifest.json
-<report_root>/tree_map_data/shards/**/*.json
+<report_root>/tree_map_report.json            # when --tree-map
+<report_root>/tree_map_data/manifest.json      # when --tree-map
+<report_root>/tree_map_data/shards/**/*.json   # when --tree-map
 ```
 
 Point `disk_usage/disks.json` entries at directories containing these generated files.
