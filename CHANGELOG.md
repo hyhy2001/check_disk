@@ -1,1 +1,8 @@
-# Changelog\n\n## [Unreleased]\n\n- refactor scanner/report pipeline and optimize exporter\n  \* optimized user-data Rust exporting\n  \* streamlined pipeline debugging\n 
+# Changelog
+
+## [Unreleased]
+
+- Refactor scanner/report pipeline and optimize exporter.
+- Improve Rust exporter performance and batching.
+- Split TreeMap into optional phase 3 and add auto-clean behavior.
+- Add scan stream/header compatibility hardening.
