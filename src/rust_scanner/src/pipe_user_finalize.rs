@@ -13,6 +13,33 @@ fn compact_file_row(path: &str, size: u64, ext: &str) -> serde_json::Value {
     json!({"p": path, "s": size, "x": ext})
 }
 
+fn size_bin_key(size: u64) -> &'static str {
+    if size <= 1023 {
+        "0-1KB"
+    } else if size <= 1024 * 1024 - 1 {
+        "1KB-1MB"
+    } else if size <= 10 * 1024 * 1024 - 1 {
+        "1MB-10MB"
+    } else if size <= 100 * 1024 * 1024 - 1 {
+        "10MB-100MB"
+    } else if size <= 1024 * 1024 * 1024 - 1 {
+        "100MB-1GB"
+    } else {
+        ">=1GB"
+    }
+}
+
+fn path_tokens(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for seg in path.split('/') {
+        let token = seg.trim().to_lowercase();
+        if token.len() >= 2 {
+            out.push(token);
+        }
+    }
+    out
+}
+
 fn compact_dir_row(path: &str, used: i64) -> serde_json::Value {
     json!({"p": path, "s": used})
 }
@@ -123,6 +150,25 @@ fn write_user_metadata_result(
         .collect();
     write_json_file_result(&meta.tmp_dir.join("top_files.json"), &json!(top_files_json))?;
 
+    let mut ext_index: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut size_bins: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut token_index: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for (size, path) in &top_files_vec {
+        let ext = crate::pipe_types::extension_for_path(path);
+        let row = compact_file_row(path, *size, &ext);
+        ext_index.entry(ext.clone()).or_default().push(row.clone());
+        size_bins
+            .entry(size_bin_key(*size).to_string())
+            .or_default()
+            .push(row.clone());
+        for tok in path_tokens(path).into_iter().take(8) {
+            token_index.entry(tok).or_default().push(row.clone());
+        }
+    }
+    write_json_file_result(&meta.tmp_dir.join("ext_index.json"), &json!(ext_index))?;
+    write_json_file_result(&meta.tmp_dir.join("size_bins.json"), &json!(size_bins))?;
+    write_json_file_result(&meta.tmp_dir.join("path_token_index.json"), &json!(token_index))?;
+
     let ui_dirs = std::cmp::min(meta.total_dirs.max(0) as usize, TOP_RECORDS) as i64;
     let ui_files = std::cmp::min(total_files.max(0) as usize, TOP_RECORDS) as i64;
     let page_size: i64 = 500;
@@ -161,6 +207,9 @@ fn write_user_metadata_result(
         "top_files": "top_files.json",
         "top_dirs": "top_dirs.json",
         "extensions": "extensions.json",
+        "ext_index": "ext_index.json",
+        "size_bins": "size_bins.json",
+        "path_token_index": "path_token_index.json",
         "files": {"parts": file_parts},
         "dirs": {"path": "dirs.ndjson"}
     });
