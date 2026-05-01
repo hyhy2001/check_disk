@@ -123,6 +123,19 @@ fn write_user_metadata_result(
         .collect();
     write_json_file_result(&meta.tmp_dir.join("top_files.json"), &json!(top_files_json))?;
 
+    let ui_dirs = std::cmp::min(meta.total_dirs.max(0) as usize, TOP_RECORDS) as i64;
+    let ui_files = std::cmp::min(total_files.max(0) as usize, TOP_RECORDS) as i64;
+    let page_size: i64 = 500;
+    let dirs_pages = std::cmp::max(1, (ui_dirs + page_size - 1) / page_size);
+    let files_pages = std::cmp::max(1, (ui_files + page_size - 1) / page_size);
+
+    write_json_file_result(&meta.tmp_dir.join("page_index.json"), &json!({
+        "version": 1,
+        "page_size": page_size,
+        "dirs": { "total_full": meta.total_dirs, "total_ui": ui_dirs, "pages": dirs_pages },
+        "files": { "total_full": total_files, "total_ui": ui_files, "pages": files_pages }
+    }))?;
+
     let mut exts: Vec<_> = extension_stats.iter()
         .map(|(ext, (count, size))| json!({"ext": ext, "count": count, "size": size}))
         .collect();
@@ -137,8 +150,14 @@ fn write_user_metadata_result(
         "summary": {
             "files": total_files,
             "dirs": meta.total_dirs,
-            "used": meta.total_used
+            "used": meta.total_used,
+            "total_files": total_files,
+            "total_dirs": meta.total_dirs,
+            "total_used": meta.total_used,
+            "ui_files": ui_files,
+            "ui_dirs": ui_dirs
         },
+        "page_index": "page_index.json",
         "top_files": "top_files.json",
         "top_dirs": "top_dirs.json",
         "extensions": "extensions.json",
@@ -168,7 +187,7 @@ pub fn write_detail_manifest(
     let total_size: i64 = users.iter().map(|u| u.total_used).sum();
     let total_dirs: i64 = users.iter().map(|u| u.total_dirs).sum();
     let manifest = json!({
-        "version": 1,
+        "version": 2,
         "format": "check-disk-detail-ndjson",
         "scan": {
             "timestamp": timestamp,
