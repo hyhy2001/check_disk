@@ -2,13 +2,10 @@
 // Shared types, constants, and utility functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs;
 
 /// Constants
 pub const FILE_PART_RECORDS: usize = 100_000;
-pub const TOP_RECORDS: usize = 1_000;
 
 /// Internal event structures
 
@@ -44,7 +41,6 @@ pub struct FileChunkResult {
     pub total_files: i64,
     pub file_parts: Vec<serde_json::Value>,
     pub extension_stats: std::collections::HashMap<String, (i64, i64)>,
-    pub top_files: Vec<(u64, String)>,
 }
 
 pub struct UserBuildResult {
@@ -104,14 +100,6 @@ pub fn parent_path(path: &str) -> Option<String> {
         Some(0) => Some("/".to_string()),
         Some(idx) => Some(trimmed[..idx].to_string()),
         None => None,
-    }
-}
-
-/// Push file into top-N binary heap (maintains largest by size)
-pub fn push_top_file(heap: &mut BinaryHeap<Reverse<(u64, String)>>, size: u64, path: &str) {
-    heap.push(Reverse((size, path.to_string())));
-    if heap.len() > TOP_RECORDS {
-        heap.pop();
     }
 }
 

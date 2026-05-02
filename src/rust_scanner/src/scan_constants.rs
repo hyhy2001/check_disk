@@ -1,6 +1,10 @@
 pub(crate) const CRITICAL_SKIP_NAMES: &[&str] = &[
-    ".snapshot", ".snapshots", ".zfs",
-    "proc", "sys", "dev",
+    ".snapshot",
+    ".snapshots",
+    ".zfs",
+    "proc",
+    "sys",
+    "dev",
     ".nfs",
 ];
 

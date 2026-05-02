@@ -1,6 +1,7 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde_json::json;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -76,11 +77,10 @@ pub fn build_one_file_chunk(job: FileChunkJob) -> Result<FileChunkResult, String
 
     let mut file_parts: Vec<serde_json::Value> = Vec::new();
     let mut extension_stats: HashMap<String, (i64, i64)> = HashMap::new();
-    let mut top_files: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
     let mut total_files = 0_i64;
     let mut current_part_idx: Option<usize> = None;
     let mut current_records = 0_usize;
-    let mut current_writer: Option<BufWriter<fs::File>> = None;
+    let mut current_writer: Option<BufWriter<GzEncoder<fs::File>>> = None;
 
     for (size, raw_path) in job.rows {
         if current_writer.is_none() || current_records >= FILE_PART_RECORDS {
@@ -94,16 +94,16 @@ pub fn build_one_file_chunk(job: FileChunkJob) -> Result<FileChunkResult, String
             }
             let part_idx = file_parts.len();
             let rel_path = format!(
-                "files/chunk-{:05}/part-{:05}.ndjson",
+                "files/chunk-{:05}/part-{:05}.ndjson.gz",
                 job.chunk_index, part_idx
             );
-            let file =
-                fs::File::create(job.output_dir.join(format!("part-{:05}.ndjson", part_idx)))
-                    .map_err(|e| format!("create {}: {}", rel_path, e))?;
+            let file = fs::File::create(job.output_dir.join(format!("part-{:05}.ndjson.gz", part_idx)))
+                .map_err(|e| format!("create {}: {}", rel_path, e))?;
+            let encoder = GzEncoder::new(file, Compression::default());
             file_parts.push(json!({"path": rel_path, "records": 0}));
             current_part_idx = Some(part_idx);
             current_records = 0;
-            current_writer = Some(BufWriter::new(file));
+            current_writer = Some(BufWriter::new(encoder));
         }
 
         let safe = crate::sanitise_path(&raw_path);
@@ -111,7 +111,6 @@ pub fn build_one_file_chunk(job: FileChunkJob) -> Result<FileChunkResult, String
         let stat = extension_stats.entry(ext.clone()).or_insert((0, 0));
         stat.0 += 1;
         stat.1 += size as i64;
-        crate::pipe_types::push_top_file(&mut top_files, size, &safe);
         json_line_result(
             current_writer.as_mut().expect("writer exists"),
             compact_file_row(&safe, size, &ext),
@@ -135,6 +134,5 @@ pub fn build_one_file_chunk(job: FileChunkJob) -> Result<FileChunkResult, String
         total_files,
         file_parts,
         extension_stats,
-        top_files: top_files.into_iter().map(|Reverse(item)| item).collect(),
     })
 }

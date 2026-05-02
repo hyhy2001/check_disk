@@ -1,44 +1,14 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use pyo3::prelude::*;
 use serde_json::json;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::pipe_io::{json_line_result, safe_user_dir, write_json_file, write_json_file_result};
-use crate::pipe_types::{TOP_RECORDS, FileChunkResult, UserBuildResult, UserJobMeta};
-
-fn compact_file_row(path: &str, size: u64, ext: &str) -> serde_json::Value {
-    json!({"p": path, "s": size, "x": ext})
-}
-
-fn size_bin_key(size: u64) -> &'static str {
-    if size <= 1023 {
-        "0-1KB"
-    } else if size <= 1024 * 1024 - 1 {
-        "1KB-1MB"
-    } else if size <= 10 * 1024 * 1024 - 1 {
-        "1MB-10MB"
-    } else if size <= 100 * 1024 * 1024 - 1 {
-        "10MB-100MB"
-    } else if size <= 1024 * 1024 * 1024 - 1 {
-        "100MB-1GB"
-    } else {
-        ">=1GB"
-    }
-}
-
-fn path_tokens(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for seg in path.split('/') {
-        let token = seg.trim().to_lowercase();
-        if token.len() >= 2 {
-            out.push(token);
-        }
-    }
-    out
-}
+use crate::pipe_types::{FileChunkResult, FILE_PART_RECORDS, UserBuildResult, UserJobMeta};
 
 fn compact_dir_row(path: &str, used: i64) -> serde_json::Value {
     json!({"p": path, "s": used})
@@ -65,10 +35,9 @@ pub fn finalize_user_outputs(
 
         let mut file_parts = Vec::new();
         let mut extension_stats: HashMap<String, (i64, i64)> = HashMap::new();
-        let mut top_files: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
         let mut total_files = 0_i64;
 
-        write_user_dirs_result(&meta.tmp_dir, &meta.top_dirs)?;
+        let dir_parts = write_user_dirs_result(&meta.tmp_dir, &meta.top_dirs)?;
 
         for chunk in user_chunks {
             total_files += chunk.total_files;
@@ -80,12 +49,9 @@ pub fn finalize_user_outputs(
                 stat.0 += count;
                 stat.1 += size;
             }
-            for (size, path) in chunk.top_files {
-                crate::pipe_types::push_top_file(&mut top_files, size, &path);
-            }
         }
 
-        write_user_metadata_result(&meta, total_files, file_parts, extension_stats, top_files)?;
+        write_user_metadata_result(&meta, total_files, file_parts, dir_parts, extension_stats)?;
         if meta.final_dir.exists() {
             fs::remove_dir_all(&meta.final_dir).map_err(|e| {
                 format!(
@@ -122,64 +88,72 @@ pub fn finalize_user_outputs(
     Ok(user_results)
 }
 
-fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result<(), String> {
-    let file = fs::File::create(user_dir.join("dirs.ndjson")).map_err(|e| format!("create dirs.ndjson: {}", e))?;
-    let mut writer = BufWriter::new(file);
-    for (path, used) in top_dirs {
-        json_line_result(&mut writer, compact_dir_row(path, *used))?;
-    }
-    writer.flush().map_err(|e| format!("flush dirs: {}", e))?;
+fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result<Vec<serde_json::Value>, String> {
+    let dirs_dir = user_dir.join("dirs");
+    fs::create_dir_all(&dirs_dir).map_err(|e| format!("create dirs dir: {}", e))?;
+    let mut dir_parts: Vec<serde_json::Value> = Vec::new();
+    let mut chunk_idx = 0usize;
+    let mut part_idx = 0usize;
+    let mut current_part_records = 0usize;
+    let mut writer: Option<BufWriter<GzEncoder<fs::File>>> = None;
 
-    let top_dirs_json: Vec<_> = top_dirs.iter().take(TOP_RECORDS)
-        .map(|(path, used)| compact_dir_row(path, *used))
-        .collect();
-    write_json_file_result(&user_dir.join("top_dirs.json"), &json!(top_dirs_json))
+    for (path, used) in top_dirs {
+        if writer.is_none() || current_part_records >= FILE_PART_RECORDS {
+            if let Some(mut w) = writer.take() {
+                w.flush().map_err(|e| format!("flush dir part: {}", e))?;
+                if !dir_parts.is_empty() {
+                    let last_idx = dir_parts.len() - 1;
+                    dir_parts[last_idx]["records"] = json!(current_part_records);
+                }
+            }
+
+            let chunk_dir = dirs_dir.join(format!("chunk-{:05}", chunk_idx));
+            fs::create_dir_all(&chunk_dir)
+                .map_err(|e| format!("create dir chunk {}: {}", chunk_dir.display(), e))?;
+
+            let rel_path = format!("dirs/chunk-{:05}/part-{:05}.ndjson.gz", chunk_idx, part_idx);
+            let part_path = chunk_dir.join(format!("part-{:05}.ndjson.gz", part_idx));
+            let file = fs::File::create(&part_path)
+                .map_err(|e| format!("create dir part {}: {}", part_path.display(), e))?;
+            let encoder = GzEncoder::new(file, Compression::default());
+            writer = Some(BufWriter::new(encoder));
+            dir_parts.push(json!({"path": rel_path, "records": 0}));
+            current_part_records = 0;
+            chunk_idx += 1;
+            part_idx = 0;
+        }
+
+        let w = writer.as_mut().unwrap();
+        json_line_result(w, compact_dir_row(path, *used))?;
+        current_part_records += 1;
+    }
+
+    if let Some(mut w) = writer {
+        w.flush().map_err(|e| format!("flush final dir part: {}", e))?;
+        if !dir_parts.is_empty() {
+            let last_idx = dir_parts.len() - 1;
+            dir_parts[last_idx]["records"] = json!(current_part_records);
+        }
+    }
+
+    Ok(dir_parts)
 }
 
 fn write_user_metadata_result(
     meta: &UserJobMeta,
     total_files: i64,
     file_parts: Vec<serde_json::Value>,
+    dir_parts: Vec<serde_json::Value>,
     extension_stats: HashMap<String, (i64, i64)>,
-    top_files: BinaryHeap<Reverse<(u64, String)>>,
 ) -> Result<(), String> {
-    let mut top_files_vec: Vec<(u64, String)> = top_files.into_iter().map(|Reverse(item)| item).collect();
-    top_files_vec.sort_by(|a, b| b.0.cmp(&a.0));
-    let top_files_json: Vec<_> = top_files_vec.iter()
-        .map(|(size, path)| compact_file_row(path, *size, &crate::pipe_types::extension_for_path(path)))
-        .collect();
-    write_json_file_result(&meta.tmp_dir.join("top_files.json"), &json!(top_files_json))?;
-
-    let mut ext_index: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    let mut size_bins: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    let mut token_index: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    for (size, path) in &top_files_vec {
-        let ext = crate::pipe_types::extension_for_path(path);
-        let row = compact_file_row(path, *size, &ext);
-        ext_index.entry(ext.clone()).or_default().push(row.clone());
-        size_bins
-            .entry(size_bin_key(*size).to_string())
-            .or_default()
-            .push(row.clone());
-        for tok in path_tokens(path).into_iter().take(8) {
-            token_index.entry(tok).or_default().push(row.clone());
-        }
-    }
-    write_json_file_result(&meta.tmp_dir.join("ext_index.json"), &json!(ext_index))?;
-    write_json_file_result(&meta.tmp_dir.join("size_bins.json"), &json!(size_bins))?;
-    write_json_file_result(&meta.tmp_dir.join("path_token_index.json"), &json!(token_index))?;
-
-    let ui_dirs = std::cmp::min(meta.total_dirs.max(0) as usize, TOP_RECORDS) as i64;
-    let ui_files = std::cmp::min(total_files.max(0) as usize, TOP_RECORDS) as i64;
     let page_size: i64 = 500;
-    let dirs_pages = std::cmp::max(1, (ui_dirs + page_size - 1) / page_size);
-    let files_pages = std::cmp::max(1, (ui_files + page_size - 1) / page_size);
+    let dirs_pages = std::cmp::max(1, (meta.total_dirs.max(0) + page_size - 1) / page_size);
+    let files_pages = std::cmp::max(1, (total_files.max(0) + page_size - 1) / page_size);
 
     write_json_file_result(&meta.tmp_dir.join("page_index.json"), &json!({
-        "version": 1,
         "page_size": page_size,
-        "dirs": { "total_full": meta.total_dirs, "total_ui": ui_dirs, "pages": dirs_pages },
-        "files": { "total_full": total_files, "total_ui": ui_files, "pages": files_pages }
+        "dirs": { "total_full": meta.total_dirs, "pages": dirs_pages },
+        "files": { "total_full": total_files, "pages": files_pages }
     }))?;
 
     let mut exts: Vec<_> = extension_stats.iter()
@@ -196,22 +170,12 @@ fn write_user_metadata_result(
         "summary": {
             "files": total_files,
             "dirs": meta.total_dirs,
-            "used": meta.total_used,
-            "total_files": total_files,
-            "total_dirs": meta.total_dirs,
-            "total_used": meta.total_used,
-            "ui_files": ui_files,
-            "ui_dirs": ui_dirs
+            "used": meta.total_used
         },
         "page_index": "page_index.json",
-        "top_files": "top_files.json",
-        "top_dirs": "top_dirs.json",
         "extensions": "extensions.json",
-        "ext_index": "ext_index.json",
-        "size_bins": "size_bins.json",
-        "path_token_index": "path_token_index.json",
         "files": {"parts": file_parts},
-        "dirs": {"path": "dirs.ndjson"}
+        "dirs": {"parts": dir_parts}
     });
     write_json_file_result(&meta.tmp_dir.join("manifest.json"), &manifest)
 }
@@ -236,8 +200,7 @@ pub fn write_detail_manifest(
     let total_size: i64 = users.iter().map(|u| u.total_used).sum();
     let total_dirs: i64 = users.iter().map(|u| u.total_dirs).sum();
     let manifest = json!({
-        "version": 2,
-        "format": "check-disk-detail-ndjson",
+        "format": "check-disk-detail",
         "scan": {
             "timestamp": timestamp,
             "root": root,

@@ -1,27 +1,26 @@
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Write, BufWriter};
+use std::io::{BufWriter, Write};
 
+mod pipe_events;
+mod pipe_io;
+mod pipe_permission;
+mod pipe_treemap;
+mod pipe_types;
+mod pipe_user_finalize;
+mod pipe_user_jobs;
+mod pipeline_manifest;
+mod report_pipeline;
 mod scan_constants;
 mod scan_core;
 mod scan_state;
 mod scan_utils;
-mod pipe_types;
-mod pipe_io;
-mod pipe_events;
-mod pipe_treemap;
-mod pipe_user_jobs;
-mod pipe_user_finalize;
-mod pipe_permission;
-mod report_pipeline;
-mod pipeline_manifest;
 use pipeline_manifest::build_pipeline_impl;
 
 /// Read RSS memory from /proc/self/status in MB (Linux only).
 // ProgressStats replaced by 3 AtomicU64 (no lock, exact counts)
-
 
 #[allow(dead_code)]
 #[pyfunction(signature = (directory, skip_dirs, target_uids, max_workers=None, debug=false))]
@@ -33,7 +32,15 @@ fn scan_disk_reference(
     max_workers: Option<usize>,
     debug: bool,
 ) -> PyResult<PyObject> {
-    scan_core::run_scan_core(py, directory, skip_dirs, target_uids, max_workers, debug, "reference")
+    scan_core::run_scan_core(
+        py,
+        directory,
+        skip_dirs,
+        target_uids,
+        max_workers,
+        debug,
+        "reference",
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +64,13 @@ use std::io::{BufRead, BufReader};
 /// valid UTF-8 JSON: replace any surrogate or invalid code points with U+FFFD.
 pub(crate) fn sanitise_path(raw: &str) -> String {
     raw.chars()
-        .map(|c| if c == '\u{FFFD}' || (c.is_control() && c != '\t') { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if c == '\u{FFFD}' || (c.is_control() && c != '\t') {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -68,7 +81,7 @@ fn json_escape(s: &str) -> String {
     out.push('"');
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
@@ -85,11 +98,11 @@ fn json_escape(s: &str) -> String {
 
 #[pyfunction]
 fn merge_write_user_report(
-    tmpdir:      String,
-    uids:        Vec<u32>,
-    username:    String,
+    tmpdir: String,
+    uids: Vec<u32>,
+    username: String,
     output_path: String,
-    timestamp:   i64,
+    timestamp: i64,
 ) -> PyResult<(u64, u64)> {
     // 1. Glob chunk files sorted for all uids in a single readdir pass.
     let chunk_files = glob_module_rust_many(&tmpdir, &uids)?;
@@ -141,9 +154,15 @@ fn merge_write_user_report(
     let mut w = BufWriter::new(out_file);
 
     // Write header
-    writeln!(w, "{{\"_meta\":{{\"date\":{},\"user\":{},\"total_files\":{},\"total_used\":{}}}}}",
-        timestamp, json_escape(&sanitise_path(&username)), total_files, total_used)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    writeln!(
+        w,
+        "{{\"_meta\":{{\"date\":{},\"user\":{},\"total_files\":{},\"total_used\":{}}}}}",
+        timestamp,
+        json_escape(&sanitise_path(&username)),
+        total_files,
+        total_used
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // K-way merge from re-opened readers
     let mut readers3: Vec<std::io::Lines<BufReader<fs::File>>> = Vec::new();
@@ -165,9 +184,18 @@ fn merge_write_user_report(
 
     while let Some((size, raw_path, idx)) = heap3.pop() {
         let safe = sanitise_path(&raw_path);
-        let xt = std::path::Path::new(&safe).extension().and_then(|s| s.to_str()).unwrap_or("");
-        writeln!(w, "{{\"path\":{},\"size\":{},\"xt\":{}}}", json_escape(&safe), size, json_escape(xt))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let xt = std::path::Path::new(&safe)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        writeln!(
+            w,
+            "{{\"path\":{},\"size\":{},\"xt\":{}}}",
+            json_escape(&safe),
+            size,
+            json_escape(xt)
+        )
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Pull next line from same chunk
         if let Some(Ok(line)) = readers3[idx].next() {
@@ -177,7 +205,8 @@ fn merge_write_user_report(
         }
     }
 
-    w.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    w.flush()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Output omitted to keep terminal clean during parallel processing
     // let mem_mb = get_rss_mb();
@@ -186,7 +215,6 @@ fn merge_write_user_report(
 
     Ok((total_files, total_used))
 }
-
 
 pub(crate) fn parse_tsv_line(line: &str) -> Option<(u64, String)> {
     let tab = line.find('\t')?;
@@ -213,12 +241,16 @@ pub(crate) fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<
 
         // Expected: uid_{uid}_t{thread}_c{chunk}.tsv
         let rest = &name[4..];
-        let Some(pivot) = rest.find("_t") else { continue };
+        let Some(pivot) = rest.find("_t") else {
+            continue;
+        };
         if pivot == 0 {
             continue;
         }
         let uid_raw = &rest[..pivot];
-        let Ok(uid) = uid_raw.parse::<u32>() else { continue };
+        let Ok(uid) = uid_raw.parse::<u32>() else {
+            continue;
+        };
         if wanted.contains(&uid) {
             files.push(entry.path().to_string_lossy().to_string());
         }
@@ -230,19 +262,20 @@ pub(crate) fn glob_module_rust_many(tmpdir: &str, uids: &[u32]) -> PyResult<Vec<
 
 fn _write_empty_report(output_path: &str, username: &str, timestamp: i64) -> PyResult<()> {
     if let Some(parent) = std::path::Path::new(output_path).parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        fs::create_dir_all(parent).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
     let mut w = BufWriter::new(
-        fs::File::create(output_path)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        fs::File::create(output_path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     );
-    writeln!(w, "{{\"_meta\":{{\"date\":{},\"user\":{},\"total_files\":0,\"total_used\":0}}}}",
-        timestamp, json_escape(username))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    writeln!(
+        w,
+        "{{\"_meta\":{{\"date\":{},\"user\":{},\"total_files\":0,\"total_used\":0}}}}",
+        timestamp,
+        json_escape(username)
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(())
 }
-
 
 #[pyfunction(signature = (directory, skip_dirs, target_uids, max_workers=None, debug=false))]
 fn scan_disk(
@@ -253,7 +286,15 @@ fn scan_disk(
     max_workers: Option<usize>,
     debug: bool,
 ) -> PyResult<PyObject> {
-    scan_core::run_scan_core(py, directory, skip_dirs, target_uids, max_workers, debug, "production")
+    scan_core::run_scan_core(
+        py,
+        directory,
+        skip_dirs,
+        target_uids,
+        max_workers,
+        debug,
+        "production",
+    )
 }
 
 #[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
@@ -275,8 +316,20 @@ fn build_pipeline(
     debug: bool,
 ) -> PyResult<u64> {
     build_pipeline_impl(
-        py, tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db,
-        treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap, debug
+        py,
+        tmpdir,
+        uids_map,
+        team_map,
+        pipeline_db_path,
+        treemap_json,
+        treemap_db,
+        treemap_root,
+        max_level,
+        min_size_bytes,
+        timestamp,
+        max_workers,
+        build_treemap,
+        debug,
     )
 }
 
@@ -299,8 +352,20 @@ fn build_pipeline_dbs(
     debug: bool,
 ) -> PyResult<u64> {
     report_pipeline::build_pipeline_dbs_impl(
-        py, tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db,
-        treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap, debug
+        py,
+        tmpdir,
+        uids_map,
+        team_map,
+        pipeline_db_path,
+        treemap_json,
+        treemap_db,
+        treemap_root,
+        max_level,
+        min_size_bytes,
+        timestamp,
+        max_workers,
+        build_treemap,
+        debug,
     )
 }
 

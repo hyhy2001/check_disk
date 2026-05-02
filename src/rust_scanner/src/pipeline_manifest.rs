@@ -23,7 +23,9 @@ pub fn build_pipeline_impl(
     debug: bool,
 ) -> PyResult<u64> {
     // Run pipeline DB builder, then build compact root manifest metadata.
-    let fast_scanner = py.import("src.fast_scanner").or_else(|_| py.import("fast_scanner"))?;
+    let fast_scanner = py
+        .import("src.fast_scanner")
+        .or_else(|_| py.import("fast_scanner"))?;
     let f = fast_scanner
         .getattr("build_pipeline_dbs")
         .or_else(|_| fast_scanner.getattr("build_pipeline_dbs"))?;
@@ -33,17 +35,17 @@ pub fn build_pipeline_impl(
     let total_files: u64 = f
         .call(
             (
-            tmpdir.clone(),
-            uids_map.clone(),
-            team_map.clone(),
-            pipeline_db_path.clone(),
-            treemap_json,
-            treemap_db,
-            treemap_root.clone(),
-            max_level,
-            min_size_bytes,
-            timestamp,
-            max_workers,
+                tmpdir.clone(),
+                uids_map.clone(),
+                team_map.clone(),
+                pipeline_db_path.clone(),
+                treemap_json,
+                treemap_db,
+                treemap_root.clone(),
+                max_level,
+                min_size_bytes,
+                timestamp,
+                max_workers,
             ),
             Some(kwargs),
         )?
@@ -114,7 +116,8 @@ pub fn build_pipeline_impl(
 
     fs::write(
         detail_root.join("data_detail.json"),
-        serde_json::to_string_pretty(&root_manifest).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        serde_json::to_string_pretty(&root_manifest)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("write data_detail.json: {}", e)))?;
 
