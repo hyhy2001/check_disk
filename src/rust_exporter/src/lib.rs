@@ -1,3 +1,4 @@
+use flate2::read::GzDecoder;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -6,7 +7,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -72,6 +73,8 @@ struct UserManifest {
 struct DirsRef {
     #[serde(default)]
     path: String,
+    #[serde(default)]
+    parts: Vec<FilePartRef>,
 }
 
 #[derive(Deserialize, Default)]
@@ -177,8 +180,8 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
     }
 }
 
-fn parse_ndjson_reader(file: File, kind: &'static str, entries: &mut Vec<ExportEntry>) {
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+fn parse_ndjson_reader<R: Read>(reader: R, kind: &'static str, entries: &mut Vec<ExportEntry>) {
+    for line in BufReader::new(reader).lines().map_while(Result::ok) {
         if let Ok(item) = serde_json::from_str::<JsonItem>(&line) {
             let size = if kind == "dir " { item.dir_used() } else { item.file_size() };
             if let Some(path) = item.path {
@@ -197,7 +200,11 @@ fn parse_ndjson_path(path: &Path, kind: &'static str) -> Vec<ExportEntry> {
         }
     };
     let mut entries = Vec::new();
-    parse_ndjson_reader(file, kind, &mut entries);
+    if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        parse_ndjson_reader(GzDecoder::new(file), kind, &mut entries);
+    } else {
+        parse_ndjson_reader(file, kind, &mut entries);
+    }
     entries
 }
 
@@ -238,8 +245,21 @@ fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, ent
     let user_dir = user_manifest_path.parent().unwrap_or(detail_dir);
 
     if kind == "dir " {
-        let dir_rel = if user_manifest.dirs.path.is_empty() { "dirs.ndjson" } else { user_manifest.dirs.path.as_str() };
-        entries.extend(parse_ndjson_path(&user_dir.join(dir_rel), kind));
+        let dir_parts: Vec<PathBuf> = if !user_manifest.dirs.parts.is_empty() {
+            user_manifest.dirs.parts
+                .into_iter()
+                .filter(|part| !part.path.is_empty())
+                .map(|part| user_dir.join(part.path))
+                .collect()
+        } else {
+            let dir_rel = if user_manifest.dirs.path.is_empty() { "dirs.ndjson" } else { user_manifest.dirs.path.as_str() };
+            vec![user_dir.join(dir_rel)]
+        };
+        let mut dir_entries: Vec<ExportEntry> = dir_parts
+            .par_iter()
+            .flat_map_iter(|path| parse_ndjson_path(path, kind))
+            .collect();
+        entries.append(&mut dir_entries);
     } else {
         let part_paths: Vec<PathBuf> = user_manifest.files.parts
             .into_iter()

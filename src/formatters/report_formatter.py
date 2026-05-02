@@ -4,6 +4,7 @@ Report Formatter Module
 Contains the ReportFormatter class for formatting and displaying reports.
 """
 
+import gzip
 import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -281,9 +282,9 @@ class ReportFormatter(BaseFormatter):
             "date": int(manifest.get("scan_date", root_manifest.get("scan", {}).get("timestamp", 0)) or 0),
             "user": user,
             "directory": root_manifest.get("scan", {}).get("root", ""),
-            "total_dirs": int(summary.get("dirs", summary.get("total_dirs", 0)) or 0),
-            "total_files": int(summary.get("files", summary.get("total_files", 0)) or 0),
-            "total_used": int(summary.get("used", summary.get("total_used", 0)) or 0),
+            "total_dirs": int(summary.get("dirs", 0) or 0),
+            "total_files": int(summary.get("files", 0) or 0),
+            "total_used": int(summary.get("used", 0) or 0),
         }
 
         def _decode_file_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -309,26 +310,26 @@ class ReportFormatter(BaseFormatter):
                 "path": item.get("path", ""),
                 "used": int(item.get("used", 0) or 0),
             }
+        def _iter_part_lines(part_path: str):
+            opener = gzip.open if part_path.endswith(".gz") else open
+            with opener(part_path, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        yield line
+
         if is_dir:
-            top_path = os.path.join(user_dir, manifest.get("top_dirs", "top_dirs.json"))
-            if os.path.exists(top_path):
-                with open(top_path, "r", encoding="utf-8") as fh:
-                    data["dirs"] = [_decode_dir_item(x) for x in json.load(fh)]
-            else:
-                dirs_path = os.path.join(user_dir, manifest.get("dirs", {}).get("path", "dirs.ndjson"))
-                data.update(self._load_detail_from_ndjson(dirs_path, True))
+            data["dirs"] = []
+            for part in manifest.get("dirs", {}).get("parts", []):
+                part_path = os.path.join(user_dir, part.get("path", ""))
+                for line in _iter_part_lines(part_path):
+                    data["dirs"].append(_decode_dir_item(json.loads(line)))
         else:
-            top_path = os.path.join(user_dir, manifest.get("top_files", "top_files.json"))
-            if os.path.exists(top_path):
-                with open(top_path, "r", encoding="utf-8") as fh:
-                    data["files"] = [_decode_file_item(x) for x in json.load(fh)]
-            else:
-                files = []
-                for part in manifest.get("files", {}).get("parts", []):
-                    part_path = os.path.join(user_dir, part.get("path", ""))
-                    part_data = self._load_detail_from_ndjson(part_path, False)
-                    files.extend(part_data.get("files", []))
-                data["files"] = files
+            data["files"] = []
+            for part in manifest.get("files", {}).get("parts", []):
+                part_path = os.path.join(user_dir, part.get("path", ""))
+                for line in _iter_part_lines(part_path):
+                    data["files"].append(_decode_file_item(json.loads(line)))
         return data
 
     def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
