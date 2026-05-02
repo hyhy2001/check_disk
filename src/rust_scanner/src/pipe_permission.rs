@@ -24,9 +24,13 @@ pub fn write_permission_issues_json(
             "type": evt.kind,
             "error": evt.errcode,
         });
-        let owner = uids_map.get(&evt.uid)
-            .cloned()
-            .unwrap_or_else(|| if evt.uid == 0 { "unknown".to_string() } else { format!("uid-{}", evt.uid) });
+        let owner = uids_map.get(&evt.uid).cloned().unwrap_or_else(|| {
+            if evt.uid == 0 {
+                "unknown".to_string()
+            } else {
+                format!("uid-{}", evt.uid)
+            }
+        });
         if owner == "unknown" {
             unknown_items.push(item);
         } else {
@@ -38,7 +42,12 @@ pub fn write_permission_issues_json(
         .into_iter()
         .map(|(name, items)| json!({"name": name, "inaccessible_items": items}))
         .collect();
-    users.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    users.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
 
     let report = json!({
         "date": timestamp,

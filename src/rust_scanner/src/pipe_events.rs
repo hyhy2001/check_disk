@@ -27,12 +27,16 @@ fn prepare_bin_reader(
             Ok(reader)
         }
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            reader
-                .seek(SeekFrom::Start(0))
-                .map_err(|seek_err| PyRuntimeError::new_err(format!("seek {}: {}", path.display(), seek_err)))?;
+            reader.seek(SeekFrom::Start(0)).map_err(|seek_err| {
+                PyRuntimeError::new_err(format!("seek {}: {}", path.display(), seek_err))
+            })?;
             Ok(reader)
         }
-        Err(e) => Err(PyRuntimeError::new_err(format!("read {}: {}", path.display(), e))),
+        Err(e) => Err(PyRuntimeError::new_err(format!(
+            "read {}: {}",
+            path.display(),
+            e
+        ))),
     }
 }
 
@@ -57,10 +61,7 @@ pub fn get_dir_agg_files(tmpdir: &str) -> PyResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub fn for_each_scan_event_in_file<F>(
-    path: &std::path::Path,
-    mut on_event: F,
-) -> PyResult<()>
+pub fn for_each_scan_event_in_file<F>(path: &std::path::Path, mut on_event: F) -> PyResult<()>
 where
     F: FnMut(ScanEvent),
 {
@@ -82,9 +83,9 @@ where
         let size = u64::from_le_bytes(header[4..12].try_into().unwrap());
         let path_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
         let mut path_bytes = vec![0u8; path_len];
-        reader.read_exact(&mut path_bytes).map_err(|e| {
-            PyRuntimeError::new_err(format!("read path {}: {}", path.display(), e))
-        })?;
+        reader
+            .read_exact(&mut path_bytes)
+            .map_err(|e| PyRuntimeError::new_err(format!("read path {}: {}", path.display(), e)))?;
         let path_str = String::from_utf8_lossy(&path_bytes).to_string();
         on_event(ScanEvent {
             uid,

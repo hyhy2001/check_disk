@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -118,19 +119,28 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
     alice_dir = detail_manifest.parent / "users" / "alice"
     alice_manifest = json.loads((alice_dir / "manifest.json").read_text(encoding="utf-8"))
     alice_part = alice_manifest["files"]["parts"][0]["path"]
-    alice_files = [
-        json.loads(line)
-        for line in (alice_dir / alice_part).read_text(encoding="utf-8").splitlines()
-    ]
+    alice_part_path = alice_dir / alice_part
+    if alice_part_path.suffix == ".gz":
+        import gzip
+        alice_lines = gzip.open(alice_part_path, "rt", encoding="utf-8").read().splitlines()
+    else:
+        alice_lines = alice_part_path.read_text(encoding="utf-8").splitlines()
+    alice_files = [json.loads(line) for line in alice_lines]
     assert [row["s"] for row in alice_files] == [4096, 2048, 512]
     assert [row["s"] for row in alice_files if row["x"] == "log"] == [2048]
     assert any(row["p"].endswith("alpha.txt") for row in alice_files)
 
     bob_dir = detail_manifest.parent / "users" / "bob"
-    bob_dirs = [
-        json.loads(line)
-        for line in (bob_dir / "dirs.ndjson").read_text(encoding="utf-8").splitlines()
-    ]
+    bob_manifest = json.loads((bob_dir / "manifest.json").read_text(encoding="utf-8"))
+    bob_dirs = []
+    for part in bob_manifest["dirs"]["parts"]:
+        part_path = bob_dir / part["path"]
+        if part_path.suffix == ".gz":
+            import gzip
+            lines = gzip.open(part_path, "rt", encoding="utf-8").read().splitlines()
+        else:
+            lines = part_path.read_text(encoding="utf-8").splitlines()
+        bob_dirs.extend(json.loads(line) for line in lines)
     assert sorted(row["s"] for row in bob_dirs) == [1024, 8192]
 
     tree = json.loads(tree_manifest.read_text(encoding="utf-8"))
@@ -209,6 +219,19 @@ def test_cli_check_users_uses_data_detail_manifest(tmp_path):
     assert file_files["alice"] == expected
     assert dir_files["missing"] == expected
     assert file_files["missing"] == expected
+
+
+def test_phase2_log_labels_are_stable():
+    pipeline_src = Path("/www/wwwroot/disk.hydev.me/check_disk/src/rust_scanner/src/report_pipeline.rs").read_text(encoding="utf-8")
+    treemap_src = Path("/www/wwwroot/disk.hydev.me/check_disk/src/rust_scanner/src/pipe_treemap.rs").read_text(encoding="utf-8")
+
+    assert "[Phase 2A] Detail build progress:" in pipeline_src
+    assert "[Phase 2A] Detail build complete:" in pipeline_src
+    assert "[Phase 2B] TreeMap build started..." in pipeline_src
+    assert "[Phase 2B] TreeMap build completed in" in pipeline_src
+    assert "[Phase 2B] TreeMap: grouping directories..." in treemap_src
+    assert "[Phase 2B] TreeMap: building" in treemap_src
+    assert "[Phase 2B] TreeMap shards:" in treemap_src
 
 def test_unified_json_outputs_permission_issues(tmp_path):
     _, _, detail_manifest, _, _ = _build_unified_fixture(tmp_path)

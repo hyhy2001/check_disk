@@ -60,7 +60,12 @@ fn spill_rows_to_disk(
         let safe = safe_user_dir(&username);
         let id = seq.fetch_add(1, Ordering::Relaxed);
         let path = spool_root.join(format!("{}_{}.rows", safe, id));
-        let file = match OpenOptions::new().create(true).write(true).truncate(true).open(&path) {
+        let file = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -71,7 +76,9 @@ fn spill_rows_to_disk(
             let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
             if writer.write_all(&size.to_le_bytes()).is_err()
                 || writer.write_all(&len.to_le_bytes()).is_err()
-                || writer.write_all(&path_bytes[..(len as usize).min(path_bytes.len())]).is_err()
+                || writer
+                    .write_all(&path_bytes[..(len as usize).min(path_bytes.len())])
+                    .is_err()
             {
                 write_ok = false;
                 break;
@@ -118,7 +125,9 @@ fn build_chunk_jobs_from_spills(
                 jobs.push(FileChunkJob {
                     username: username.to_string(),
                     chunk_index,
-                    output_dir: tmp_dir.join("files").join(format!("chunk-{:05}", chunk_index)),
+                    output_dir: tmp_dir
+                        .join("files")
+                        .join(format!("chunk-{:05}", chunk_index)),
                     rows: std::mem::take(&mut rows),
                 });
                 chunk_index += 1;
@@ -129,7 +138,9 @@ fn build_chunk_jobs_from_spills(
         jobs.push(FileChunkJob {
             username: username.to_string(),
             chunk_index,
-            output_dir: tmp_dir.join("files").join(format!("chunk-{:05}", chunk_index)),
+            output_dir: tmp_dir
+                .join("files")
+                .join(format!("chunk-{:05}", chunk_index)),
             rows,
         });
     }
@@ -286,7 +297,7 @@ pub fn build_pipeline_dbs_impl(
 
         let dir_sizes_by_user = if has_dir_agg {
             println!(
-                "[Phase 2] Loading {} Phase 1 directory aggregate shards...",
+                "[Phase 2] Loading {} pre-aggregated directory shard(s)...",
                 dir_agg_paths.len()
             );
             dir_agg_paths
@@ -428,19 +439,20 @@ pub fn build_pipeline_dbs_impl(
             done_users += 1;
             let pct = (done_users as f64 / total_users as f64) * 100.0;
             print!(
-                "\r[Phase 2] Detail reports: {}/{} users ({:.1}%) ... ",
+                "\r[Phase 2A] Detail build progress: {}/{} users ({:.1}%) ... ",
                 done_users, total_users, pct
             );
             let _ = std::io::stdout().flush();
         }
         println!();
+        println!("[Phase 2A] Detail build complete: {}/{} users", done_users, total_users);
         t_chunk_parallel = t3.elapsed().as_secs_f64();
 
         let t4 = Instant::now();
         t_finalize = t4.elapsed().as_secs_f64();
 
         if build_treemap {
-            println!("[Phase 2] Detail reports completed. Starting TreeMap build...");
+            println!("[Phase 2B] TreeMap build started...");
 
             let t5 = Instant::now();
             write_treemap_json_outputs(
@@ -453,7 +465,7 @@ pub fn build_pipeline_dbs_impl(
                 min_size_bytes,
             )?;
             t_tree = t5.elapsed().as_secs_f64();
-            println!("[Phase 2] TreeMap build completed in {:.2}s", t_tree);
+            println!("[Phase 2B] TreeMap build completed in {:.2}s", t_tree);
         } else {
             let _ = fs::remove_dir_all(&tree_work_dir);
         }

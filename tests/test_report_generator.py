@@ -110,7 +110,13 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
     user_dir = tmp_path / "detail_users" / "users" / "alice"
     user_manifest = json.loads((user_dir / "manifest.json").read_text(encoding="utf-8"))
     part_path = user_manifest["files"]["parts"][0]["path"]
-    file_rows = [json.loads(x) for x in (user_dir / part_path).read_text(encoding="utf-8").splitlines()]
+    file_part = user_dir / part_path
+    if file_part.suffix == ".gz":
+        import gzip
+        lines = gzip.open(file_part, "rt", encoding="utf-8").read().splitlines()
+    else:
+        lines = file_part.read_text(encoding="utf-8").splitlines()
+    file_rows = [json.loads(x) for x in lines]
     assert len(file_rows) == 2
     assert any(r["p"].endswith("alpha.txt") for r in file_rows)
     assert any(r["p"].endswith("beta.log") for r in file_rows)

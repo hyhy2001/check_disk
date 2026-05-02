@@ -369,12 +369,10 @@ def main():
             prefix = config.get('output_prefix', '')
 
             heartbeat.set_phase("report", "Generating main summary reports")
-            print("\n=== GENERATING REPORTS ===")
+            print("\n=== PHASE 1: SUMMARY REPORTS ===")
 
             # Main summary report
             report_generator.generate_report(scan_results)
-            if main_report_path:
-                print(f"Main summary report saved to: {main_report_path}")
 
             # Enqueue main + sibling reports AFTER they are written to disk
             if sync_pipeline and main_report_path:
@@ -391,6 +389,7 @@ def main():
             # Per-user detail reports (dir + file) - runs with same
             # concurrency level as the scanner (Phase 1 workers reused)
             heartbeat.set_phase("detail", "Generating user detail reports")
+            print("=== PHASE 2: DETAIL PIPELINE ===")
             tree_level = getattr(args, 'level', 3)
             created = report_generator.generate_detail_reports_with_level(
                 scan_results,
@@ -445,7 +444,10 @@ def main():
             _update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             if main_report_path:
-                print(f"Main summary report: {main_report_path}")
+                print(f"Summary report: {main_report_path}")
+            detail_manifest = os.path.join(out_dir, "detail_users", "data_detail.json")
+            if os.path.exists(detail_manifest):
+                print(f"Detail manifest: {detail_manifest}")
             total_elapsed = time.time() - run_started_at
             print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 

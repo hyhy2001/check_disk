@@ -20,7 +20,7 @@ pub fn write_treemap_json_outputs(
     max_level: usize,
     min_size_bytes: i64,
 ) -> PyResult<u64> {
-    println!("[Phase 2] TreeMap: grouping directories...");
+    println!("[Phase 2B] TreeMap: grouping directories...");
     let root = normalize_root(root_dir);
     let mut direct_sizes: HashMap<String, i64> = HashMap::new();
     let mut all_dirs: HashMap<String, ()> = HashMap::new();
@@ -53,8 +53,9 @@ pub fn write_treemap_json_outputs(
 
     let mut paths: Vec<String> = all_dirs.keys().cloned().collect();
     paths.sort();
-    println!("[Phase 2] TreeMap: building {} shard(s)...", paths.len());
-    let path_to_shard: HashMap<String, String> = paths.iter()
+    println!("[Phase 2B] TreeMap: building {} shard(s)...", paths.len());
+    let path_to_shard: HashMap<String, String> = paths
+        .iter()
         .map(|path| (path.clone(), shard_id_for_path(path)))
         .collect();
 
@@ -64,7 +65,10 @@ pub fn write_treemap_json_outputs(
             continue;
         }
         let parent = tm_parent(path).to_string();
-        parent_to_children.entry(parent).or_default().push(path.clone());
+        parent_to_children
+            .entry(parent)
+            .or_default()
+            .push(path.clone());
     }
 
     let mut recursive_sizes = direct_sizes;
@@ -89,25 +93,42 @@ pub fn write_treemap_json_outputs(
     let written = AtomicUsize::new(0);
     let bucket_map: Arc<Mutex<HashMap<String, HashMap<String, serde_json::Value>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    paths.par_iter().try_for_each(|path| -> Result<(), String> {
-        let shard_id = path_to_shard.get(path).ok_or_else(|| format!("missing shard id for {}", path))?;
-        let children = shard_children_json(path, &parent_to_children, &recursive_sizes, &dir_owner_map, &path_to_shard, min_size_bytes);
-        if !children.is_empty() || path == &root {
-            let prefix = shard_bucket_prefix(shard_id);
-            let mut guard = bucket_map.lock().map_err(|_| "bucket map lock poisoned".to_string())?;
-            guard
-                .entry(prefix.to_string())
-                .or_default()
-                .insert(path.clone(), json!(children));
-            written.fetch_add(1, Ordering::Relaxed);
-        }
-        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-        if done % 10_000 == 0 || done == total_paths {
-            let percent = (done as f64 / total_paths as f64) * 100.0;
-            print!("\r[Phase 2] TreeMap shards: {}/{} ({:.1}%) ... ", done, total_paths, percent);
-        }
-        Ok(())
-    }).map_err(PyRuntimeError::new_err)?;
+    paths
+        .par_iter()
+        .try_for_each(|path| -> Result<(), String> {
+            let shard_id = path_to_shard
+                .get(path)
+                .ok_or_else(|| format!("missing shard id for {}", path))?;
+            let children = shard_children_json(
+                path,
+                &parent_to_children,
+                &recursive_sizes,
+                &dir_owner_map,
+                &path_to_shard,
+                min_size_bytes,
+            );
+            if !children.is_empty() || path == &root {
+                let prefix = shard_bucket_prefix(shard_id);
+                let mut guard = bucket_map
+                    .lock()
+                    .map_err(|_| "bucket map lock poisoned".to_string())?;
+                guard
+                    .entry(prefix.to_string())
+                    .or_default()
+                    .insert(path.clone(), json!(children));
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+            let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 10_000 == 0 || done == total_paths {
+                let percent = (done as f64 / total_paths as f64) * 100.0;
+                print!(
+                    "\r[Phase 2B] TreeMap shards: {}/{} ({:.1}%) ... ",
+                    done, total_paths, percent
+                );
+            }
+            Ok(())
+        })
+        .map_err(PyRuntimeError::new_err)?;
     println!();
     let buckets = bucket_map
         .lock()
@@ -116,12 +137,20 @@ pub fn write_treemap_json_outputs(
         write_json_file_result(
             &shards_dir.join(prefix).join("bucket.json"),
             &json!(payload),
-        ).map_err(PyRuntimeError::new_err)?;
+        )
+        .map_err(PyRuntimeError::new_err)?;
     }
     let shard_count = written.load(Ordering::Relaxed) as u64;
     let bucket_count = buckets.len() as u64;
 
-    let root_children = shard_children_json(&root, &parent_to_children, &recursive_sizes, &dir_owner_map, &path_to_shard, min_size_bytes);
+    let root_children = shard_children_json(
+        &root,
+        &parent_to_children,
+        &recursive_sizes,
+        &dir_owner_map,
+        &path_to_shard,
+        min_size_bytes,
+    );
     let root_node = json!({
         "version": 1,
         "format": "check-disk-treemap-json",
@@ -140,15 +169,18 @@ pub fn write_treemap_json_outputs(
     });
     write_json_file(Path::new(json_path), &root_node)?;
 
-    write_json_file(&data_dir.join("manifest.json"), &json!({
-        "version": 2,
-        "format": "check-disk-treemap-shards-bucketed-json",
-        "root_shard_id": path_to_shard.get(&root).cloned().unwrap_or_else(|| "000000".to_string()),
-        "shard_count": shard_count,
-        "bucket_count": bucket_count,
-        "shard_lookup_key": "path",
-        "shard_path_template": "shards/{prefix}/bucket.json"
-    }))?;
+    write_json_file(
+        &data_dir.join("manifest.json"),
+        &json!({
+            "version": 2,
+            "format": "check-disk-treemap-shards-bucketed-json",
+            "root_shard_id": path_to_shard.get(&root).cloned().unwrap_or_else(|| "000000".to_string()),
+            "shard_count": shard_count,
+            "bucket_count": bucket_count,
+            "shard_lookup_key": "path",
+            "shard_path_template": "shards/{prefix}/bucket.json"
+        }),
+    )?;
 
     Ok(shard_count)
 }
@@ -161,7 +193,10 @@ fn shard_children_json(
     path_to_shard: &HashMap<String, String>,
     min_size_bytes: i64,
 ) -> Vec<serde_json::Value> {
-    let mut items: Vec<_> = parent_to_children.get(path).into_iter().flatten()
+    let mut items: Vec<_> = parent_to_children
+        .get(path)
+        .into_iter()
+        .flatten()
         .filter_map(|child| {
             let size = recursive_sizes.get(child).copied().unwrap_or(0);
             if size < min_size_bytes {
@@ -178,18 +213,31 @@ fn shard_children_json(
             }))
         })
         .collect();
-    items.sort_by(|a, b| b["value"].as_i64().unwrap_or(0).cmp(&a["value"].as_i64().unwrap_or(0)));
+    items.sort_by(|a, b| {
+        b["value"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["value"].as_i64().unwrap_or(0))
+    });
     items
 }
 
 fn normalize_root(root_dir: &str) -> String {
     let trimmed = root_dir.trim_end_matches('/');
-    if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn tm_depth(path: &str, root: &str) -> usize {
     let rel = path.strip_prefix(root).unwrap_or(path).trim_matches('/');
-    if rel.is_empty() { 0 } else { rel.split('/').count() }
+    if rel.is_empty() {
+        0
+    } else {
+        rel.split('/').count()
+    }
 }
 
 fn tm_clamp(path: &str, root: &str, max_level: usize) -> String {

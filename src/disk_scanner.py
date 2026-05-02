@@ -73,6 +73,9 @@ class DiskScanner:
         self._scanner = None
 
     def scan(self) -> ScanResult:
+        directory = self.config.get("directory", "/")
+        if not os.path.isdir(directory):
+            raise RuntimeError(f"Scan directory does not exist: {directory}")
         if self.use_rust:
             return self._rust_scan()
         return self._scanner.scan()
@@ -215,8 +218,11 @@ class DiskScanner:
 
         print(f"{'='*60}")
         print("Disk Information (final snapshot):")
-        print(f"  Total capacity: {format_size(system_info.get('total', 0))}")
-        print(f"  Used space:     {format_size(system_info.get('used', 0))} ({system_info.get('used', 0) * 100 / system_info.get('total', 1):.1f}%)")
+        total_capacity = float(system_info.get('total', 0) or 0)
+        used_space = float(system_info.get('used', 0) or 0)
+        used_percent = (used_space * 100.0 / total_capacity) if total_capacity > 0 else 0.0
+        print(f"  Total capacity: {format_size(total_capacity)}")
+        print(f"  Used space:     {format_size(used_space)} ({used_percent:.1f}%)")
         print(f"  Available:      {format_size(system_info.get('available', 0))}")
         print(f"{'='*60}")
 
