@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+
+# Development tools
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Claude/AI Tools
+.claude/
+.agent/
+.codex
+
+# Project specific
+*.log
+.env
+reports/
+detail_users/
+reports_test/
+report_*/
+report_test/
+report_validate_after_buildsh/
+report_golden_after_compact/
+test_zone/
+output_txt/
+disk_checker_config.json
