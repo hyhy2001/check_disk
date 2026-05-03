@@ -50,3 +50,4 @@ report_golden_after_compact/
 test_zone/
 output_txt/
 disk_checker_config.json
+docs/
