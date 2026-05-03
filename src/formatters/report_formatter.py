@@ -4,9 +4,10 @@ Report Formatter Module
 Contains the ReportFormatter class for formatting and displaying reports.
 """
 
-import gzip
 import json
 import os
+import gzip
+import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils import format_size, format_timestamp
@@ -255,10 +256,12 @@ class ReportFormatter(BaseFormatter):
 
     def _load_detail_report(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
         """Load detail report from generated manifest, NDJSON, or JSON."""
-        if path.endswith('data_detail.json'):
+        if path.endswith('manifest.json'):
             return self._load_detail_from_manifest(path, is_dir, user=user)
-        if path.endswith('.ndjson'):
+        if path.endswith('.ndjson') or path.endswith('.ndjson.gz'):
             return self._load_detail_from_ndjson(path, is_dir)
+        if path.endswith('.bin.gz') or path.endswith('.bin'):
+            return self._load_detail_from_bin(path, is_dir)
 
         from ..utils import load_json_report
         return load_json_report(path)
@@ -267,74 +270,112 @@ class ReportFormatter(BaseFormatter):
         with open(path, "r", encoding="utf-8") as fh:
             root_manifest = json.load(fh)
         base_dir = os.path.dirname(path)
+
         user_entry = next(
             (entry for entry in root_manifest.get("users", []) if entry.get("username") == user),
             None,
         )
+
+        scan_meta: Dict[str, Any] = root_manifest.get("scan", {}) if isinstance(root_manifest, dict) else {}
         if not user_entry:
+            users_index_path = os.path.join(base_dir, "api", "users_index.min.json")
+            if os.path.exists(users_index_path):
+                with open(users_index_path, "r", encoding="utf-8") as fh:
+                    users_index = json.load(fh)
+                user_entry = next(
+                    (entry for entry in users_index if isinstance(entry, dict) and entry.get("username") == user),
+                    None,
+                )
+            data_detail_min = os.path.join(base_dir, "api", "data_detail.min.json")
+            if os.path.exists(data_detail_min):
+                with open(data_detail_min, "r", encoding="utf-8") as fh:
+                    min_meta = json.load(fh)
+                scan_meta = min_meta.get("scan", {}) if isinstance(min_meta, dict) else {}
+
+        safe_user = "".join(c if c.isalnum() or c in "-_." else "_" for c in user)
+        manifest_rel = user_entry.get("manifest", "") if isinstance(user_entry, dict) else ""
+        manifest_path = os.path.join(base_dir, manifest_rel) if manifest_rel else os.path.join(base_dir, "users", safe_user, "manifest.json")
+        if not os.path.exists(manifest_path):
             return {}
-        manifest_path = os.path.join(base_dir, user_entry.get("manifest", ""))
+
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
         user_dir = os.path.dirname(manifest_path)
+        path_dict = self._load_paths_dict(user_dir, manifest)
         summary = manifest.get("summary", {})
         data: Dict[str, Any] = {
-            "date": int(manifest.get("scan_date", root_manifest.get("scan", {}).get("timestamp", 0)) or 0),
+            "date": int(manifest.get("scan_date", scan_meta.get("timestamp", 0)) or 0),
             "user": user,
-            "directory": root_manifest.get("scan", {}).get("root", ""),
+            "directory": scan_meta.get("root", ""),
             "total_dirs": int(summary.get("dirs", 0) or 0),
             "total_files": int(summary.get("files", 0) or 0),
             "total_used": int(summary.get("used", 0) or 0),
         }
 
+        def _resolve_path(item: Dict[str, Any]) -> str:
+            path_id = item.get("i")
+            if isinstance(path_id, int) and 0 <= path_id < len(path_dict):
+                return path_dict[path_id]
+            return item.get("p", "")
+
         def _decode_file_item(item: Dict[str, Any]) -> Dict[str, Any]:
-            if "p" in item and "s" in item:
-                return {
-                    "path": item.get("p", ""),
-                    "size": int(item.get("s", 0) or 0),
-                    "ext": item.get("x", ""),
-                }
             return {
-                "path": item.get("path", ""),
-                "size": int(item.get("size", 0) or 0),
-                "ext": item.get("ext", item.get("xt", "")),
+                "path": _resolve_path(item),
+                "size": int(item.get("s", 0) or 0),
+                "ext": item.get("x", ""),
             }
 
         def _decode_dir_item(item: Dict[str, Any]) -> Dict[str, Any]:
-            if "p" in item and "s" in item:
-                return {
-                    "path": item.get("p", ""),
-                    "used": int(item.get("s", 0) or 0),
-                }
             return {
-                "path": item.get("path", ""),
-                "used": int(item.get("used", 0) or 0),
+                "path": _resolve_path(item),
+                "used": int(item.get("s", 0) or 0),
             }
-        def _iter_part_lines(part_path: str):
-            opener = gzip.open if part_path.endswith(".gz") else open
-            with opener(part_path, "rt", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        yield line
-
         if is_dir:
-            data["dirs"] = []
-            for part in manifest.get("dirs", {}).get("parts", []):
-                part_path = os.path.join(user_dir, part.get("path", ""))
-                for line in _iter_part_lines(part_path):
-                    data["dirs"].append(_decode_dir_item(json.loads(line)))
+            top_path = os.path.join(user_dir, manifest.get("top_dirs", "top_dirs.json"))
+            if os.path.exists(top_path):
+                with open(top_path, "r", encoding="utf-8") as fh:
+                    data["dirs"] = [_decode_dir_item(x) for x in json.load(fh)]
+            else:
+                dirs = []
+                for part in manifest.get("dirs", {}).get("parts", []):
+                    part_path = os.path.join(user_dir, part.get("path", ""))
+                    part_loader = self._load_detail_from_bin if part_path.endswith(".bin") or part_path.endswith(".bin.gz") else self._load_detail_from_ndjson
+                    part_data = part_loader(part_path, True, path_dict=path_dict)
+                    dirs.extend(part_data.get("dirs", []))
+                data["dirs"] = dirs
         else:
-            data["files"] = []
-            for part in manifest.get("files", {}).get("parts", []):
-                part_path = os.path.join(user_dir, part.get("path", ""))
-                for line in _iter_part_lines(part_path):
-                    data["files"].append(_decode_file_item(json.loads(line)))
+            top_path = os.path.join(user_dir, manifest.get("top_files", "top_files.json"))
+            if os.path.exists(top_path):
+                with open(top_path, "r", encoding="utf-8") as fh:
+                    data["files"] = [_decode_file_item(x) for x in json.load(fh)]
+            else:
+                files = []
+                for part in manifest.get("files", {}).get("parts", []):
+                    part_path = os.path.join(user_dir, part.get("path", ""))
+                    part_loader = self._load_detail_from_bin if part_path.endswith(".bin") or part_path.endswith(".bin.gz") else self._load_detail_from_ndjson
+                    part_data = part_loader(part_path, False, path_dict=path_dict)
+                    files.extend(part_data.get("files", []))
+                data["files"] = files
         return data
 
-    def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
+    def _load_paths_dict(self, user_dir: str, manifest: Dict[str, Any]) -> List[str]:
+        dict_rel = manifest.get("paths_dict", "")
+        if not dict_rel:
+            return []
+        dict_path = os.path.join(user_dir, dict_rel)
+        if not os.path.exists(dict_path):
+            return []
+        open_fn = gzip.open if dict_path.endswith(".gz") else open
+        with open_fn(dict_path, "rt", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            return [str(item) for item in loaded]
+        return []
+
+    def _load_detail_from_ndjson(self, path: str, is_dir: bool, path_dict: Optional[List[str]] = None) -> Dict[str, Any]:
         data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
-        with open(path, "r", encoding="utf-8") as fh:
+        open_fn = gzip.open if path.endswith(".gz") else open
+        with open_fn(path, "rt", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -357,18 +398,74 @@ class ReportFormatter(BaseFormatter):
                     continue
 
                 if is_dir:
-                    p = obj.get("path", obj.get("p"))
+                    path_id = obj.get("i")
+                    p = None
+                    if isinstance(path_id, int) and path_dict and 0 <= path_id < len(path_dict):
+                        p = path_dict[path_id]
+                    elif "p" in obj:
+                        p = obj.get("p")
                     if p is not None:
                         data.setdefault("dirs", []).append({
                             "path": p,
-                            "used": int(obj.get("used", obj.get("s", 0)) or 0),
+                            "used": int(obj.get("s", 0) or 0),
                         })
                 else:
-                    p = obj.get("path", obj.get("p"))
+                    path_id = obj.get("i")
+                    p = None
+                    if isinstance(path_id, int) and path_dict and 0 <= path_id < len(path_dict):
+                        p = path_dict[path_id]
+                    elif "p" in obj:
+                        p = obj.get("p")
                     if p is not None:
                         data.setdefault("files", []).append({
                             "path": p,
-                            "size": int(obj.get("size", obj.get("s", 0)) or 0),
-                            "ext": obj.get("ext", obj.get("xt", obj.get("x", ""))),
+                            "size": int(obj.get("s", 0) or 0),
+                            "ext": obj.get("x", ""),
                         })
+        return data
+
+    def _load_detail_from_bin(self, path: str, is_dir: bool, path_dict: Optional[List[str]] = None) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
+        open_fn = gzip.open if path.endswith(".gz") else open
+        with open_fn(path, "rb") as fh:
+            header = fh.read(8)
+            if len(header) < 8 or header[:4] != b"CDB4":
+                return data
+            kind = header[5]
+            if is_dir and kind != 1:
+                return data
+            if not is_dir and kind != 0:
+                return data
+
+            if is_dir:
+                while True:
+                    chunk = fh.read(12)
+                    if not chunk:
+                        break
+                    if len(chunk) < 12:
+                        break
+                    path_id, used = struct.unpack("<Iq", chunk)
+                    p = ""
+                    if path_dict and 0 <= path_id < len(path_dict):
+                        p = path_dict[path_id]
+                    data.setdefault("dirs", []).append({"path": p, "used": int(used)})
+            else:
+                while True:
+                    base = fh.read(14)
+                    if not base:
+                        break
+                    if len(base) < 14:
+                        break
+                    path_id, size, ext_len = struct.unpack("<IQH", base)
+                    ext_raw = fh.read(ext_len)
+                    if len(ext_raw) < ext_len:
+                        break
+                    p = ""
+                    if path_dict and 0 <= path_id < len(path_dict):
+                        p = path_dict[path_id]
+                    data.setdefault("files", []).append({
+                        "path": p,
+                        "size": int(size),
+                        "ext": ext_raw.decode("utf-8", errors="ignore"),
+                    })
         return data

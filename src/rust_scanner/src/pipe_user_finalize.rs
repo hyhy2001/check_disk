@@ -7,11 +7,30 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::pipe_io::{json_line_result, safe_user_dir, write_json_file, write_json_file_result};
+use crate::pipe_binary::crc32c_of_files;
+use crate::pipe_io::{write_json_file, write_json_file_result};
 use crate::pipe_types::{FileChunkResult, FILE_PART_RECORDS, UserBuildResult, UserJobMeta};
 
-fn compact_dir_row(path: &str, used: i64) -> serde_json::Value {
-    json!({"p": path, "s": used})
+const BIN_MAGIC: &[u8; 4] = b"CDB4";
+const BIN_KIND_DIR: u8 = 1;
+
+fn write_dir_part_header(writer: &mut BufWriter<GzEncoder<fs::File>>) -> Result<(), String> {
+    writer
+        .write_all(BIN_MAGIC)
+        .and_then(|_| writer.write_all(&[1u8, BIN_KIND_DIR, 0u8, 0u8]))
+        .map_err(|e| format!("write dir part header: {}", e))
+}
+
+fn write_dir_record(
+    writer: &mut BufWriter<GzEncoder<fs::File>>,
+    path_id: usize,
+    used: i64,
+) -> Result<(), String> {
+    let pid = u32::try_from(path_id).map_err(|_| format!("path id too large: {}", path_id))?;
+    writer
+        .write_all(&pid.to_le_bytes())
+        .and_then(|_| writer.write_all(&used.to_le_bytes()))
+        .map_err(|e| format!("write dir record: {}", e))
 }
 
 pub fn finalize_user_outputs(
@@ -51,7 +70,14 @@ pub fn finalize_user_outputs(
             }
         }
 
-        write_user_metadata_result(&meta, total_files, file_parts, dir_parts, extension_stats)?;
+        write_user_metadata_result(
+            &meta,
+            total_files,
+            file_parts,
+            dir_parts,
+            extension_stats,
+            "../../index_seed/paths.bin",
+        )?;
         if meta.final_dir.exists() {
             fs::remove_dir_all(&meta.final_dir).map_err(|e| {
                 format!(
@@ -88,7 +114,7 @@ pub fn finalize_user_outputs(
     Ok(user_results)
 }
 
-fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result<Vec<serde_json::Value>, String> {
+fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(usize, i64)]) -> Result<Vec<serde_json::Value>, String> {
     let dirs_dir = user_dir.join("dirs");
     fs::create_dir_all(&dirs_dir).map_err(|e| format!("create dirs dir: {}", e))?;
     let mut dir_parts: Vec<serde_json::Value> = Vec::new();
@@ -97,7 +123,7 @@ fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result
     let mut current_part_records = 0usize;
     let mut writer: Option<BufWriter<GzEncoder<fs::File>>> = None;
 
-    for (path, used) in top_dirs {
+    for (path_id, used) in top_dirs {
         if writer.is_none() || current_part_records >= FILE_PART_RECORDS {
             if let Some(mut w) = writer.take() {
                 w.flush().map_err(|e| format!("flush dir part: {}", e))?;
@@ -111,12 +137,14 @@ fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result
             fs::create_dir_all(&chunk_dir)
                 .map_err(|e| format!("create dir chunk {}: {}", chunk_dir.display(), e))?;
 
-            let rel_path = format!("dirs/chunk-{:05}/part-{:05}.ndjson.gz", chunk_idx, part_idx);
-            let part_path = chunk_dir.join(format!("part-{:05}.ndjson.gz", part_idx));
+            let rel_path = format!("dirs/chunk-{:05}/part-{:05}.bin.gz", chunk_idx, part_idx);
+            let part_path = chunk_dir.join(format!("part-{:05}.bin.gz", part_idx));
             let file = fs::File::create(&part_path)
                 .map_err(|e| format!("create dir part {}: {}", part_path.display(), e))?;
             let encoder = GzEncoder::new(file, Compression::default());
-            writer = Some(BufWriter::new(encoder));
+            let mut part_writer = BufWriter::new(encoder);
+            write_dir_part_header(&mut part_writer)?;
+            writer = Some(part_writer);
             dir_parts.push(json!({"path": rel_path, "records": 0}));
             current_part_records = 0;
             chunk_idx += 1;
@@ -124,7 +152,7 @@ fn write_user_dirs_result(user_dir: &Path, top_dirs: &[(String, i64)]) -> Result
         }
 
         let w = writer.as_mut().unwrap();
-        json_line_result(w, compact_dir_row(path, *used))?;
+        write_dir_record(w, *path_id, *used)?;
         current_part_records += 1;
     }
 
@@ -145,6 +173,7 @@ fn write_user_metadata_result(
     file_parts: Vec<serde_json::Value>,
     dir_parts: Vec<serde_json::Value>,
     extension_stats: HashMap<String, (i64, i64)>,
+    global_paths_rel: &str,
 ) -> Result<(), String> {
     let page_size: i64 = 500;
     let dirs_pages = std::cmp::max(1, (meta.total_dirs.max(0) + page_size - 1) / page_size);
@@ -174,6 +203,7 @@ fn write_user_metadata_result(
         },
         "page_index": "page_index.json",
         "extensions": "extensions.json",
+        "paths_dict": global_paths_rel,
         "files": {"parts": file_parts},
         "dirs": {"parts": dir_parts}
     });
@@ -186,21 +216,81 @@ pub fn write_detail_manifest(
     root: &str,
     timestamp: i64,
     total_files: i64,
+    total_paths: usize,
+    total_exts: usize,
+    total_docs: usize,
+    total_uid_totals: usize,
+    total_dir_user_sizes: usize,
+    total_perm_events: usize,
 ) -> PyResult<()> {
-    let user_entries: Vec<_> = users.iter().map(|user| {
-        json!({
-            "username": user.username,
-            "team_id": user.team_id,
-            "total_files": user.total_files,
-            "total_dirs": user.total_dirs,
-            "total_used": user.total_used,
-            "manifest": format!("users/{}/manifest.json", safe_user_dir(&user.username))
-        })
-    }).collect();
     let total_size: i64 = users.iter().map(|u| u.total_used).sum();
     let total_dirs: i64 = users.iter().map(|u| u.total_dirs).sum();
+
+    let file_bytes = |rel: &str| -> u64 {
+        fs::metadata(detail_root.join(rel)).map(|m| m.len()).unwrap_or(0)
+    };
+
+    let checksum_files = [
+        "dict/paths.dict.bin",
+        "dict/paths.parent.bin",
+        "dict/exts.dict.bin",
+        "dict/users.dict.bin",
+        "cols/doc.uid.bin",
+        "cols/doc.path_id.bin",
+        "cols/doc.size.bin",
+        "cols/doc.ext_id.bin",
+        "agg/uid_totals.bin",
+        "agg/dir_user_sizes.bin",
+        "agg/perm_events.bin",
+    ];
+    let checksum = crc32c_of_files(detail_root, &checksum_files)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
     let manifest = json!({
-        "format": "check-disk-detail",
+        "schema": "check-disk-detail",
+        "version": 1,
+        "created_at": timestamp,
+        "total_docs": total_docs,
+        "total_users": users.len(),
+        "total_paths": total_paths,
+        "files": {
+            "dict/paths.dict.bin": {"bytes": file_bytes("dict/paths.dict.bin"), "records": total_paths},
+            "dict/paths.parent.bin": {"bytes": file_bytes("dict/paths.parent.bin"), "records": total_paths},
+            "dict/exts.dict.bin": {"bytes": file_bytes("dict/exts.dict.bin"), "records": total_exts},
+            "dict/users.dict.bin": {"bytes": file_bytes("dict/users.dict.bin"), "records": users.len()},
+            "cols/doc.uid.bin": {"bytes": file_bytes("cols/doc.uid.bin"), "records": total_docs},
+            "cols/doc.path_id.bin": {"bytes": file_bytes("cols/doc.path_id.bin"), "records": total_docs},
+            "cols/doc.size.bin": {"bytes": file_bytes("cols/doc.size.bin"), "records": total_docs},
+            "cols/doc.ext_id.bin": {"bytes": file_bytes("cols/doc.ext_id.bin"), "records": total_docs},
+            "agg/uid_totals.bin": {"bytes": file_bytes("agg/uid_totals.bin"), "records": total_uid_totals},
+            "agg/dir_user_sizes.bin": {"bytes": file_bytes("agg/dir_user_sizes.bin"), "records": total_dir_user_sizes},
+            "agg/perm_events.bin": {"bytes": file_bytes("agg/perm_events.bin"), "records": total_perm_events},
+            "users/": {"count": users.len(), "record_encoding": "binary-v1"}
+        },
+        "checksum": checksum
+    });
+    write_json_file(&detail_root.join("manifest.json"), &manifest)?;
+
+    let api_dir = detail_root.join("api");
+    fs::create_dir_all(&api_dir)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("mkdir {}: {}", api_dir.display(), e)))?;
+
+    let min_users: Vec<_> = users
+        .iter()
+        .enumerate()
+        .map(|(idx, user)| {
+            json!({
+                "uid_id": idx,
+                "username": user.username,
+                "team_id": user.team_id,
+                "total_files": user.total_files,
+                "total_dirs": user.total_dirs,
+                "total_bytes": user.total_used,
+            })
+        })
+        .collect();
+
+    let data_detail_min = json!({
         "scan": {
             "timestamp": timestamp,
             "root": root,
@@ -208,7 +298,29 @@ pub fn write_detail_manifest(
             "total_dirs": total_dirs,
             "total_size": total_size
         },
-        "users": user_entries
+        "totals": {
+            "users": users.len(),
+            "docs": total_docs,
+            "paths": total_paths
+        },
+        "users": min_users
     });
-    write_json_file(&detail_root.join("data_detail.json"), &manifest)
+    write_json_file(&api_dir.join("data_detail.min.json"), &data_detail_min)?;
+
+    let users_index: Vec<_> = users
+        .iter()
+        .enumerate()
+        .map(|(idx, user)| {
+            json!({
+                "uid_id": idx,
+                "file": format!("users/u_{:04}.bin", idx + 1),
+                "username": user.username,
+                "team_id": user.team_id,
+                "total_files": user.total_files,
+                "total_bytes": user.total_used,
+                "total_dirs": user.total_dirs,
+            })
+        })
+        .collect();
+    write_json_file(&api_dir.join("users_index.min.json"), &json!(users_index))
 }

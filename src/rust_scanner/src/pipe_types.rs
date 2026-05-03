@@ -24,7 +24,7 @@ pub struct UserJobMeta {
     pub tmp_dir: std::path::PathBuf,
     pub total_dirs: i64,
     pub total_used: i64,
-    pub top_dirs: Vec<(String, i64)>,
+    pub top_dirs: Vec<(usize, i64)>,
     pub timestamp: i64,
 }
 
@@ -32,7 +32,7 @@ pub struct FileChunkJob {
     pub username: String,
     pub chunk_index: usize,
     pub output_dir: std::path::PathBuf,
-    pub rows: Vec<(u64, String)>,
+    pub rows: Vec<(u64, usize, String)>,
 }
 
 pub struct FileChunkResult {

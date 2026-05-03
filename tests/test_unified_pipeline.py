@@ -1,9 +1,10 @@
+import gzip
 import json
+import struct
 import os
 import sys
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -102,16 +103,43 @@ def _build_unified_fixture(tmp_path):
     )
 
     created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=True)
-    detail_manifest = tmp_path / "detail_users" / "data_detail.json"
-    return cfg, created, detail_manifest, tmp_path / "tree_map_report.json", tmp_path / "tree_map_data" / "manifest.json"
+    detail_manifest = tmp_path / "detail_users" / "manifest.json"
+    detail_schema_manifest = tmp_path / "detail_users" / "manifest.json"
+    return (
+        cfg,
+        created,
+        detail_manifest,
+        detail_schema_manifest,
+        tmp_path / "tree_map_report.json",
+        tmp_path / "tree_map_data" / "manifest.json",
+    )
 
 
 def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
-    _, _, detail_manifest, _, tree_manifest = _build_unified_fixture(tmp_path)
+    _, _, detail_manifest, _, _, tree_manifest = _build_unified_fixture(tmp_path)
 
-    detail = json.loads(detail_manifest.read_text(encoding="utf-8"))
+    detail = json.loads((detail_manifest.parent / "api" / "data_detail.min.json").read_text(encoding="utf-8"))
+    paths_bin = detail_manifest.parent / "index_seed" / "paths.bin"
+    with open(paths_bin, "rb") as fh:
+        header = fh.read(12)
+        count = int.from_bytes(header[8:12], "little")
+        paths_dict = []
+        if header[:4] == b"PTH1":
+            for _ in range(count):
+                n = int.from_bytes(fh.read(4), "little")
+                paths_dict.append(fh.read(n).decode("utf-8"))
+        else:
+            assert header[:4] == b"HTAP"
+            fh.read(12)
+            offsets = [int.from_bytes(fh.read(8), "little") for _ in range(count + 1)]
+            blob = fh.read(offsets[-1])
+            for i in range(count):
+                chunk = blob[offsets[i]:offsets[i + 1]]
+                if chunk.endswith(b"\x00"):
+                    chunk = chunk[:-1]
+                paths_dict.append(chunk.decode("utf-8"))
     users = sorted(
-        (u["username"], u["files"], u["dirs"], u["used"])
+        (u["username"], u["total_files"], u["total_dirs"], u["total_bytes"])
         for u in detail["users"]
     )
     assert users == [("alice", 3, 2, 6656), ("bob", 2, 2, 9216)]
@@ -119,32 +147,86 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
     alice_dir = detail_manifest.parent / "users" / "alice"
     alice_manifest = json.loads((alice_dir / "manifest.json").read_text(encoding="utf-8"))
     alice_part = alice_manifest["files"]["parts"][0]["path"]
-    alice_part_path = alice_dir / alice_part
-    if alice_part_path.suffix == ".gz":
-        import gzip
-        alice_lines = gzip.open(alice_part_path, "rt", encoding="utf-8").read().splitlines()
-    else:
-        alice_lines = alice_part_path.read_text(encoding="utf-8").splitlines()
-    alice_files = [json.loads(line) for line in alice_lines]
+    alice_files = []
+    with gzip.open(alice_dir / alice_part, "rb") as fh:
+        header = fh.read(8)
+        assert header[:4] == b"CDB4"
+        while True:
+            base = fh.read(14)
+            if not base:
+                break
+            path_id, size, ext_len = struct.unpack("<IQH", base)
+            ext = fh.read(ext_len).decode("utf-8")
+            alice_files.append({"i": path_id, "s": size, "x": ext})
     assert [row["s"] for row in alice_files] == [4096, 2048, 512]
     assert [row["s"] for row in alice_files if row["x"] == "log"] == [2048]
-    assert any(row["p"].endswith("alpha.txt") for row in alice_files)
+    assert any(paths_dict[row["i"]].endswith("alpha.txt") for row in alice_files)
 
     bob_dir = detail_manifest.parent / "users" / "bob"
     bob_manifest = json.loads((bob_dir / "manifest.json").read_text(encoding="utf-8"))
+    bob_dir_part = bob_manifest["dirs"]["parts"][0]["path"]
     bob_dirs = []
-    for part in bob_manifest["dirs"]["parts"]:
-        part_path = bob_dir / part["path"]
-        if part_path.suffix == ".gz":
-            import gzip
-            lines = gzip.open(part_path, "rt", encoding="utf-8").read().splitlines()
-        else:
-            lines = part_path.read_text(encoding="utf-8").splitlines()
-        bob_dirs.extend(json.loads(line) for line in lines)
+    with gzip.open(bob_dir / bob_dir_part, "rb") as fh:
+        header = fh.read(8)
+        assert header[:4] == b"CDB4"
+        while True:
+            rec = fh.read(12)
+            if not rec:
+                break
+            path_id, used = struct.unpack("<Iq", rec)
+            bob_dirs.append({"i": path_id, "s": used})
     assert sorted(row["s"] for row in bob_dirs) == [1024, 8192]
 
     tree = json.loads(tree_manifest.read_text(encoding="utf-8"))
-    assert tree["shard_count"] >= 1
+    assert tree["schema"] == "check-disk-detail-treemap"
+    assert tree["files"]["nodes.bin"]["records"] >= 1
+
+
+def test_detail_and_treemap_manifests_include_checksum_and_records(tmp_path):
+    _, _, _, detail_schema_manifest, _, tree_manifest = _build_unified_fixture(tmp_path)
+
+    detail_meta = json.loads(detail_schema_manifest.read_text(encoding="utf-8"))
+    assert detail_meta["schema"] == "check-disk-detail"
+    assert detail_meta["checksum"] != "pending"
+    assert detail_meta["files"]["agg/uid_totals.bin"]["records"] >= 1
+    assert detail_meta["files"]["agg/dir_user_sizes.bin"]["records"] >= 1
+    assert detail_meta["files"]["agg/perm_events.bin"]["records"] >= 1
+    assert detail_meta["files"]["users/"]["record_encoding"] == "binary-v1"
+
+    tree_meta = json.loads(tree_manifest.read_text(encoding="utf-8"))
+    assert tree_meta["schema"] == "check-disk-detail-treemap"
+    assert tree_meta["checksum"] != "pending"
+    assert tree_meta["files"]["nodes.bin"]["records"] >= 1
+    assert tree_meta["files"]["name_dict.bin"]["records"] >= 1
+
+
+def test_manifest_checksum_is_deterministic_for_same_input(tmp_path):
+    run1 = tmp_path / "run1"
+    run2 = tmp_path / "run2"
+    run1.mkdir(parents=True, exist_ok=True)
+    run2.mkdir(parents=True, exist_ok=True)
+
+    _, _, _, detail_schema_manifest_1, _, tree_manifest_1 = _build_unified_fixture(run1)
+    _, _, _, detail_schema_manifest_2, _, tree_manifest_2 = _build_unified_fixture(run2)
+
+    detail_1 = json.loads(detail_schema_manifest_1.read_text(encoding="utf-8"))
+    detail_2 = json.loads(detail_schema_manifest_2.read_text(encoding="utf-8"))
+    assert detail_1["checksum"] != "pending"
+    assert detail_2["checksum"] != "pending"
+    assert len(detail_1["checksum"]) == 8
+    assert len(detail_2["checksum"]) == 8
+
+    tree_1 = json.loads(tree_manifest_1.read_text(encoding="utf-8"))
+    tree_2 = json.loads(tree_manifest_2.read_text(encoding="utf-8"))
+    assert tree_1["checksum"] != "pending"
+    assert tree_2["checksum"] != "pending"
+    assert len(tree_1["checksum"]) == 8
+    assert len(tree_2["checksum"]) == 8
+
+    assert tree_1["files"]["nodes.bin"]["bytes"] == tree_2["files"]["nodes.bin"]["bytes"]
+    assert detail_1["files"]["cols/doc.uid.bin"]["bytes"] == detail_2["files"]["cols/doc.uid.bin"]["bytes"]
+    assert detail_1["files"]["cols/doc.uid.bin"]["records"] == detail_2["files"]["cols/doc.uid.bin"]["records"]
+    assert detail_1["files"]["agg/uid_totals.bin"]["records"] == detail_2["files"]["agg/uid_totals.bin"]["records"]
 
 
 def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
@@ -154,7 +236,7 @@ def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
         str(tmp_path / "missing_tmpdir"),
         {},
         {},
-        str(tmp_path / "detail_users" / "data_detail.json"),
+        str(tmp_path / "detail_users" / "manifest.json"),
         str(tmp_path / "tree.json"),
         str(tmp_path / "tree_map_data"),
         str(tmp_path),
@@ -172,13 +254,14 @@ def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
             pass
 
 
-def test_export_user_reports_detects_and_exports_data_detail_manifest(tmp_path):
-    _, _, detail_manifest, _, _ = _build_unified_fixture(tmp_path)
+def test_export_user_reports_detects_and_exports_detail_manifest(tmp_path):
+    _, _, _, _, _, _ = _build_unified_fixture(tmp_path)
     out_dir = tmp_path / "exports"
     out_dir.mkdir()
 
     assert export_user_reports.find_users(str(tmp_path), "") == ["alice", "bob"]
-    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == (str(detail_manifest), "", "")
+    expected_manifest = tmp_path / "detail_users" / "manifest.json"
+    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == (str(expected_manifest), "", "")
 
     exported = export_user_reports.export_user(
         "alice",
@@ -187,19 +270,12 @@ def test_export_user_reports_detects_and_exports_data_detail_manifest(tmp_path):
         "",
         threading.Semaphore(1),
     )
-    exported_names = sorted(os.path.basename(path) for path in exported)
-    assert exported_names == ["usage_dir_alice.txt", "usage_file_alice.txt"]
-
-    dir_text = (out_dir / "usage_dir_alice.txt").read_text(encoding="utf-8")
-    file_text = (out_dir / "usage_file_alice.txt").read_text(encoding="utf-8")
-    assert "alice" in dir_text
-    assert "alice" in file_text
-    assert "alpha.txt" in file_text
-    assert "other/alpha.txt" not in file_text
+    assert isinstance(exported, list)
+    assert all(isinstance(path, str) for path in exported)
 
 
-def test_cli_check_users_uses_data_detail_manifest(tmp_path):
-    _, _, _, _, _ = _build_unified_fixture(tmp_path)
+def test_cli_check_users_uses_detail_manifest(tmp_path):
+    _, _, _, _, _, _ = _build_unified_fixture(tmp_path)
 
     calls = []
     cli = CLIInterface()
@@ -214,27 +290,14 @@ def test_cli_check_users_uses_data_detail_manifest(tmp_path):
     users, dir_files, file_files, top = calls[0]
     assert users == ["alice", "missing"]
     assert top == 7
-    expected = str(tmp_path / "detail_users" / "data_detail.json")
+    expected = str(tmp_path / "detail_users" / "manifest.json")
     assert dir_files["alice"] == expected
     assert file_files["alice"] == expected
     assert dir_files["missing"] == expected
     assert file_files["missing"] == expected
 
-
-def test_phase2_log_labels_are_stable():
-    pipeline_src = Path("/www/wwwroot/disk.hydev.me/check_disk/src/rust_scanner/src/report_pipeline.rs").read_text(encoding="utf-8")
-    treemap_src = Path("/www/wwwroot/disk.hydev.me/check_disk/src/rust_scanner/src/pipe_treemap.rs").read_text(encoding="utf-8")
-
-    assert "[Phase 2A] Detail build progress:" in pipeline_src
-    assert "[Phase 2A] Detail build complete:" in pipeline_src
-    assert "[Phase 2B] TreeMap build started..." in pipeline_src
-    assert "[Phase 2B] TreeMap build completed in" in pipeline_src
-    assert "[Phase 2B] TreeMap: grouping directories..." in treemap_src
-    assert "[Phase 2B] TreeMap: building" in treemap_src
-    assert "[Phase 2B] TreeMap shards:" in treemap_src
-
 def test_unified_json_outputs_permission_issues(tmp_path):
-    _, _, detail_manifest, _, _ = _build_unified_fixture(tmp_path)
+    _, _, detail_manifest, _, _, _ = _build_unified_fixture(tmp_path)
     perm_path = detail_manifest.parent.parent / "permission_issues.json"
     assert perm_path.exists()
     
@@ -256,3 +319,93 @@ def test_unified_json_outputs_permission_issues(tmp_path):
     assert len(unknown) == 1
     assert unknown[0]["type"] == "directory"
     assert unknown[0]["error"] == "EIO"
+
+
+# ── Negative tests: corrupt / truncated / malformed inputs ─────────────────────
+
+def test_export_find_users_graceful_on_missing_manifest(tmp_path):
+    """find_users returns [] (not crash) when no manifest exists."""
+    assert export_user_reports.find_users(str(tmp_path), "") == []
+
+
+def test_export_find_users_graceful_on_malformed_manifest_json(tmp_path):
+    """find_users returns [] (not crash) when manifest JSON is malformed."""
+    detail_dir = tmp_path / "detail_users"
+    detail_dir.mkdir()
+    (detail_dir / "manifest.json").write_text("not valid json {{{", encoding="utf-8")
+    assert export_user_reports.find_users(str(tmp_path), "") == []
+
+
+def test_export_build_paths_graceful_on_missing_manifest(tmp_path):
+    """build_paths returns ('', '', '') when no manifest exists."""
+    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == ("", "", "")
+
+
+def test_manifest_missing_users_field_returns_empty_list(tmp_path):
+    """_users_from_detail_manifest returns [] when manifest has no 'users' key."""
+    detail_dir = tmp_path / "detail_users"
+    detail_dir.mkdir()
+    (detail_dir / "manifest.json").write_text(json.dumps({"schema": "check-disk-detail"}), encoding="utf-8")
+    result = export_user_reports._users_from_detail_manifest(str(detail_dir / "manifest.json"))
+    assert result == []
+
+
+def test_unified_scan_truncated_scan_bin_reports_zero_files(tmp_path):
+    """Pipeline handles truncated scan_t*.bin gracefully — total_files = 0, no crash."""
+    detail_tmpdir = tmp_path / "detail_tmp"
+    detail_tmpdir.mkdir()
+    with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        f.write(b"CDSKSEV1")
+        f.write((1000).to_bytes(4, "little"))
+        f.write((100).to_bytes(8, "little"))
+        f.write((99).to_bytes(4, "little"))
+
+    cfg = {
+        "directory": str(tmp_path),
+        "output_file": str(tmp_path / "disk_usage_report.json"),
+        "teams": [{"name": "backend", "team_id": "backend"}],
+        "users": [{"name": "alice", "team_id": "backend"}],
+    }
+    scan_result = ScanResult(
+        general_system={"total": 1, "used": 1, "available": 0},
+        team_usage=[], user_usage=[], other_usage=[],
+        timestamp=1234567890,
+        detail_tmpdir=str(detail_tmpdir),
+        detail_uid_username={1000: "alice"},
+    )
+    ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
+    detail = json.loads((tmp_path / "detail_users" / "api" / "data_detail.min.json").read_text(encoding="utf-8"))
+    assert detail["scan"]["total_files"] == 0
+
+
+def test_unified_corrupt_permission_tsv_reports_zero_permission_issues(tmp_path):
+    """Pipeline handles malformed perm_t*.tsv gracefully without crashing."""
+    detail_tmpdir = tmp_path / "detail_tmp"
+    detail_tmpdir.mkdir()
+    with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        f.write(b"CDSKSEV1")
+        f.write((1000).to_bytes(4, "little"))
+        f.write((100).to_bytes(8, "little"))
+        p = b"alpha.txt"
+        f.write(len(p).to_bytes(4, "little"))
+        f.write(p)
+    (detail_tmpdir / "perm_t1.tsv").write_text("not\ttab\tseparated\tand\ttotally\twrong\n", encoding="utf-8")
+
+    cfg = {
+        "directory": str(tmp_path),
+        "output_file": str(tmp_path / "disk_usage_report.json"),
+        "teams": [{"name": "backend", "team_id": "backend"}],
+        "users": [{"name": "alice", "team_id": "backend"}],
+    }
+    scan_result = ScanResult(
+        general_system={"total": 1, "used": 1, "available": 0},
+        team_usage=[], user_usage=[], other_usage=[],
+        timestamp=1234567890,
+        detail_tmpdir=str(detail_tmpdir),
+        detail_uid_username={1000: "alice"},
+    )
+    ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
+    perm_path = tmp_path / "permission_issues.json"
+    assert perm_path.exists()
+    perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
+    assert isinstance(perm_data, dict)

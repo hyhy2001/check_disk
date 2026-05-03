@@ -12,7 +12,6 @@ Output contract note:
 """
 
 import argparse
-import glob
 import json
 import os
 import sys
@@ -34,95 +33,52 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 
 def _resolve_detail_dir(input_dir: str, prefix: str) -> str:
-    """Return the directory that actually contains the detail JSON files."""
+    """Return the directory that contains detail_users manifest outputs."""
+    _ = prefix
     sub = os.path.join(input_dir, "detail_users")
-    pat_prefix = f"{prefix}_" if prefix else ""
-
-    if os.path.exists(os.path.join(input_dir, "data_detail.json")):
-        return input_dir
-    if os.path.exists(os.path.join(sub, "data_detail.json")):
+    if os.path.exists(os.path.join(sub, "manifest.json")):
         return sub
-    if glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.ndjson")) or \
-       glob.glob(os.path.join(sub, f"{pat_prefix}detail_report_*.json")):
-        return sub
-    if glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.ndjson")) or \
-       glob.glob(os.path.join(input_dir, f"{pat_prefix}detail_report_*.json")):
+    if os.path.exists(os.path.join(input_dir, "manifest.json")):
         return input_dir
     return sub
 
 
-def _find_data_detail_manifest(detail_dir: str) -> str:
-    path = os.path.join(detail_dir, "data_detail.json")
+def _find_detail_manifest(detail_dir: str) -> str:
+    path = os.path.join(detail_dir, "manifest.json")
     return path if os.path.exists(path) else ""
 
 
-def _users_from_data_detail_manifest(manifest_path: str) -> list:
+def _users_from_detail_manifest(manifest_path: str) -> list:
     if not manifest_path:
         return []
     try:
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
-        return sorted(str(u.get("username")) for u in manifest.get("users", []) if u.get("username"))
+
+        users = sorted(str(u.get("username")) for u in manifest.get("users", []) if u.get("username"))
+        if users:
+            return users
+
+        api_users_index = os.path.join(os.path.dirname(manifest_path), "api", "users_index.min.json")
+        if os.path.exists(api_users_index):
+            with open(api_users_index, "r", encoding="utf-8") as fh:
+                rows = json.load(fh)
+            return sorted(str(r.get("username")) for r in rows if isinstance(r, dict) and r.get("username"))
     except Exception:
         return []
+
+    return []
 
 
 
 def find_users(input_dir: str, prefix: str) -> list:
-    """Return sorted list of usernames discovered from detail reports."""
+    """Return sorted list of usernames discovered from detail manifest."""
     detail_dir = _resolve_detail_dir(input_dir, prefix)
-    manifest_users = _users_from_data_detail_manifest(_find_data_detail_manifest(detail_dir))
-    if manifest_users:
-        return manifest_users
-
-    pat_prefix = f"{prefix}_" if prefix else ""
-
-    # Try looking for the unified detail_report_<user>.ndjson or .json pattern
-    users = set()
-    for ext in [".ndjson", ".json"]:
-        unified_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_*{ext}")
-        strip_unified = f"{pat_prefix}detail_report_"
-
-        for path in glob.glob(unified_pattern):
-            name = os.path.basename(path)
-            # Exclude legacy dir/file markers if mixed
-            if name.startswith(strip_unified) and name.endswith(ext) and "dir_" not in name and "file_" not in name:
-                user = name[len(strip_unified):-len(ext)]
-                users.add(user)
-
-        # If using legacy format fallback
-        if not users:
-            legacy_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_dir_*{ext}")
-            strip_legacy = f"{pat_prefix}detail_report_dir_"
-            for path in glob.glob(legacy_pattern):
-                name = os.path.basename(path)
-                if name.startswith(strip_legacy) and name.endswith(ext):
-                    user = name[len(strip_legacy):-len(ext)]
-                    users.add(user)
-
-        # New combined schema can store only detail_report_file_<user>.* with dirs in same DB.
-        if not users:
-            file_pattern = os.path.join(detail_dir, f"{pat_prefix}detail_report_file_*{ext}")
-            strip_file = f"{pat_prefix}detail_report_file_"
-            for path in glob.glob(file_pattern):
-                name = os.path.basename(path)
-                if name.startswith(strip_file) and name.endswith(ext):
-                    user = name[len(strip_file):-len(ext)]
-                    users.add(user)
-
-        if users:
-            break
-
-    return sorted(list(users))
+    return _users_from_detail_manifest(_find_detail_manifest(detail_dir))
 
 
-def _pick_existing_path(detail_dir: str, base_name: str) -> str:
-    """Pick first existing path by preferred extension order."""
-    for ext in [".ndjson", ".json"]:
-        p = os.path.join(detail_dir, f"{base_name}{ext}")
-        if os.path.exists(p):
-            return p
-    return ""
+
+
 
 def _get_rss_mb() -> float:
     """Best-effort current process RSS in MB (Linux)."""
@@ -138,19 +94,13 @@ def _get_rss_mb() -> float:
 
 
 def build_paths(input_dir: str, prefix: str, user: str) -> tuple:
-    """Return (unified_path, dir_path, file_path) auto-detecting layout."""
+    """Return (unified_path, dir_path, file_path) for manifest-based detail exports."""
+    _ = user
     detail_dir = _resolve_detail_dir(input_dir, prefix)
-    pat_prefix = f"{prefix}_" if prefix else ""
-
-    data_detail_manifest = _find_data_detail_manifest(detail_dir)
-    if data_detail_manifest:
-        return (data_detail_manifest, "", "")
-
-    unified_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_{user}")
-    dir_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_dir_{user}")
-    file_path = _pick_existing_path(detail_dir, f"{pat_prefix}detail_report_file_{user}")
-
-    return (unified_path, dir_path, file_path)
+    detail_manifest = _find_detail_manifest(detail_dir)
+    if detail_manifest:
+        return (detail_manifest, "", "")
+    return ("", "", "")
 
 
 
@@ -174,7 +124,7 @@ def export_user(user: str,
                 output_dir: str,
                 prefix: str,
                 sem=None) -> list:
-    """Compatibility wrapper for older callers/tests; now delegates to Rust batch internals."""
+    """Export one user from manifest-based detail outputs via Rust batch internals."""
     unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
     if not any([os.path.exists(unified_path), os.path.exists(dir_path), os.path.exists(file_path)]):
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
@@ -195,7 +145,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--input-dir",   default=".",
-                   help="Directory containing detail_report_dir/file JSON/NDJSON/DB files (default: .)")
+                   help="Directory containing detail_users/manifest.json outputs (default: .)")
     p.add_argument("--output-dir",  default=None,
                    help="Directory to write .txt files to (default: same as --input-dir)")
     p.add_argument("--prefix",      default="",

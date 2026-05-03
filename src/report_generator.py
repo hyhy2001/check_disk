@@ -291,7 +291,7 @@ class ReportGenerator:
         detail_dir = os.path.join(output_dir, "detail_users")
         os.makedirs(detail_dir, exist_ok=True)
 
-        unified_path = os.path.join(detail_dir, "data_detail.json")
+        detail_manifest_path = os.path.join(detail_dir, "manifest.json")
         tree_json_path = self._get_output_filename("tree_map_report")
         tree_data_path = os.path.join(output_dir, "tree_map_data")
         if not build_treemap:
@@ -301,7 +301,7 @@ class ReportGenerator:
                 shutil.rmtree(tree_data_path)
         # Avoid expensive pre-clean for huge runs. Rust Phase 2 pipeline already
         # recreates/overwrites its working output directories atomically.
-        stale_targets = [unified_path]
+        stale_targets = [detail_manifest_path]
         if build_treemap:
             stale_targets.append(tree_json_path)
         for stale_path in stale_targets:
@@ -325,7 +325,7 @@ class ReportGenerator:
             scan_result.detail_tmpdir,
             scan_result.detail_uid_username,
             team_map,
-            unified_path,
+            detail_manifest_path,
             tree_json_path,
             tree_data_path,
             self.config.get("directory", "/"),
@@ -367,7 +367,7 @@ class ReportGenerator:
             raise build_error_holder["error"]
         total_files = total_files_holder["value"]
 
-        root_manifest_path = unified_path
+        root_manifest_path = detail_manifest_path
 
         created = [root_manifest_path]
         if build_treemap:
@@ -375,12 +375,12 @@ class ReportGenerator:
         self.cleanup_stale_detail_reports(created)
 
         detail_users_count = 0
-        root_manifest_data = None
         try:
             import json
-            with open(root_manifest_path, "r", encoding="utf-8") as fh:
-                root_manifest_data = json.load(fh)
-            detail_users_count = len(root_manifest_data.get("users", []))
+            users_index_path = os.path.join(detail_dir, "api", "users_index.min.json")
+            with open(users_index_path, "r", encoding="utf-8") as fh:
+                users_index = json.load(fh)
+            detail_users_count = len(users_index) if isinstance(users_index, list) else 0
         except Exception:
             detail_users_count = 0
 

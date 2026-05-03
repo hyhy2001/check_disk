@@ -236,7 +236,7 @@ class CLIInterface:
         if prefix:
             print("Warning: --prefix is ignored for JSON/NDJSON detail manifests")
         detail_dir = os.path.join(output_dir, "detail_users")
-        detail_manifest = os.path.join(detail_dir, "data_detail.json")
+        detail_manifest = os.path.join(detail_dir, "manifest.json")
 
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}

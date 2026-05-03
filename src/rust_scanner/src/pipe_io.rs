@@ -81,16 +81,6 @@ pub fn safe_user_dir(username: &str) -> String {
         .collect()
 }
 
-pub fn json_line_result<W: Write>(
-    writer: &mut W,
-    value: serde_json::Value,
-) -> Result<(), String> {
-    serde_json::to_writer(&mut *writer, &value).map_err(|e| format!("json write: {}", e))?;
-    writer
-        .write_all(b"\n")
-        .map_err(|e| format!("write newline: {}", e))
-}
-
 pub fn write_json_file(path: &Path, value: &serde_json::Value) -> PyResult<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;

@@ -15,6 +15,8 @@ import json
 import os
 import sys
 import time
+import gzip
+import struct
 
 import pytest
 
@@ -93,36 +95,73 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
 
     created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=True)
 
-    detail_manifest = tmp_path / "detail_users" / "data_detail.json"
+    detail_manifest = tmp_path / "detail_users" / "manifest.json"
+    detail_schema_manifest = tmp_path / "detail_users" / "manifest.json"
     treemap_json = tmp_path / "tree_map_report.json"
     treemap_manifest = tmp_path / "tree_map_data" / "manifest.json"
-    assert sorted(map(str, [detail_manifest, treemap_json, treemap_manifest])) == created
+    expected_created = sorted(map(str, [detail_schema_manifest, treemap_json, treemap_manifest]))
+    assert expected_created == created
     assert detail_manifest.exists()
+    assert detail_schema_manifest.exists()
     assert treemap_json.exists()
     assert treemap_manifest.exists()
 
-    detail = json.loads(detail_manifest.read_text(encoding="utf-8"))
+    index_dir = tmp_path / "detail_users" / "index"
+    index_mmi = index_dir / "index.mmi"
+    token_dict = index_dir / "tokens.json"
+    ext_dict = index_dir / "exts.json"
+    user_dict = index_dir / "users.json"
+    assert index_mmi.exists()
+    assert token_dict.exists()
+    assert ext_dict.exists()
+    assert user_dict.exists()
+
+    detail = json.loads((tmp_path / "detail_users" / "api" / "data_detail.min.json").read_text(encoding="utf-8"))
     assert detail["users"][0]["username"] == "alice"
-    assert detail["users"][0]["files"] == 2
-    assert detail["users"][0]["dirs"] == 2
-    assert detail["users"][0]["used"] == 6144
+    assert detail["users"][0]["total_files"] == 2
+    assert detail["users"][0]["total_dirs"] == 2
+    assert detail["users"][0]["total_bytes"] == 6144
 
     user_dir = tmp_path / "detail_users" / "users" / "alice"
+    paths_bin = tmp_path / "detail_users" / "index_seed" / "paths.bin"
+    with open(paths_bin, "rb") as fh:
+        header = fh.read(12)
+        count = int.from_bytes(header[8:12], "little")
+        paths_dict = []
+        if header[:4] == b"PTH1":
+            for _ in range(count):
+                n = int.from_bytes(fh.read(4), "little")
+                paths_dict.append(fh.read(n).decode("utf-8"))
+        else:
+            assert header[:4] == b"HTAP"
+            fh.read(12)
+            offsets = [int.from_bytes(fh.read(8), "little") for _ in range(count + 1)]
+            blob = fh.read(offsets[-1])
+            for i in range(count):
+                chunk = blob[offsets[i]:offsets[i + 1]]
+                if chunk.endswith(b"\x00"):
+                    chunk = chunk[:-1]
+                paths_dict.append(chunk.decode("utf-8"))
     user_manifest = json.loads((user_dir / "manifest.json").read_text(encoding="utf-8"))
     part_path = user_manifest["files"]["parts"][0]["path"]
-    file_part = user_dir / part_path
-    if file_part.suffix == ".gz":
-        import gzip
-        lines = gzip.open(file_part, "rt", encoding="utf-8").read().splitlines()
-    else:
-        lines = file_part.read_text(encoding="utf-8").splitlines()
-    file_rows = [json.loads(x) for x in lines]
+    file_rows = []
+    with gzip.open(user_dir / part_path, "rb") as fh:
+        header = fh.read(8)
+        assert header[:4] == b"CDB4"
+        while True:
+            base = fh.read(14)
+            if not base:
+                break
+            path_id, size, ext_len = struct.unpack("<IQH", base)
+            ext = fh.read(ext_len).decode("utf-8")
+            file_rows.append({"i": path_id, "s": size, "x": ext})
     assert len(file_rows) == 2
-    assert any(r["p"].endswith("alpha.txt") for r in file_rows)
-    assert any(r["p"].endswith("beta.log") for r in file_rows)
+    assert any(paths_dict[r["i"]].endswith("alpha.txt") for r in file_rows)
+    assert any(paths_dict[r["i"]].endswith("beta.log") for r in file_rows)
 
     tree_manifest = json.loads(treemap_manifest.read_text(encoding="utf-8"))
-    assert tree_manifest["shard_count"] >= 1
+    assert tree_manifest["schema"] == "check-disk-detail-treemap"
+    assert tree_manifest["files"]["nodes.bin"]["records"] >= 1
 
 
 # ── ReportGenerator.__init__ ──────────────────────────────────────────────────

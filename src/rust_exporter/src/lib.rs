@@ -3,6 +3,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -19,6 +20,8 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 struct JsonItem {
     #[serde(alias = "p")]
     path: Option<String>,
+    #[serde(default, rename = "i")]
+    short_path_id: Option<usize>,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -63,6 +66,8 @@ struct DetailRootUser {
 
 #[derive(Deserialize, Default)]
 struct UserManifest {
+    #[serde(default)]
+    paths_dict: String,
     #[serde(default)]
     dirs: DirsRef,
     #[serde(default)]
@@ -146,7 +151,7 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
         return;
     }
 
-    if file_path.ends_with("data_detail.json") {
+    if file_path.ends_with("manifest.json") {
         parse_manifest_items(user, file_path, kind, entries);
         return;
     }
@@ -159,8 +164,10 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
         }
     };
 
-    if file_path.ends_with(".ndjson") {
-        parse_ndjson_reader(f, kind, entries);
+    if file_path.ends_with(".bin") || file_path.ends_with(".bin.gz") {
+        entries.extend(parse_bin_path(Path::new(file_path), kind, None));
+    } else if file_path.ends_with(".ndjson") || file_path.ends_with(".ndjson.gz") {
+        entries.extend(parse_ndjson_path(Path::new(file_path), kind, None));
     } else if kind == "dir " {
         if let Ok(data) = serde_json::from_reader::<_, ReportDir>(BufReader::new(f)) {
             for d in data.dirs {
@@ -180,18 +187,25 @@ fn parse_file_items(user: &str, file_path: &str, kind: &'static str, entries: &m
     }
 }
 
-fn parse_ndjson_reader<R: Read>(reader: R, kind: &'static str, entries: &mut Vec<ExportEntry>) {
-    for line in BufReader::new(reader).lines().map_while(Result::ok) {
+fn parse_ndjson_reader<R: BufRead>(reader: R, kind: &'static str, entries: &mut Vec<ExportEntry>, path_dict: Option<&[String]>) {
+    for line in reader.lines().map_while(Result::ok) {
         if let Ok(item) = serde_json::from_str::<JsonItem>(&line) {
             let size = if kind == "dir " { item.dir_used() } else { item.file_size() };
-            if let Some(path) = item.path {
+            let resolved_path = if let Some(path) = item.path {
+                Some(path)
+            } else if let Some(path_id) = item.short_path_id {
+                path_dict.and_then(|dict| dict.get(path_id)).cloned()
+            } else {
+                None
+            };
+            if let Some(path) = resolved_path {
                 entries.push(ExportEntry { kind, path, size });
             }
         }
     }
 }
 
-fn parse_ndjson_path(path: &Path, kind: &'static str) -> Vec<ExportEntry> {
+fn parse_ndjson_path(path: &Path, kind: &'static str, path_dict: Option<&[String]>) -> Vec<ExportEntry> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) => {
@@ -200,34 +214,141 @@ fn parse_ndjson_path(path: &Path, kind: &'static str) -> Vec<ExportEntry> {
         }
     };
     let mut entries = Vec::new();
-    if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-        parse_ndjson_reader(GzDecoder::new(file), kind, &mut entries);
+    if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        let decoder = GzDecoder::new(file);
+        parse_ndjson_reader(BufReader::new(decoder), kind, &mut entries, path_dict);
     } else {
-        parse_ndjson_reader(file, kind, &mut entries);
+        parse_ndjson_reader(BufReader::new(file), kind, &mut entries, path_dict);
     }
     entries
 }
 
-fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
-    let file = match File::open(manifest_path) {
+fn parse_bin_path(path: &Path, kind: &'static str, path_dict: Option<&[String]>) -> Vec<ExportEntry> {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("  [rust-warn] Failed to open manifest {}: {}", manifest_path, e);
-            return;
+            eprintln!("  [rust-warn] Failed to open {}: {}", path.display(), e);
+            return Vec::new();
         }
     };
-    let root_manifest: DetailRootManifest = match serde_json::from_reader(BufReader::new(file)) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("  [rust-warn] Failed to parse manifest {}: {}", manifest_path, e);
-            return;
+    let mut reader: Box<dyn std::io::Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+
+    let mut header = [0u8; 8];
+    if reader.read_exact(&mut header).is_err() || &header[0..4] != b"CDB4" {
+        return Vec::new();
+    }
+    let rec_kind = header[5];
+    let expect_kind = if kind == "dir " { 1u8 } else { 0u8 };
+    if rec_kind != expect_kind {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    if expect_kind == 1 {
+        loop {
+            let mut rec = [0u8; 12];
+            if reader.read_exact(&mut rec).is_err() {
+                break;
+            }
+            let path_id = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+            let used = i64::from_le_bytes([rec[4], rec[5], rec[6], rec[7], rec[8], rec[9], rec[10], rec[11]]);
+            if let Some(path) = path_dict.and_then(|dict| dict.get(path_id)).cloned() {
+                out.push(ExportEntry { kind, path, size: used.max(0) as u64 });
+            }
         }
-    };
-    let Some(user_entry) = root_manifest.users.into_iter().find(|entry| entry.username == user) else {
-        return;
-    };
+    } else {
+        loop {
+            let mut base = [0u8; 14];
+            if reader.read_exact(&mut base).is_err() {
+                break;
+            }
+            let path_id = u32::from_le_bytes([base[0], base[1], base[2], base[3]]) as usize;
+            let size = u64::from_le_bytes([base[4], base[5], base[6], base[7], base[8], base[9], base[10], base[11]]);
+            let ext_len = u16::from_le_bytes([base[12], base[13]]) as usize;
+            let mut ext_buf = vec![0u8; ext_len];
+            if reader.read_exact(&mut ext_buf).is_err() {
+                break;
+            }
+            if let Some(path) = path_dict.and_then(|dict| dict.get(path_id)).cloned() {
+                out.push(ExportEntry { kind, path, size });
+            }
+        }
+    }
+    out
+}
+
+fn load_json_maybe_gzip<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let file = File::open(path).ok()?;
+    if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        serde_json::from_reader(BufReader::new(GzDecoder::new(file))).ok()
+    } else {
+        serde_json::from_reader(BufReader::new(file)).ok()
+    }
+}
+
+fn read_paths_binary(path: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE, File::open(path).ok()?);
+    let mut head = [0u8; 12];
+    reader.read_exact(&mut head).ok()?;
+    let magic = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+
+    if magic == 0x5041_5448 {
+        let count = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        let mut offsets = Vec::with_capacity(count + 1);
+        for _ in 0..=count {
+            let mut off = [0u8; 8];
+            reader.read_exact(&mut off).ok()?;
+            offsets.push(u64::from_le_bytes(off));
+        }
+        let mut blob = Vec::new();
+        reader.read_to_end(&mut blob).ok()?;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = *offsets.get(i)? as usize;
+            let end = *offsets.get(i + 1)? as usize;
+            if end > blob.len() || start > end {
+                return None;
+            }
+            let mut bytes = blob[start..end].to_vec();
+            if bytes.last().copied() == Some(0) {
+                bytes.pop();
+            }
+            out.push(String::from_utf8_lossy(&bytes).to_string());
+        }
+        return Some(out);
+    }
+
+    if magic == 0x3148_5450 {
+        let count = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf).ok()?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut bytes = vec![0u8; len];
+            reader.read_exact(&mut bytes).ok()?;
+            out.push(String::from_utf8_lossy(&bytes).to_string());
+        }
+        return Some(out);
+    }
+
+    None
+}
+
+fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
     let detail_dir = Path::new(manifest_path).parent().unwrap_or_else(|| Path::new("."));
-    let user_manifest_path = detail_dir.join(user_entry.manifest);
+    let safe_user: String = user
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    let user_manifest_path = detail_dir.join("users").join(safe_user).join("manifest.json");
+
     let file = match File::open(&user_manifest_path) {
         Ok(file) => file,
         Err(e) => {
@@ -244,22 +365,40 @@ fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, ent
     };
     let user_dir = user_manifest_path.parent().unwrap_or(detail_dir);
 
+    let path_dict: Option<Vec<String>> = if user_manifest.paths_dict.is_empty() {
+        None
+    } else {
+        let dict_path = user_dir.join(&user_manifest.paths_dict);
+        let is_bin = dict_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("bin"))
+            .unwrap_or(false);
+        if is_bin {
+            read_paths_binary(&dict_path)
+        } else {
+            load_json_maybe_gzip::<Vec<String>>(&dict_path)
+        }
+    };
+
     if kind == "dir " {
-        let dir_parts: Vec<PathBuf> = if !user_manifest.dirs.parts.is_empty() {
-            user_manifest.dirs.parts
-                .into_iter()
-                .filter(|part| !part.path.is_empty())
-                .map(|part| user_dir.join(part.path))
-                .collect()
+        if !user_manifest.dirs.parts.is_empty() {
+            for part in user_manifest.dirs.parts {
+                if !part.path.is_empty() {
+                    let p = user_dir.join(part.path);
+                    if p.extension().and_then(|s| s.to_str()) == Some("gz") && p.to_string_lossy().ends_with(".bin.gz") {
+                        entries.extend(parse_bin_path(&p, kind, path_dict.as_deref()));
+                    } else if p.extension().and_then(|s| s.to_str()) == Some("bin") {
+                        entries.extend(parse_bin_path(&p, kind, path_dict.as_deref()));
+                    } else {
+                        entries.extend(parse_ndjson_path(&p, kind, path_dict.as_deref()));
+                    }
+                }
+            }
         } else {
             let dir_rel = if user_manifest.dirs.path.is_empty() { "dirs.ndjson" } else { user_manifest.dirs.path.as_str() };
-            vec![user_dir.join(dir_rel)]
-        };
-        let mut dir_entries: Vec<ExportEntry> = dir_parts
-            .par_iter()
-            .flat_map_iter(|path| parse_ndjson_path(path, kind))
-            .collect();
-        entries.append(&mut dir_entries);
+            entries.extend(parse_ndjson_path(&user_dir.join(dir_rel), kind, path_dict.as_deref()));
+        }
     } else {
         let part_paths: Vec<PathBuf> = user_manifest.files.parts
             .into_iter()
@@ -268,7 +407,15 @@ fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, ent
             .collect();
         let mut part_entries: Vec<ExportEntry> = part_paths
             .par_iter()
-            .flat_map_iter(|path| parse_ndjson_path(path, kind))
+            .flat_map_iter(|path| {
+                if path.extension().and_then(|s| s.to_str()) == Some("gz") && path.to_string_lossy().ends_with(".bin.gz") {
+                    parse_bin_path(path, kind, path_dict.as_deref())
+                } else if path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                    parse_bin_path(path, kind, path_dict.as_deref())
+                } else {
+                    parse_ndjson_path(path, kind, path_dict.as_deref())
+                }
+            })
             .collect();
         entries.append(&mut part_entries);
     }
