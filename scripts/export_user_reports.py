@@ -55,7 +55,11 @@ def _users_from_detail_manifest(manifest_path: str) -> list:
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
 
-        users = sorted(str(u.get("username")) for u in manifest.get("users", []) if u.get("username"))
+        users = sorted(
+            str(u.get("username"))
+            for u in manifest.get("users", [])
+            if u.get("username") and not str(u.get("username")).startswith("uid-")
+        )
         if users:
             return users
 
@@ -63,7 +67,13 @@ def _users_from_detail_manifest(manifest_path: str) -> list:
         if os.path.exists(api_users_index):
             with open(api_users_index, "r", encoding="utf-8") as fh:
                 rows = json.load(fh)
-            return sorted(str(r.get("username")) for r in rows if isinstance(r, dict) and r.get("username"))
+            return sorted(
+                str(r.get("username"))
+                for r in rows
+                if isinstance(r, dict)
+                and r.get("username")
+                and not str(r.get("username")).startswith("uid-")
+            )
     except Exception:
         return []
 
@@ -124,7 +134,8 @@ def export_user(user: str,
                 output_dir: str,
                 prefix: str,
                 sem=None) -> list:
-    """Export one user from manifest-based detail outputs via Rust batch internals."""
+    """Backward-compatible single-user export wrapper over Rust batch jobs."""
+    _ = sem
     unified_path, dir_path, file_path = build_paths(input_dir, prefix, user)
     if not any([os.path.exists(unified_path), os.path.exists(dir_path), os.path.exists(file_path)]):
         print(f"  [skip] No data found for user: {user}", file=sys.stderr)
@@ -174,8 +185,6 @@ def main() -> None:
     start_ts = time.time()
     rss_start = _get_rss_mb()
     peak_rss = rss_start
-    progress_every = 5
-
     print(f"Exporting {len(users)} user(s) using Rust Core [parallel {workers}w] -> {output_dir}")
     print(f"Workers selected: --workers={workers}")
     print("Tip: change concurrency with --workers N")

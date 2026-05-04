@@ -98,6 +98,7 @@ pub fn write_json_file(path: &Path, value: &serde_json::Value) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("flush {}: {}", path.display(), e)))
 }
 
+#[allow(dead_code)]
 pub fn write_json_file_result(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;

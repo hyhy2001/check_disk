@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "index.h"
 
 #include <errno.h>
@@ -7,6 +8,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <stdio.h>
 #include <unistd.h>
 
 typedef struct {
@@ -63,6 +65,8 @@ int cdx1_open(const char *path, cdx1_index *out) {
         close(fd);
         return err;
     }
+
+    madvise(mapped, (size_t)st.st_size, MADV_SEQUENTIAL);
 
     const uint8_t *base = (const uint8_t *)mapped;
     const cdx1_header *hdr = (const cdx1_header *)base;
@@ -188,53 +192,69 @@ static int apply_filter_ids_or(const cdx1_posting_entry *entries,
         return 0;
     }
 
-    uint32_t *current = NULL;
-    uint32_t current_count = 0;
-
+    size_t total_capacity = 0;
     for (size_t i = 0; i < id_count; i++) {
         const uint32_t *vals = NULL;
         uint32_t count = 0;
         if (!posting_lookup(entries, values, entry_count, ids[i], &vals, &count) || count == 0) {
             continue;
         }
-        if (current == NULL) {
-            current = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
-            if (!current) {
-                return ENOMEM;
-            }
-            memcpy(current, vals, (size_t)count * sizeof(uint32_t));
-            current_count = count;
-            continue;
-        }
-
-        uint32_t *merged = (uint32_t *)malloc((size_t)(current_count + count) * sizeof(uint32_t));
-        if (!merged) {
-            free(current);
-            return ENOMEM;
-        }
-        uint32_t a = 0, b = 0, k = 0;
-        while (a < current_count && b < count) {
-            uint32_t va = current[a], vb = vals[b];
-            if (va == vb) { merged[k++] = va; a++; b++; }
-            else if (va < vb) { merged[k++] = va; a++; }
-            else { merged[k++] = vb; b++; }
-        }
-        while (a < current_count) merged[k++] = current[a++];
-        while (b < count) merged[k++] = vals[b++];
-        free(current);
-        current = merged;
-        current_count = k;
+        total_capacity += count;
     }
 
-    if (current == NULL) {
+    if (total_capacity == 0) {
         free(*candidate);
         *candidate = NULL;
         *candidate_count = 0;
         return 0;
     }
 
+    uint32_t *scratch = (uint32_t *)malloc(total_capacity * sizeof(uint32_t));
+    uint32_t *current = (uint32_t *)malloc(total_capacity * sizeof(uint32_t));
+    if (!scratch || !current) {
+        free(scratch);
+        free(current);
+        return ENOMEM;
+    }
+
+    uint32_t current_count = 0;
+    for (size_t i = 0; i < id_count; i++) {
+        const uint32_t *vals = NULL;
+        uint32_t count = 0;
+        if (!posting_lookup(entries, values, entry_count, ids[i], &vals, &count) || count == 0) {
+            continue;
+        }
+        if (current_count == 0) {
+            memcpy(current, vals, (size_t)count * sizeof(uint32_t));
+            current_count = count;
+            continue;
+        }
+
+        uint32_t a = 0, b = 0, k = 0;
+        while (a < current_count && b < count) {
+            uint32_t va = current[a], vb = vals[b];
+            if (va == vb) { scratch[k++] = va; a++; b++; }
+            else if (va < vb) { scratch[k++] = va; a++; }
+            else { scratch[k++] = vb; b++; }
+        }
+        while (a < current_count) scratch[k++] = current[a++];
+        while (b < count) scratch[k++] = vals[b++];
+
+        memcpy(current, scratch, (size_t)k * sizeof(uint32_t));
+        current_count = k;
+    }
+
+    free(scratch);
+
     if (*candidate == NULL) {
-        *candidate = current;
+        uint32_t *out = (uint32_t *)malloc((size_t)current_count * sizeof(uint32_t));
+        if (!out) {
+            free(current);
+            return ENOMEM;
+        }
+        memcpy(out, current, (size_t)current_count * sizeof(uint32_t));
+        free(current);
+        *candidate = out;
         *candidate_count = current_count;
         return 0;
     }

@@ -369,7 +369,10 @@ class ReportGenerator:
 
         root_manifest_path = detail_manifest_path
 
-        created = [root_manifest_path]
+        created = [
+            root_manifest_path,
+            os.path.join(detail_dir, "data_detail.json"),
+        ]
         if build_treemap:
             created.extend([tree_json_path, os.path.join(tree_data_path, "manifest.json")])
         self.cleanup_stale_detail_reports(created)
@@ -377,9 +380,10 @@ class ReportGenerator:
         detail_users_count = 0
         try:
             import json
-            users_index_path = os.path.join(detail_dir, "api", "users_index.min.json")
-            with open(users_index_path, "r", encoding="utf-8") as fh:
-                users_index = json.load(fh)
+            detail_summary_path = os.path.join(detail_dir, "data_detail.json")
+            with open(detail_summary_path, "r", encoding="utf-8") as fh:
+                detail_summary = json.load(fh)
+            users_index = detail_summary.get("users", []) if isinstance(detail_summary, dict) else []
             detail_users_count = len(users_index) if isinstance(users_index, list) else 0
         except Exception:
             detail_users_count = 0

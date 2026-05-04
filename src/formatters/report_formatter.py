@@ -8,6 +8,7 @@ import json
 import os
 import gzip
 import struct
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils import format_size, format_timestamp
@@ -227,7 +228,8 @@ class ReportFormatter(BaseFormatter):
             total_used  = file_report.get('total_used', 0)
             print(f"\nTotal files: {total_files:,}  |  Total size: {format_size(total_used)}")
 
-            display = files[:top]
+            files_sorted = sorted(files, key=lambda f: int(f.get('size', 0) or 0), reverse=True)
+            display = files_sorted[:top]
             if display:
                 headers = ["File", "Size"]
                 rows = [[f['path'], format_size(f['size'])] for f in display]
@@ -468,4 +470,130 @@ class ReportFormatter(BaseFormatter):
                         "size": int(size),
                         "ext": ext_raw.decode("utf-8", errors="ignore"),
                     })
+        return data
+
+    def _load_detail_from_text(self, detail_dir: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
+        data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
+
+        name_to_uid: Dict[str, int] = {}
+        exts_map: List[str] = []
+        path_map: List[str] = []
+        data_ndjson = os.path.join(detail_dir, "data.ndjson")
+
+        segment_map = []
+        if os.path.exists(data_ndjson):
+            with open(data_ndjson, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    row_type = str(obj.get("t", ""))
+                    if row_type == "u":
+                        uid = int(obj.get("i", -1))
+                        name = str(obj.get("n", ""))
+                        if uid >= 0 and name:
+                            name_to_uid[name] = uid
+                    elif row_type == "e":
+                        ext_id = int(obj.get("i", -1))
+                        ext = str(obj.get("x", ""))
+                        while len(exts_map) <= ext_id:
+                            exts_map.append("")
+                        if ext_id >= 0:
+                            exts_map[ext_id] = ext
+                    elif row_type == "n":
+                        seg_id = int(obj.get("i", -1))
+                        seg = str(obj.get("s", "") or "")
+                        while len(segment_map) <= seg_id:
+                            segment_map.append("")
+                        if seg_id >= 0:
+                            segment_map[seg_id] = seg
+                    elif row_type == "p":
+                        path_id = int(obj.get("i", -1))
+                        parent_id = int(obj.get("r", 0) or 0)
+                        path_text = str(obj.get("p", "") or "")
+                        suffix = str(obj.get("s", "") or "")
+                        seg_id = int(obj.get("n", -1))
+                        if 0 <= seg_id < len(segment_map):
+                            suffix = segment_map[seg_id] or suffix
+                        while len(path_map) <= path_id:
+                            path_map.append("")
+                        if path_id >= 0:
+                            if path_text:
+                                path_map[path_id] = path_text
+                            elif suffix:
+                                if parent_id > 0 and parent_id < len(path_map) and path_map[parent_id] and not suffix.startswith("/"):
+                                    path_map[path_id] = f"{path_map[parent_id]}/{suffix}"
+                                else:
+                                    path_map[path_id] = suffix if suffix else ""
+
+        target_uid = name_to_uid.get(user, -1)
+        if target_uid < 0:
+            return {}
+
+        scan_date = 0
+        scan_root = ""
+        api_detail = os.path.join(detail_dir, "api", "data_detail.min.json")
+        if os.path.exists(api_detail):
+            try:
+                with open(api_detail, "r", encoding="utf-8") as fh:
+                    detail = json.load(fh)
+                scan_date = int(detail.get("scan", {}).get("timestamp", 0) or 0)
+                scan_root = str(detail.get("scan", {}).get("root", "") or "")
+            except Exception:
+                pass
+
+        data["date"] = scan_date
+        data["user"] = user
+        data["directory"] = scan_root
+
+        dir_rows = []
+        file_rows = []
+
+        if os.path.exists(data_ndjson):
+            with open(data_ndjson, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    row_type = str(obj.get("t", ""))
+                    uid = int(obj.get("u", -1))
+                    if row_type == "ut" and uid == target_uid:
+                        data["total_files"] = int(obj.get("f", 0) or 0)
+                        data["total_dirs"] = int(obj.get("d", 0) or 0)
+                        data["total_used"] = int(obj.get("b", 0) or 0)
+                    elif row_type == "du" and uid == target_uid:
+                        dir_id = int(obj.get("p", -1))
+                        path = path_map[dir_id] if 0 <= dir_id < len(path_map) else ""
+                        if path:
+                            dir_rows.append({
+                                "path": path,
+                                "used": int(obj.get("b", 0) or 0),
+                            })
+                    elif row_type == "d" and uid == target_uid:
+                        path_id = int(obj.get("p", -1))
+                        ext_id = int(obj.get("e", -1))
+                        path = path_map[path_id] if 0 <= path_id < len(path_map) else ""
+                        if not path:
+                            continue
+                        file_rows.append({
+                            "path": path,
+                            "size": int(obj.get("s", 0) or 0),
+                            "ext": exts_map[ext_id] if 0 <= ext_id < len(exts_map) else "",
+                        })
+
+        if is_dir:
+            dir_rows.sort(key=lambda x: x.get("used", 0), reverse=True)
+            data["dirs"] = dir_rows
+            return data
+
+        file_rows.sort(key=lambda x: x.get("size", 0), reverse=True)
+        data["files"] = file_rows
         return data

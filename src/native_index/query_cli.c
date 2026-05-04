@@ -1,29 +1,25 @@
 #define _GNU_SOURCE
-#include "index.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#define MAX_LINE (8 * 1024 * 1024)
-
-/* Field bitmask for --fields */
-#define F_DOC_ID  0x001U
-#define F_GID     0x002U
-#define F_UID     0x004U
-#define F_SIZE    0x008U
-#define F_EID     0x010U
-#define F_SID     0x020U
-#define F_PATH    0x040U
-#define F_EXT     0x080U
-#define F_USER    0x100U
-#define F_ALL     0x1FFU
+#define F_DOC_ID 0x001U
+#define F_GID 0x002U
+#define F_UID 0x004U
+#define F_SIZE 0x008U
+#define F_EID 0x010U
+#define F_SID 0x020U
+#define F_PATH 0x040U
+#define F_EXT 0x080U
+#define F_USER 0x100U
+#define F_ALL 0x1FFU
 
 enum sort_mode { SORT_NONE, SORT_SIZE_ASC, SORT_SIZE_DESC, SORT_PATH_ASC };
-
-typedef struct { uint32_t idx; uint32_t gid; uint64_t size; } doc_key;
-
 
 typedef struct {
     char **items;
@@ -31,22 +27,55 @@ typedef struct {
 } str_list;
 
 typedef struct {
+    uint32_t doc_id;
     uint32_t gid;
+    uint32_t uid;
+    uint64_t size;
+    uint32_t eid;
+    uint32_t sid;
+} doc_ref;
+
+typedef struct {
+    doc_ref *items;
+    size_t count;
+    size_t cap;
+} doc_list;
+
+typedef struct {
+    char *id;
+    char *name;
+    char *owner;
     char *path;
-} gid_path;
+    char *type;
+    uint64_t value;
+    int has_children;
+} treemap_row;
 
-static gid_path *g_sort_path_map = NULL;
-static size_t g_sort_path_map_n = 0;
+typedef struct {
+    treemap_row *items;
+    size_t count;
+    size_t cap;
+} treemap_rows;
 
-static void free_gid_map(gid_path *map, size_t count);
+static char **g_paths = NULL;
+static size_t g_paths_n = 0;
+
+static char *json_get_str(const char *line, const char *key);
+static void free_str_arr(char **arr, size_t count);
+static int doc_list_push(doc_list *lst, const doc_ref *d);
+static int json_get_bool(const char *line, const char *key, int *out);
+static int treemap_rows_push(treemap_rows *lst, const treemap_row *r);
+static void free_treemap_rows(treemap_rows *lst);
+static int load_treemap_rows(const char *detail_root, treemap_rows *rows);
+static char *parent_path_dup(const char *path);
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s <index_dir|index.mmi>\n"
+            "Usage: %s <detail_users|detail_users/index>\n"
             "  [--kw a,b] [--ext .txt,.log] [--user u1,u2]\n"
-            "  [--min n] [--max n] [--limit n] [--offset n]\n"
+            "  [--min n] [--max n] [--limit n] [--offset n] [--page n]\n"
             "  [--sort size_asc|size_desc|path_asc]\n"
-            "  [--json] [--docs] [--fields doc_id,gid,path,user,...]\n",
+            "  [--json] [--docs] [--fields doc_id,gid,path,user,...] [--stats]\n",
             prog);
 }
 
@@ -73,7 +102,10 @@ static int split_csv(const char *s, str_list *out) {
     if (!buf) return 1;
     size_t cap = 8;
     out->items = (char **)calloc(cap, sizeof(char *));
-    if (!out->items) { free(buf); return 1; }
+    if (!out->items) {
+        free(buf);
+        return 1;
+    }
     char *tok = strtok(buf, ",");
     while (tok) {
         while (*tok == ' ') tok++;
@@ -83,11 +115,17 @@ static int split_csv(const char *s, str_list *out) {
             if (out->count == cap) {
                 cap *= 2;
                 char **next = (char **)realloc(out->items, cap * sizeof(char *));
-                if (!next) { free(buf); return 1; }
+                if (!next) {
+                    free(buf);
+                    return 1;
+                }
                 out->items = next;
             }
             out->items[out->count] = dupstr(tok);
-            if (!out->items[out->count]) { free(buf); return 1; }
+            if (!out->items[out->count]) {
+                free(buf);
+                return 1;
+            }
             out->count++;
         }
         tok = strtok(NULL, ",");
@@ -96,66 +134,331 @@ static int split_csv(const char *s, str_list *out) {
     return 0;
 }
 
-static char *build_path(const char *index_path, const char *name) {
-    size_t base_len = strlen(index_path);
-    if (base_len >= 10 && strcmp(index_path + base_len - 10, "/index.mmi") == 0) base_len -= 10;
-    size_t n = base_len + 1 + strlen(name) + 1;
+static char *build_path2(const char *base, const char *name) {
+    size_t n = strlen(base) + 1 + strlen(name) + 1;
     char *out = (char *)malloc(n);
     if (!out) return NULL;
-    memcpy(out, index_path, base_len);
-    out[base_len] = '/';
-    strcpy(out + base_len + 1, name);
+    snprintf(out, n, "%s/%s", base, name);
     return out;
 }
 
-static int parse_json_string_array(const char *path, str_list *out) {
-    memset(out, 0, sizeof(*out));
+static char *resolve_detail_root(const char *input) {
+    size_t n = strlen(input);
+    if (n >= 6 && strcmp(input + n - 6, "/index") == 0) {
+        char *out = (char *)malloc(n - 6 + 1);
+        if (!out) return NULL;
+        memcpy(out, input, n - 6);
+        out[n - 6] = '\0';
+        return out;
+    }
+    if (n >= 10 && strcmp(input + n - 10, "/index.mmi") == 0) {
+        char *out = (char *)malloc(n - 10 + 1);
+        if (!out) return NULL;
+        memcpy(out, input, n - 10);
+        out[n - 10] = '\0';
+        return out;
+    }
+    return dupstr(input);
+}
+
+static char *read_file_all(const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) return 1;
-    char *buf = (char *)malloc(MAX_LINE);
-    if (!buf) { fclose(f); return 1; }
-    size_t n = fread(buf, 1, MAX_LINE - 1, f);
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long sz = ftell(f);
+    if (sz < 0) {
+        fclose(f);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t n = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[n] = '\0';
-    size_t cap = 64;
-    out->items = (char **)calloc(cap, sizeof(char *));
-    if (!out->items) { free(buf); return 1; }
-    const char *p = buf;
-    while (*p && *p != '[') p++;
-    if (*p != '[') { free(buf); return 1; }
-    p++;
-    while (*p) {
-        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
-        if (*p == ']') break;
-        if (*p != '"') { free(buf); return 1; }
-        p++;
-        const char *start = p;
-        while (*p && *p != '"') {
-            if (*p == '\\' && *(p + 1)) p++;
-            p++;
-        }
-        if (*p != '"') { free(buf); return 1; }
-        size_t len = (size_t)(p - start);
-        char *s = (char *)malloc(len + 1);
-        if (!s) { free(buf); return 1; }
-        memcpy(s, start, len);
-        s[len] = '\0';
-        if (out->count == cap) {
-            cap *= 2;
-            char **next = (char **)realloc(out->items, cap * sizeof(char *));
-            if (!next) { free(s); free(buf); return 1; }
-            out->items = next;
-        }
-        out->items[out->count++] = s;
-        p++;
-    }
+    return buf;
+}
+
+static int is_text_layout(const char *detail_root) {
+    char *manifest = build_path2(detail_root, "manifest.json");
+    if (!manifest) return 0;
+    char *buf = read_file_all(manifest);
+    free(manifest);
+    if (!buf) return 0;
+    int ok = strstr(buf, "check-disk-detail\"") != NULL;
     free(buf);
+    return ok;
+}
+
+static int is_treemap_layout(const char *detail_root) {
+    char *manifest = build_path2(detail_root, "manifest.json");
+    if (!manifest) return 0;
+    char *buf = read_file_all(manifest);
+    free(manifest);
+    if (!buf) return 0;
+    int ok = strstr(buf, "check-disk-detail-treemap") != NULL;
+    free(buf);
+    return ok;
+}
+
+static char *safe_user_dir(const char *user) {
+    size_t n = strlen(user);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)user[i];
+        out[i] = (isalnum(ch) || ch == '-' || ch == '_' || ch == '.') ? (char)ch : '_';
+    }
+    out[n] = '\0';
+    return out;
+}
+
+static int ensure_str_slot(char ***arr, size_t *cap, size_t id) {
+    if (id < *cap) return 1;
+    size_t old = *cap;
+    size_t next_cap = *cap ? *cap : 16;
+    while (id >= next_cap) next_cap = next_cap * 2 + 16;
+    char **next = (char **)realloc(*arr, next_cap * sizeof(char *));
+    if (!next) return 0;
+    memset(next + old, 0, (next_cap - old) * sizeof(char *));
+    *arr = next;
+    *cap = next_cap;
+    return 1;
+}
+
+static __attribute__((unused)) int ensure_dict_id(char ***arr, size_t *count, size_t *cap, const char *value, uint32_t *out_id) {
+    for (size_t i = 0; i < *count; i++) {
+        if ((*arr)[i] && strcmp((*arr)[i], value) == 0) {
+            *out_id = (uint32_t)i;
+            return 1;
+        }
+    }
+    if (!ensure_str_slot(arr, cap, *count)) return 0;
+    (*arr)[*count] = dupstr(value);
+    if (!(*arr)[*count]) return 0;
+    *out_id = (uint32_t)(*count);
+    (*count)++;
+    return 1;
+}
+
+static __attribute__((unused)) const char *skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+static int append_filter_doc(doc_list *docs, uint32_t doc_id, uint32_t gid, uint32_t uid, uint32_t eid, uint64_t size) {
+    doc_ref d;
+    memset(&d, 0, sizeof(d));
+    d.doc_id = doc_id;
+    d.gid = gid;
+    d.uid = uid;
+    d.eid = eid;
+    d.size = size;
+    d.sid = 0;
+    return doc_list_push(docs, &d);
+}
+
+static int load_user_file_parts(const char *user_dir, char ***parts_out, size_t *parts_n) {
+    *parts_out = NULL;
+    *parts_n = 0;
+    char *manifest_path = build_path2(user_dir, "manifest.json");
+    if (!manifest_path) return 0;
+    char *buf = read_file_all(manifest_path);
+    free(manifest_path);
+    if (!buf) return 0;
+
+    char *files_sec = strstr(buf, "\"files\"");
+    if (!files_sec) {
+        free(buf);
+        return 1;
+    }
+    char *parts_sec = strstr(files_sec, "\"parts\"");
+    if (!parts_sec) {
+        free(buf);
+        return 1;
+    }
+    char *arr = strchr(parts_sec, '[');
+    char *arr_end = arr ? strchr(arr, ']') : NULL;
+    if (!arr || !arr_end) {
+        free(buf);
+        return 1;
+    }
+
+    size_t cap = 4;
+    char **parts = (char **)calloc(cap, sizeof(char *));
+    if (!parts) {
+        free(buf);
+        return 0;
+    }
+    const char *p = arr;
+    while ((p = strstr(p, "\"path\"")) && p < arr_end) {
+        char *path = json_get_str(p, "path");
+        if (!path) {
+            p += 6;
+            continue;
+        }
+        if (*parts_n == cap) {
+            cap *= 2;
+            char **next = (char **)realloc(parts, cap * sizeof(char *));
+            if (!next) {
+                free(path);
+                free_str_arr(parts, *parts_n);
+                free(buf);
+                return 0;
+            }
+            parts = next;
+        }
+        parts[*parts_n] = path;
+        (*parts_n)++;
+        p += 6;
+    }
+    *parts_out = parts;
+    free(buf);
+    return 1;
+}
+
+static int load_root_users(const char *detail_root, char ***users_out, size_t *users_n) {
+    *users_out = NULL;
+    *users_n = 0;
+    char *manifest_path = build_path2(detail_root, "manifest.json");
+    if (!manifest_path) return 0;
+    char *buf = read_file_all(manifest_path);
+    free(manifest_path);
+    if (!buf) return 0;
+
+    size_t cap = 8;
+    char **users = (char **)calloc(cap, sizeof(char *));
+    if (!users) {
+        free(buf);
+        return 0;
+    }
+    const char *p = buf;
+    while ((p = strstr(p, "\"username\"")) != NULL) {
+        char *name = json_get_str(p, "username");
+        if (!name) {
+            p += 10;
+            continue;
+        }
+        if (*users_n == cap) {
+            cap *= 2;
+            char **next = (char **)realloc(users, cap * sizeof(char *));
+            if (!next) {
+                free(name);
+                free_str_arr(users, *users_n);
+                free(buf);
+                return 0;
+            }
+            users = next;
+        }
+        users[*users_n] = name;
+        (*users_n)++;
+        p += 10;
+    }
+    *users_out = users;
+    free(buf);
+    return 1;
+}
+
+static const char *json_find_key(const char *line, const char *key) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t pat_len = strlen(pat);
+    const char *p = line;
+    while ((p = strstr(p, pat)) != NULL) {
+        const char *q = p + pat_len;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == ':') {
+            q++;
+            while (*q == ' ' || *q == '\t') q++;
+            return q;
+        }
+        p = p + 1;
+    }
+    return NULL;
+}
+
+static int json_get_u64(const char *line, const char *key, uint64_t *out) {
+    const char *p = json_find_key(line, key);
+    if (!p) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p) return 0;
+    *out = (uint64_t)v;
+    return 1;
+}
+
+static int json_get_bool(const char *line, const char *key, int *out) {
+    const char *p = json_find_key(line, key);
+    if (!p) return 0;
+    if (strncmp(p, "true", 4) == 0) {
+        *out = 1;
+        return 1;
+    }
+    if (strncmp(p, "false", 5) == 0) {
+        *out = 0;
+        return 1;
+    }
     return 0;
 }
 
-static int find_id(const str_list *dict, const char *key, uint32_t *out) {
-    for (size_t i = 0; i < dict->count; i++) {
-        if (strcmp(dict->items[i], key) == 0) { *out = (uint32_t)i; return 1; }
+static __attribute__((unused)) int json_get_u32(const char *line, const char *key, uint32_t *out) {
+    uint64_t v = 0;
+    if (!json_get_u64(line, key, &v)) return 0;
+    *out = (uint32_t)v;
+    return 1;
+}
+
+static char *json_get_str(const char *line, const char *key) {
+    const char *p = json_find_key(line, key);
+    if (!p || *p != '"') return NULL;
+    p++;
+    size_t cap = 64, len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    while (*p && *p != '"') {
+        char ch = *p;
+        if (ch == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+                case 'n': ch = '\n'; break;
+                case 'r': ch = '\r'; break;
+                case 't': ch = '\t'; break;
+                case 'b': ch = '\b'; break;
+                case 'f': ch = '\f'; break;
+                default: ch = *p; break;
+            }
+        }
+        if (len + 2 > cap) {
+            cap *= 2;
+            char *next = (char *)realloc(out, cap);
+            if (!next) {
+                free(out);
+                return NULL;
+            }
+            out = next;
+        }
+        out[len++] = ch;
+        p++;
+    }
+    out[len] = '\0';
+    return out;
+}
+
+static int find_id_exact(char **dict, size_t count, const char *key, uint32_t *out) {
+    for (size_t i = 0; i < count; i++) {
+        if (dict[i] && strcmp(dict[i], key) == 0) {
+            *out = (uint32_t)i;
+            return 1;
+        }
     }
     return 0;
 }
@@ -165,255 +468,81 @@ static int contains_u32(uint32_t *arr, size_t n, uint32_t v) {
     return 0;
 }
 
-static const char *normalize_ext_token(const char *ext) {
-    if (!ext) return "";
-    while (*ext == ' ') ext++;
-    if (*ext == '.') ext++;
-    return ext;
-}
-
-static int resolve_ext_id(const str_list *ext_dict, const char *raw_ext, uint32_t *out_eid) {
-    const char *norm = normalize_ext_token(raw_ext);
-    if (find_id(ext_dict, norm, out_eid)) return 1;
-
-    size_t n = strlen(norm);
-    char *lower = (char *)malloc(n + 1);
-    if (!lower) return 0;
-    for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)norm[i]);
-    lower[n] = '\0';
-    int ok = find_id(ext_dict, lower, out_eid);
-    free(lower);
-    return ok;
-}
-
-
-static void tokenize_text(const char *text, str_list *out_tokens) {
-    memset(out_tokens, 0, sizeof(*out_tokens));
-    size_t cap = 8;
-    out_tokens->items = (char **)calloc(cap, sizeof(char *));
-    if (!out_tokens->items) return;
-    char cur[256];
-    size_t n = 0;
-    for (const char *p = text;; p++) {
-        int c = (unsigned char)*p;
-        if (isalnum(c)) { if (n + 1 < sizeof(cur)) cur[n++] = (char)tolower(c); }
-        else {
-            if (n > 0) {
-                cur[n] = '\0';
-                if (out_tokens->count == cap) {
-                    cap *= 2;
-                    char **next = (char **)realloc(out_tokens->items, cap * sizeof(char *));
-                    if (!next) return;
-                    out_tokens->items = next;
-                }
-                out_tokens->items[out_tokens->count++] = dupstr(cur);
-                n = 0;
-            }
-            if (c == '\0') break;
-        }
+static char *norm_lower_token(const char *s, int drop_dot) {
+    while (*s == ' ') s++;
+    size_t n = strlen(s);
+    while (n > 0 && s[n - 1] == ' ') n--;
+    size_t start = 0;
+    if (drop_dot) {
+        while (start < n && s[start] == '.') start++;
     }
-}
-
-static __attribute__((unused)) char *shell_quote_single(const char *s) {
-    size_t n = 2;
-    for (const char *p = s; *p; p++) { if (*p == '\'') n += 4; else n += 1; }
-    char *out = (char *)malloc(n + 1);
+    char *out = (char *)malloc(n - start + 1);
     if (!out) return NULL;
-    char *w = out;
-    *w++ = '\'';
-    for (const char *p = s; *p; p++) {
-        if (*p == '\'') { *w++ = '\''; *w++ = '\\'; *w++ = '\''; *w++ = '\''; }
-        else *w++ = *p;
-    }
-    *w++ = '\'';
-    *w = '\0';
+    size_t w = 0;
+    for (size_t i = start; i < n; i++) out[w++] = (char)tolower((unsigned char)s[i]);
+    out[w] = '\0';
     return out;
 }
 
-static int cmp_u32(const void *a, const void *b) {
-    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-    return (x < y) ? -1 : (x > y) ? 1 : 0;
+static int cmp_doc_size_asc(const void *a, const void *b) {
+    const doc_ref *x = (const doc_ref *)a;
+    const doc_ref *y = (const doc_ref *)b;
+    if (x->size < y->size) return -1;
+    if (x->size > y->size) return 1;
+    return (x->doc_id < y->doc_id) ? -1 : (x->doc_id > y->doc_id);
 }
 
-static int cmp_gid_path_key(const void *key, const void *elem) {
-    uint32_t g = *(const uint32_t *)key;
-    const gid_path *e = (const gid_path *)elem;
-    return (g < e->gid) ? -1 : (g > e->gid) ? 1 : 0;
+static int cmp_doc_size_desc(const void *a, const void *b) {
+    return cmp_doc_size_asc(b, a);
 }
 
-static __attribute__((unused)) char *read_json_string_from_stream(FILE *fp, int *ok) {
-    size_t cap = 128, len = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) { *ok = 0; return NULL; }
-    int c;
-    while ((c = fgetc(fp)) != EOF) {
-        if (c == '"') { buf[len] = '\0'; *ok = 1; return buf; }
-        if (c == '\\') {
-            int e = fgetc(fp);
-            if (e == EOF) break;
-            char decoded;
-            switch (e) { case '"': decoded = '"'; break; case '\\': decoded = '\\'; break;
-            case '/': decoded = '/'; break; case 'b': decoded = '\b'; break;
-            case 'f': decoded = '\f'; break; case 'n': decoded = '\n'; break;
-            case 'r': decoded = '\r'; break; case 't': decoded = '\t'; break;
-            default: decoded = (char)e; break; }
-            if (len + 2 > cap) { cap *= 2; char *next = (char *)realloc(buf, cap); if (!next) { free(buf); *ok = 0; return NULL; } buf = next; }
-            buf[len++] = decoded;
-            continue;
-        }
-        if (len + 2 > cap) { cap *= 2; char *next = (char *)realloc(buf, cap); if (!next) { free(buf); *ok = 0; return NULL; } buf = next; }
-        buf[len++] = (char)c;
+static int cmp_doc_path_asc(const void *a, const void *b) {
+    const doc_ref *x = (const doc_ref *)a;
+    const doc_ref *y = (const doc_ref *)b;
+    const char *px = (x->gid < g_paths_n) ? g_paths[x->gid] : NULL;
+    const char *py = (y->gid < g_paths_n) ? g_paths[y->gid] : NULL;
+    if (px && py) {
+        int c = strcmp(px, py);
+        if (c != 0) return c;
+    } else if (px && !py) {
+        return -1;
+    } else if (!px && py) {
+        return 1;
+    }
+    return (x->doc_id < y->doc_id) ? -1 : (x->doc_id > y->doc_id);
+}
+
+static enum sort_mode parse_sort_mode(const char *s) {
+    if (!s || !*s) return SORT_NONE;
+    if (strcmp(s, "size_asc") == 0) return SORT_SIZE_ASC;
+    if (strcmp(s, "size_desc") == 0) return SORT_SIZE_DESC;
+    if (strcmp(s, "path_asc") == 0) return SORT_PATH_ASC;
+    return SORT_NONE;
+}
+
+static unsigned int parse_fields_mask(const char *s) {
+    unsigned int mask = 0;
+    if (!s || !*s) return F_ALL;
+    char *buf = dupstr(s);
+    if (!buf) return F_ALL;
+    char *tok = strtok(buf, ",");
+    while (tok) {
+        while (*tok == ' ') tok++;
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') tok[--len] = '\0';
+        if (strcmp(tok, "doc_id") == 0) mask |= F_DOC_ID;
+        else if (strcmp(tok, "gid") == 0) mask |= F_GID;
+        else if (strcmp(tok, "uid") == 0) mask |= F_UID;
+        else if (strcmp(tok, "size") == 0) mask |= F_SIZE;
+        else if (strcmp(tok, "eid") == 0) mask |= F_EID;
+        else if (strcmp(tok, "sid") == 0) mask |= F_SID;
+        else if (strcmp(tok, "path") == 0) mask |= F_PATH;
+        else if (strcmp(tok, "ext") == 0) mask |= F_EXT;
+        else if (strcmp(tok, "user") == 0) mask |= F_USER;
+        tok = strtok(NULL, ",");
     }
     free(buf);
-    *ok = 0;
-    return NULL;
-}
-
-static int load_paths_for_gids(const char *paths_bin, const uint32_t *gids,
-                               size_t gids_count, gid_path **out_map, size_t *out_count) {
-    *out_map = NULL;
-    *out_count = 0;
-    if (gids_count == 0) return 0;
-
-    uint32_t *work = (uint32_t *)malloc(gids_count * sizeof(uint32_t));
-    if (!work) return 1;
-    size_t work_n = 0;
-    for (size_t i = 0; i < gids_count; i++) work[work_n++] = gids[i];
-    qsort(work, work_n, sizeof(uint32_t), cmp_u32);
-
-    size_t uniq_n = 0;
-    for (size_t i = 0; i < work_n; i++) {
-        if (i == 0 || work[i] != work[i - 1]) work[uniq_n++] = work[i];
-    }
-
-    gid_path *map = (gid_path *)calloc(uniq_n, sizeof(gid_path));
-    if (!map) { free(work); return 1; }
-    for (size_t i = 0; i < uniq_n; i++) map[i].gid = work[i];
-
-    FILE *fp = fopen(paths_bin, "rb");
-    if (!fp) { free(work); free(map); return 1; }
-
-    unsigned char header[12];
-    if (fread(header, 1, 12, fp) != 12) {
-        fclose(fp); free(work); free(map); return 1;
-    }
-
-    uint32_t count = (uint32_t)header[8] |
-                     ((uint32_t)header[9] << 8) |
-                     ((uint32_t)header[10] << 16) |
-                     ((uint32_t)header[11] << 24);
-    size_t want = 0;
-
-    if (header[0] == 'P' && header[1] == 'T' && header[2] == 'H' && header[3] == '1') {
-        for (uint32_t idx = 0; idx < count && want < uniq_n; idx++) {
-            unsigned char lenb[4];
-            if (fread(lenb, 1, 4, fp) != 4) break;
-            uint32_t len = (uint32_t)lenb[0] |
-                           ((uint32_t)lenb[1] << 8) |
-                           ((uint32_t)lenb[2] << 16) |
-                           ((uint32_t)lenb[3] << 24);
-
-            while (want < uniq_n && map[want].gid < idx) want++;
-            if (want < uniq_n && map[want].gid == idx) {
-                char *value = (char *)malloc((size_t)len + 1);
-                if (!value) { fclose(fp); free(work); free_gid_map(map, uniq_n); return 1; }
-                if (fread(value, 1, len, fp) != len) {
-                    free(value); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-                }
-                value[len] = '\0';
-                map[want].path = value;
-                want++;
-            } else {
-                if (fseek(fp, (long)len, SEEK_CUR) != 0) {
-                    fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-                }
-            }
-        }
-    } else if (header[0] == 'H' && header[1] == 'T' && header[2] == 'A' && header[3] == 'P') {
-        unsigned char extra[12];
-        if (fread(extra, 1, 12, fp) != 12) {
-            fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-        }
-
-        uint64_t *offsets = (uint64_t *)calloc((size_t)count + 1, sizeof(uint64_t));
-        if (!offsets) {
-            fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-        }
-        for (uint32_t i = 0; i <= count; i++) {
-            unsigned char offb[8];
-            if (fread(offb, 1, 8, fp) != 8) {
-                free(offsets); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-            }
-            offsets[i] = (uint64_t)offb[0]
-                       | ((uint64_t)offb[1] << 8)
-                       | ((uint64_t)offb[2] << 16)
-                       | ((uint64_t)offb[3] << 24)
-                       | ((uint64_t)offb[4] << 32)
-                       | ((uint64_t)offb[5] << 40)
-                       | ((uint64_t)offb[6] << 48)
-                       | ((uint64_t)offb[7] << 56);
-        }
-
-        uint64_t blob_size_u64 = offsets[count];
-        if (blob_size_u64 > SIZE_MAX) {
-            free(offsets); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-        }
-        size_t blob_size = (size_t)blob_size_u64;
-        unsigned char *blob = (unsigned char *)malloc(blob_size ? blob_size : 1);
-        if (!blob) {
-            free(offsets); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-        }
-        if (blob_size > 0 && fread(blob, 1, blob_size, fp) != blob_size) {
-            free(blob); free(offsets); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-        }
-
-        for (uint32_t idx = 0; idx < count && want < uniq_n; idx++) {
-            while (want < uniq_n && map[want].gid < idx) want++;
-            if (want >= uniq_n) break;
-            if (map[want].gid != idx) continue;
-
-            uint64_t start = offsets[idx];
-            uint64_t end = offsets[idx + 1];
-            if (start > end || end > blob_size_u64) {
-                free(blob); free(offsets); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-            }
-
-            size_t len = (size_t)(end - start);
-            if (len > 0 && blob[end - 1] == '\0') len--;
-            char *value = (char *)malloc(len + 1);
-            if (!value) {
-                free(blob); free(offsets); fclose(fp); free(work); free_gid_map(map, uniq_n); return 1;
-            }
-            memcpy(value, blob + start, len);
-            value[len] = '\0';
-            map[want].path = value;
-            want++;
-        }
-
-        free(blob);
-        free(offsets);
-    } else {
-        fclose(fp); free(work); free(map); return 1;
-    }
-
-    fclose(fp);
-    free(work);
-    *out_map = map;
-    *out_count = uniq_n;
-    return 0;
-}
-
-
-static void free_gid_map(gid_path *map, size_t count) {
-    if (!map) return;
-    for (size_t i = 0; i < count; i++) free(map[i].path);
-    free(map);
-}
-
-static const char *find_path_in_map(gid_path *map, size_t count, uint32_t gid) {
-    if (!map || count == 0) return NULL;
-    gid_path *hit = (gid_path *)bsearch(&gid, map, count, sizeof(gid_path), cmp_gid_path_key);
-    return hit ? hit->path : NULL;
+    return mask ? mask : F_ALL;
 }
 
 static void print_json_escaped(const char *s) {
@@ -438,68 +567,237 @@ static void print_json_escaped(const char *s) {
     putchar('"');
 }
 
-static enum sort_mode parse_sort_mode(const char *s) {
-    if (!s || !*s) return SORT_NONE;
-    if (strcmp(s, "size_asc")  == 0) return SORT_SIZE_ASC;
-    if (strcmp(s, "size_desc") == 0) return SORT_SIZE_DESC;
-    if (strcmp(s, "path_asc")  == 0) return SORT_PATH_ASC;
-    return SORT_NONE;
+static void free_str_arr(char **arr, size_t count) {
+    if (!arr) return;
+    for (size_t i = 0; i < count; i++) free(arr[i]);
+    free(arr);
 }
 
-static int cmp_doc_key_size_asc(const void *a, const void *b) {
-    const doc_key *x = (const doc_key *)a, *y = (const doc_key *)b;
-    if (x->size < y->size) return -1;
-    if (x->size > y->size) return  1;
-    return (x->idx < y->idx) ? -1 : (x->idx > y->idx) ? 1 : 0;
-}
-static int cmp_doc_key_size_desc(const void *a, const void *b) {
-    return cmp_doc_key_size_asc(b, a);
-}
-static const char *find_path_in_map(gid_path *map, size_t count, uint32_t gid);
-static int cmp_doc_key_path_asc(const void *a, const void *b) {
-    const doc_key *x = (const doc_key *)a, *y = (const doc_key *)b;
-    const char *px = find_path_in_map(g_sort_path_map, g_sort_path_map_n, x->gid);
-    const char *py = find_path_in_map(g_sort_path_map, g_sort_path_map_n, y->gid);
-    if (px && py) {
-        int cmp = strcmp(px, py);
-        if (cmp != 0) return cmp;
-    } else if (px && !py) {
-        return -1;
-    } else if (!px && py) {
-        return 1;
-    }
-    return (x->idx < y->idx) ? -1 : (x->idx > y->idx) ? 1 : 0;
+static char *parent_path_dup(const char *path) {
+    if (!path || !*path) return dupstr("");
+    const char *end = path + strlen(path) - 1;
+    while (end > path && *end == '/') end--;
+    if (end <= path) return dupstr("/");
+    while (end > path && *end != '/') end--;
+    if (end == path) return dupstr("/");
+    size_t len = (size_t)(end - path);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return out;
 }
 
-static unsigned int parse_fields_mask(const char *s) {
-    unsigned int mask = 0;
-    if (!s || !*s) return F_ALL;
-    char *buf = dupstr(s);
-    if (!buf) return F_ALL;
-    char *tok = strtok(buf, ",");
-    while (tok) {
-        while (*tok == ' ') tok++;
-        size_t len = strlen(tok);
-        while (len > 0 && tok[len - 1] == ' ') tok[--len] = '\0';
-        if      (strcmp(tok, "doc_id") == 0) mask |= F_DOC_ID;
-        else if (strcmp(tok, "gid") == 0)    mask |= F_GID;
-        else if (strcmp(tok, "uid") == 0)    mask |= F_UID;
-        else if (strcmp(tok, "size") == 0)    mask |= F_SIZE;
-        else if (strcmp(tok, "eid") == 0)     mask |= F_EID;
-        else if (strcmp(tok, "sid") == 0)     mask |= F_SID;
-        else if (strcmp(tok, "path") == 0)    mask |= F_PATH;
-        else if (strcmp(tok, "ext") == 0)     mask |= F_EXT;
-        else if (strcmp(tok, "user") == 0)    mask |= F_USER;
-        tok = strtok(NULL, ",");
+static int kw_match_any(const char *path, const str_list *kw_tokens) {
+    if (kw_tokens->count == 0) return 1;
+    if (!path) return 0;
+    size_t path_len = strlen(path);
+    for (size_t ti = 0; ti < kw_tokens->count; ti++) {
+        const char *tok = kw_tokens->items[ti];
+        if (!tok || !*tok) continue;
+        size_t tok_len = strlen(tok);
+        if (tok_len > path_len) continue;
+        for (size_t pos = 0; pos <= path_len - tok_len; pos++) {
+            size_t j = 0;
+            while (j < tok_len) {
+                unsigned char ca = (unsigned char)path[pos + j];
+                unsigned char cb = (unsigned char)tok[j];
+                if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+                if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+                if (ca != cb) break;
+                j++;
+            }
+            if (j == tok_len) return 1;
+        }
     }
+    return 0;
+}
+
+static int doc_list_reserve(doc_list *lst, size_t cap_hint) {
+    if (cap_hint <= lst->cap) return 1;
+    doc_ref *buf = (doc_ref *)realloc(lst->items, cap_hint * sizeof(doc_ref));
+    if (!buf) return 0;
+    lst->items = buf;
+    lst->cap = cap_hint;
+    return 1;
+}
+
+static int doc_list_push(doc_list *lst, const doc_ref *d) {
+    if (lst->count == lst->cap) {
+        size_t next = lst->cap ? lst->cap * 2 : 4096;
+        doc_ref *buf = (doc_ref *)realloc(lst->items, next * sizeof(doc_ref));
+        if (!buf) return 0;
+        lst->items = buf;
+        lst->cap = next;
+    }
+    lst->items[lst->count++] = *d;
+    return 1;
+}
+
+static void free_doc_list(doc_list *lst) {
+    if (!lst) return;
+    free(lst->items);
+    lst->items = NULL;
+    lst->count = 0;
+    lst->cap = 0;
+}
+
+static int treemap_rows_push(treemap_rows *lst, const treemap_row *r) {
+    if (lst->count == lst->cap) {
+        size_t next = lst->cap ? lst->cap * 2 : 4096;
+        treemap_row *buf = (treemap_row *)realloc(lst->items, next * sizeof(treemap_row));
+        if (!buf) return 0;
+        lst->items = buf;
+        lst->cap = next;
+    }
+    lst->items[lst->count++] = *r;
+    return 1;
+}
+
+static void free_treemap_rows(treemap_rows *lst) {
+    if (!lst) return;
+    for (size_t i = 0; i < lst->count; i++) {
+        free(lst->items[i].id);
+        free(lst->items[i].name);
+        free(lst->items[i].owner);
+        free(lst->items[i].path);
+        free(lst->items[i].type);
+    }
+    free(lst->items);
+    lst->items = NULL;
+    lst->count = 0;
+    lst->cap = 0;
+}
+
+static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
+    char *shards_dir = build_path2(data_dir, "shards");
+    if (!shards_dir) return 0;
+
+    DIR *d = opendir(shards_dir);
+    if (!d) {
+        free(shards_dir);
+        return 0;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        if (strlen(entry->d_name) != 2) continue;
+
+        size_t nd = strlen(shards_dir) + 1 + strlen(entry->d_name) + strlen("/bucket.ndjson") + 1;
+        char *bucket_path = (char *)malloc(nd);
+        if (!bucket_path) continue;
+        snprintf(bucket_path, nd, "%s/%s/bucket.ndjson", shards_dir, entry->d_name);
+
+        FILE *bf = fopen(bucket_path, "r");
+        free(bucket_path);
+        if (!bf) continue;
+
+        char *line = NULL;
+        size_t line_cap = 0;
+        ssize_t nread;
+        while ((nread = getline(&line, &line_cap, bf)) > 0) {
+            if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
+            if (!*line) continue;
+
+            treemap_row r = {0};
+            r.id = json_get_str(line, "id");
+            r.name = json_get_str(line, "n");
+            r.owner = json_get_str(line, "o");
+            r.path = json_get_str(line, "p");
+            r.type = json_get_str(line, "t");
+            if (!json_get_u64(line, "v", &r.value)) r.value = 0;
+            if (!json_get_bool(line, "h", &r.has_children)) r.has_children = 0;
+
+            if (r.path && r.name) {
+                if (!treemap_rows_push(rows, &r)) {
+                    free(r.id); free(r.name); free(r.owner); free(r.path); free(r.type);
+                }
+            } else {
+                free(r.id); free(r.name); free(r.owner); free(r.path); free(r.type);
+            }
+        }
+        free(line);
+        fclose(bf);
+    }
+    closedir(d);
+    free(shards_dir);
+    return 1;
+}
+
+static int load_treemap_rows(const char *detail_root, treemap_rows *rows) {
+    memset(rows, 0, sizeof(*rows));
+    char *manifest = build_path2(detail_root, "manifest.json");
+    if (!manifest) return 0;
+    char *buf = read_file_all(manifest);
+    free(manifest);
+    if (!buf) return 0;
+
+    int is_treemap = strstr(buf, "check-disk-detail-treemap") != NULL;
     free(buf);
-    return mask ? mask : F_ALL;
+    if (!is_treemap) return 0;
+
+    const char *slash = strrchr(detail_root, '/');
+    if (!slash || slash == detail_root) return 0;
+    size_t parent_n = (size_t)(slash - detail_root);
+    char *parent = (char *)malloc(parent_n + 1);
+    if (!parent) return 0;
+    memcpy(parent, detail_root, parent_n);
+    parent[parent_n] = '\0';
+
+    size_t tm_n = strlen(parent) + strlen("/tree_map_data") + 1;
+    char *tree_map_data = (char *)malloc(tm_n);
+    if (!tree_map_data) {
+        free(parent);
+        return 0;
+    }
+    snprintf(tree_map_data, tm_n, "%s/tree_map_data", parent);
+    free(parent);
+
+    int ok = load_treemap_shards_dir(tree_map_data, rows);
+    free(tree_map_data);
+    return ok;
 }
 
-/* Print a single doc JSON object, only selected fields, no trailing comma */
-static void print_doc(const cdx1_doc_ref *d, unsigned int mask,
-                      gid_path *path_map, size_t path_map_n,
-                      const str_list *ext_dict, const str_list *user_dict) {
+static __attribute__((unused)) int list_ids_from_filter(const str_list *inputs, char **dict, size_t dict_n,
+                                int is_ext, uint32_t **out_ids, size_t *out_n) {
+    *out_ids = NULL;
+    *out_n = 0;
+    if (inputs->count == 0) return 1;
+    uint32_t *ids = (uint32_t *)calloc(inputs->count + 1, sizeof(uint32_t));
+    if (!ids) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < inputs->count; i++) {
+        char *norm = norm_lower_token(inputs->items[i], is_ext ? 1 : 0);
+        if (!norm) {
+            free(ids);
+            return 0;
+        }
+        uint32_t id = 0;
+        int ok = 0;
+        if (!is_ext) {
+            ok = find_id_exact(dict, dict_n, inputs->items[i], &id);
+        } else {
+            ok = find_id_exact(dict, dict_n, norm, &id);
+        }
+        if (ok && !contains_u32(ids, n, id)) ids[n++] = id;
+        free(norm);
+    }
+    *out_ids = ids;
+    *out_n = n;
+    return 1;
+}
+
+static int pass_id_filter(uint32_t value, const uint32_t *ids, size_t n) {
+    if (n == 0) return 1;
+    for (size_t i = 0; i < n; i++) if (ids[i] == value) return 1;
+    return 0;
+}
+
+static void print_doc_json(const doc_ref *d, unsigned int mask,
+                           char **paths, size_t paths_n,
+                           char **exts, size_t exts_n,
+                           char **users, size_t users_n) {
     putchar('{');
     int first = 1;
     if (mask & F_DOC_ID) {
@@ -528,22 +826,22 @@ static void print_doc(const cdx1_doc_ref *d, unsigned int mask,
     }
     if (mask & F_PATH) {
         printf("%s\"path\":", first ? "" : ",");
-        const char *path = find_path_in_map(path_map, path_map_n, d->gid);
-        if (path) print_json_escaped(path);
+        const char *p = (d->gid < paths_n) ? paths[d->gid] : NULL;
+        if (p) print_json_escaped(p);
         else printf("null");
         first = 0;
     }
     if (mask & F_EXT) {
         printf("%s\"ext\":", first ? "" : ",");
-        const char *ext_name = (d->eid < ext_dict->count) ? ext_dict->items[d->eid] : NULL;
-        if (ext_name) print_json_escaped(ext_name);
+        const char *e = (d->eid < exts_n) ? exts[d->eid] : NULL;
+        if (e) print_json_escaped(e);
         else printf("null");
         first = 0;
     }
     if (mask & F_USER) {
         printf("%s\"user\":", first ? "" : ",");
-        const char *user_name = (d->uid < user_dict->count) ? user_dict->items[d->uid] : NULL;
-        if (user_name) print_json_escaped(user_name);
+        const char *u = (d->uid < users_n) ? users[d->uid] : NULL;
+        if (u) print_json_escaped(u);
         else printf("null");
         first = 0;
     }
@@ -551,177 +849,483 @@ static void print_doc(const cdx1_doc_ref *d, unsigned int mask,
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { usage(argv[0]); return 2; }
+    if (argc < 2) {
+        usage(argv[0]);
+        return 2;
+    }
 
-    const char *index_input = argv[1];
+    const char *input = argv[1];
     const char *kw_csv = NULL, *ext_csv = NULL, *user_csv = NULL;
     uint64_t size_min = 0, size_max = 0;
     int has_min = 0, has_max = 0;
     size_t limit = 0, offset = 0;
-    int output_json = 0, output_docs = 0;
+    size_t page_num = 0;
+    int output_json = 0, output_docs = 0, show_stats = 0;
     unsigned int fields_mask = 0;
     enum sort_mode sort_mode = SORT_NONE;
 
     for (int i = 2; i < argc; i++) {
-        if      (strcmp(argv[i], "--kw") == 0 && i + 1 < argc)    kw_csv = argv[++i];
-        else if (strcmp(argv[i], "--ext") == 0 && i + 1 < argc)    ext_csv = argv[++i];
-        else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc)   user_csv = argv[++i];
-        else if (strcmp(argv[i], "--min") == 0 && i + 1 < argc)    { size_min = strtoull(argv[++i], NULL, 10); has_min = 1; }
-        else if (strcmp(argv[i], "--max") == 0 && i + 1 < argc)    { size_max = strtoull(argv[++i], NULL, 10); has_max = 1; }
-        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)  limit = (size_t)strtoull(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--json") == 0)                   output_json = 1;
-        else if (strcmp(argv[i], "--docs") == 0)                  output_docs = 1;
-        else if (strcmp(argv[i], "--fields") == 0 && i + 1 < argc) fields_mask = parse_fields_mask(argv[++i]);
-        else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) offset = (size_t)strtoull(argv[++i], NULL, 10);
-        else if (strcmp(argv[i], "--sort") == 0 && i + 1 < argc) sort_mode = parse_sort_mode(argv[++i]);
-        else { usage(argv[0]); return 2; }
+        if (strcmp(argv[i], "--kw") == 0 && i + 1 < argc) kw_csv = argv[++i];
+        else if (strcmp(argv[i], "--ext") == 0 && i + 1 < argc) ext_csv = argv[++i];
+        else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc) user_csv = argv[++i];
+        else if (strcmp(argv[i], "--min") == 0 && i + 1 < argc) {
+            size_min = strtoull(argv[++i], NULL, 10);
+            has_min = 1;
+        } else if (strcmp(argv[i], "--max") == 0 && i + 1 < argc) {
+            size_max = strtoull(argv[++i], NULL, 10);
+            has_max = 1;
+        } else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+            limit = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) {
+            offset = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--page") == 0 && i + 1 < argc) {
+            page_num = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--sort") == 0 && i + 1 < argc) {
+            sort_mode = parse_sort_mode(argv[++i]);
+        } else if (strcmp(argv[i], "--json") == 0) {
+            output_json = 1;
+        } else if (strcmp(argv[i], "--docs") == 0) {
+            output_docs = 1;
+        } else if (strcmp(argv[i], "--fields") == 0 && i + 1 < argc) {
+            fields_mask = parse_fields_mask(argv[++i]);
+        } else if (strcmp(argv[i], "--stats") == 0) {
+            show_stats = 1;
+        } else {
+            usage(argv[0]);
+            return 2;
+        }
     }
 
-    char *mmi_path = NULL;
-    if (strlen(index_input) >= 10 && strcmp(index_input + strlen(index_input) - 10, "/index.mmi") == 0) mmi_path = dupstr(index_input);
-    else mmi_path = build_path(index_input, "index.mmi");
-    if (!mmi_path) return 1;
+    if (page_num > 0) {
+        if (limit == 0) limit = 500;
+        if (page_num > 1 && offset == 0) offset = (page_num - 1) * limit;
+    }
+    if (limit == 0) limit = 500;
+    if (page_num == 0) page_num = (offset / limit) + 1;
 
-    char *tokens_path = build_path(index_input, "tokens.json");
-    char *exts_path = build_path(index_input, "exts.json");
-    char *users_path = build_path(index_input, "users.json");
-    char *paths_bin_path = build_path(index_input, "../index_seed/paths.bin");
-    if (!tokens_path || !exts_path || !users_path || !paths_bin_path) return 1;
+    char *detail_root = resolve_detail_root(input);
+    if (!detail_root) return 1;
 
-    str_list token_dict, ext_dict, user_dict;
-    if (parse_json_string_array(tokens_path, &token_dict) != 0 ||
-        parse_json_string_array(exts_path, &ext_dict) != 0 ||
-        parse_json_string_array(users_path, &user_dict) != 0) {
-        fprintf(stderr, "failed to parse dictionaries in index dir\n");
+    if (is_treemap_layout(detail_root)) {
+        treemap_rows rows = {0};
+        if (!load_treemap_rows(detail_root, &rows)) {
+            fprintf(stderr, "failed to load treemap rows from shards\n");
+            free(detail_root);
+            return 1;
+        }
+
+        str_list kw_raw = {0}, user_raw = {0};
+        split_csv(kw_csv ? kw_csv : "", &kw_raw);
+        split_csv(user_csv ? user_csv : "", &user_raw);
+
+        str_list kw_tokens = {0};
+        if (kw_raw.count > 0) {
+            kw_tokens.items = (char **)calloc(kw_raw.count * 4 + 1, sizeof(char *));
+            if (!kw_tokens.items) {
+                free_treemap_rows(&rows);
+                free_str_list(&kw_raw);
+                free_str_list(&user_raw);
+                free(detail_root);
+                return 1;
+            }
+            for (size_t i = 0; i < kw_raw.count; i++) {
+                char *norm = norm_lower_token(kw_raw.items[i], 0);
+                if (!norm) continue;
+                char cur[256];
+                size_t cn = 0;
+                for (const char *p = norm; ; p++) {
+                    int c = (unsigned char)*p;
+                    if (isalnum(c)) {
+                        if (cn + 1 < sizeof(cur)) cur[cn++] = (char)c;
+                    } else {
+                        if (cn > 0) {
+                            cur[cn] = '\0';
+                            kw_tokens.items[kw_tokens.count++] = dupstr(cur);
+                            cn = 0;
+                        }
+                        if (c == '\0') break;
+                    }
+                }
+                free(norm);
+            }
+        }
+
+        doc_list docs = {0};
+        size_t treemap_hint = rows.count < 4096 ? rows.count : 4096;
+        if (treemap_hint > 0 && !doc_list_reserve(&docs, treemap_hint)) {
+            free_treemap_rows(&rows);
+            free_str_list(&kw_raw);
+            free_str_list(&user_raw);
+            free_str_list(&kw_tokens);
+            free(detail_root);
+            return 1;
+        }
+        for (size_t i = 0; i < rows.count; i++) {
+            treemap_row *r = &rows.items[i];
+            if (!r->path) continue;
+            if (has_min && r->value < size_min) continue;
+            if (has_max && r->value > size_max) continue;
+            if (!kw_match_any(r->path, &kw_tokens) && !kw_match_any(r->name ? r->name : "", &kw_tokens)) continue;
+
+            if (user_raw.count > 0) {
+                int owner_ok = 0;
+                for (size_t u = 0; u < user_raw.count; u++) {
+                    if (r->owner && strcmp(r->owner, user_raw.items[u]) == 0) {
+                        owner_ok = 1;
+                        break;
+                    }
+                }
+                if (!owner_ok) continue;
+            }
+
+            uint32_t gid = (uint32_t)docs.count;
+            if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) continue;
+            free(g_paths[gid]);
+            g_paths[gid] = dupstr(r->path);
+            if (!g_paths[gid]) continue;
+            append_filter_doc(&docs, (uint32_t)docs.count, gid, 0, 0, r->value);
+        }
+
+        if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_asc);
+        else if (sort_mode == SORT_SIZE_DESC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_desc);
+        else if (sort_mode == SORT_PATH_ASC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_path_asc);
+
+        size_t matched = docs.count;
+        size_t start = (offset < matched) ? offset : matched;
+        size_t remain = (start < matched) ? (matched - start) : 0;
+        size_t emit = (remain > limit) ? limit : remain;
+
+        if (output_json) {
+            size_t total_pages = (matched + limit > 0) ? ((matched + limit - 1) / limit) : 1;
+            printf("{\"matched\":%zu,\"returned\":%zu,\"page\":%zu,\"page_size\":%zu,\"total_pages\":%zu,\"doc_ids\":[",
+                   matched, emit, page_num, limit, total_pages);
+            for (size_t i = 0; i < emit; i++) {
+                if (i) putchar(',');
+                printf("%u", docs.items[start + i].doc_id);
+            }
+            putchar(']');
+            if (output_docs && emit > 0) {
+                printf(",\"docs\":[");
+                for (size_t i = 0; i < emit; i++) {
+                    if (i) putchar(',');
+                    uint32_t did = docs.items[start + i].doc_id;
+                    treemap_row *r = (did < rows.count) ? &rows.items[did] : NULL;
+                    printf("{\"doc_id\":%u,\"path\":", docs.items[start + i].doc_id);
+                    if (r && r->path) print_json_escaped(r->path); else printf("null");
+                    printf(",\"size\":%llu,\"user\":", (unsigned long long)docs.items[start + i].size);
+                    if (r && r->owner) print_json_escaped(r->owner); else printf("null");
+                    printf(",\"name\":");
+                    if (r && r->name) print_json_escaped(r->name); else printf("null");
+                    printf(",\"type\":");
+                    if (r && r->type) print_json_escaped(r->type); else printf("null");
+                    printf(",\"parent_path\":");
+                    if (r && r->path) {
+                        char *pp = parent_path_dup(r->path);
+                        if (pp) {
+                            print_json_escaped(pp);
+                            free(pp);
+                        } else {
+                            printf("null");
+                        }
+                    } else {
+                        printf("null");
+                    }
+                    printf(",\"has_children\":%s}", (r && r->has_children) ? "true" : "false");
+                }
+                putchar(']');
+            }
+            puts("}");
+        } else {
+            printf("matched docs: %zu\n", matched);
+            for (size_t i = 0; i < emit; i++) printf("%u\n", docs.items[start + i].doc_id);
+        }
+
+        free_doc_list(&docs);
+        free_treemap_rows(&rows);
+        free_str_list(&kw_raw);
+        free_str_list(&user_raw);
+        free_str_list(&kw_tokens);
+        free(detail_root);
+        return 0;
+    }
+    if (!is_text_layout(detail_root)) {
+        fprintf(stderr, "detail layout not found at %s (manifest.json schema check failed)\n", detail_root);
+        free(detail_root);
         return 1;
     }
 
-    str_list kws, exts, users;
-    if (split_csv(kw_csv ? kw_csv : "", &kws) != 0 ||
-        split_csv(ext_csv ? ext_csv : "", &exts) != 0 ||
-        split_csv(user_csv ? user_csv : "", &users) != 0) {
-        fprintf(stderr, "failed to parse filters\n"); return 1;
+    /* ── Load user list from root manifest ── */
+    char **g_users = NULL;
+    size_t g_users_n = 0;
+    size_t g_users_cap = 0;
+    if (!load_root_users(detail_root, &g_users, &g_users_n)) {
+        fprintf(stderr, "failed to load user list from manifest\n");
+        free(detail_root);
+        return 1;
     }
 
-    uint32_t *token_ids = (uint32_t *)calloc(kws.count * 4 + 1, sizeof(uint32_t));
-    uint32_t *ext_ids   = (uint32_t *)calloc(exts.count + 1, sizeof(uint32_t));
-    uint32_t *user_ids  = (uint32_t *)calloc(users.count + 1, sizeof(uint32_t));
-    if (!token_ids || !ext_ids || !user_ids) return 1;
-    size_t token_n = 0, ext_n = 0, user_n = 0;
+    /* ── Collect all file rows from per-user chunks ── */
+    size_t g_exts_cap = 256, g_exts_n = 0;
+    char **g_exts = (char **)calloc(g_exts_cap, sizeof(char *));
+    
+    str_list kw_raw = {0}, ext_raw = {0}, user_raw = {0};
+    split_csv(kw_csv ? kw_csv : "", &kw_raw);
+    split_csv(ext_csv ? ext_csv : "", &ext_raw);
+    split_csv(user_csv ? user_csv : "", &user_raw);
 
-    for (size_t i = 0; i < kws.count; i++) {
-        str_list toks; tokenize_text(kws.items[i], &toks);
-        for (size_t j = 0; j < toks.count; j++) {
-            uint32_t tid = 0;
-            if (find_id(&token_dict, toks.items[j], &tid) && !contains_u32(token_ids, token_n, tid)) token_ids[token_n++] = tid;
-        }
-        free_str_list(&toks);
-    }
-    for (size_t i = 0; i < exts.count; i++) {
-        uint32_t eid = 0;
-        if (resolve_ext_id(&ext_dict, exts.items[i], &eid) && !contains_u32(ext_ids, ext_n, eid)) ext_ids[ext_n++] = eid;
-    }
-    for (size_t i = 0; i < users.count; i++) {
-        uint32_t uid = 0;
-        if (find_id(&user_dict, users.items[i], &uid) && !contains_u32(user_ids, user_n, uid)) user_ids[user_n++] = uid;
-    }
-
-    cdx1_index index;
-    int err = cdx1_open(mmi_path, &index);
-    if (err != 0) { fprintf(stderr, "open index failed: %d\n", err); return 1; }
-
-    cdx1_query query;
-    memset(&query, 0, sizeof(query));
-    query.token_ids = token_n ? token_ids : NULL; query.token_count = token_n;
-    query.ext_ids   = ext_n   ? ext_ids   : NULL; query.ext_count   = ext_n;
-    query.user_ids  = user_n  ? user_ids  : NULL; query.user_count  = user_n;
-    query.size_min = size_min; query.size_max = size_max;
-    query.has_size_min = has_min; query.has_size_max = has_max;
-
-    cdx1_docset out;
-    err = cdx1_query_docs(&index, &query, &out);
-    if (err != 0) { fprintf(stderr, "query failed: %d\n", err); cdx1_close(&index); return 1; }
-
-    size_t matched = out.count;
-    doc_key *keys = NULL;
-    if (matched > 0) {
-        keys = (doc_key *)calloc(matched, sizeof(doc_key));
-        if (!keys) { cdx1_free_docset(&out); cdx1_close(&index); return 1; }
-        for (size_t i = 0; i < matched; i++) {
-            uint32_t id = out.doc_ids[i];
-            keys[i].idx = id;
-            if (id < index.doc_count) {
-                keys[i].gid = index.docs[id].gid;
-                keys[i].size = index.docs[id].size;
+    /* Build keyword tokens for path matching */
+    str_list kw_tokens = {0};
+    if (kw_raw.count > 0) {
+        kw_tokens.items = (char **)calloc(kw_raw.count * 4 + 1, sizeof(char *));
+        if (!kw_tokens.items) { free(detail_root); return 1; }
+        for (size_t i = 0; i < kw_raw.count; i++) {
+            char *norm = norm_lower_token(kw_raw.items[i], 0);
+            if (!norm) continue;
+            char cur[256];
+            size_t cn = 0;
+            for (const char *p = norm; ; p++) {
+                int c = (unsigned char)*p;
+                if (isalnum(c)) {
+                    if (cn + 1 < sizeof(cur)) cur[cn++] = (char)c;
+                } else {
+                    if (cn > 0) { cur[cn] = '\0'; kw_tokens.items[kw_tokens.count++] = dupstr(cur); cn = 0; }
+                    if (c == '\0') break;
+                }
             }
+            free(norm);
         }
-        if (sort_mode == SORT_SIZE_ASC) qsort(keys, matched, sizeof(doc_key), cmp_doc_key_size_asc);
-        else if (sort_mode == SORT_SIZE_DESC) qsort(keys, matched, sizeof(doc_key), cmp_doc_key_size_desc);
     }
 
+    /* Build user_id filter list */
+    uint32_t *user_ids = NULL;
+    size_t user_n = 0;
+    for (size_t i = 0; i < user_raw.count; i++) {
+        uint32_t uid = 0;
+        if (find_id_exact(g_users, g_users_n, user_raw.items[i], &uid)) {
+            uint32_t *tmp = (uint32_t *)realloc(user_ids, (user_n + 1) * sizeof(uint32_t));
+            if (!tmp) { free(user_ids); user_ids = NULL; }
+            else { user_ids = tmp; user_ids[user_n++] = uid; }
+        }
+    }
+
+    unsigned char *user_selected = NULL;
+    if (user_n > 0 && g_users_n > 0) {
+        user_selected = (unsigned char *)calloc(g_users_n, sizeof(unsigned char));
+        if (!user_selected) {
+            free(detail_root);
+            free_str_arr(g_users, g_users_n);
+            free(user_ids);
+            free_str_list(&kw_raw);
+            free_str_list(&ext_raw);
+            free_str_list(&user_raw);
+            free_str_list(&kw_tokens);
+            return 1;
+        }
+        for (size_t i = 0; i < user_n; i++) {
+            if (user_ids[i] < g_users_n) user_selected[user_ids[i]] = 1;
+        }
+    }
+
+    /* Build ext_id filter list */
+    uint32_t *ext_ids = NULL;
+    size_t ext_n = 0;
+    for (size_t i = 0; i < ext_raw.count; i++) {
+        char *norm_ext = norm_lower_token(ext_raw.items[i], 1);
+        if (!norm_ext) continue;
+        uint32_t eid = 0;
+        int found = 0;
+        for (size_t j = 0; j < g_exts_n; j++) {
+            if (g_exts[j] && strcmp(g_exts[j], norm_ext) == 0) { eid = (uint32_t)j; found = 1; break; }
+        }
+        if (!found) {
+            if (!ensure_str_slot(&g_exts, &g_exts_cap, g_exts_n)) { free(norm_ext); continue; }
+            g_exts[g_exts_n] = norm_ext;
+            eid = (uint32_t)g_exts_n;
+            g_exts_n++;
+        } else {
+            free(norm_ext);
+        }
+        if (!contains_u32(ext_ids, ext_n, eid)) {
+            uint32_t *tmp = (uint32_t *)realloc(ext_ids, (ext_n + 1) * sizeof(uint32_t));
+            if (tmp) { ext_ids = tmp; ext_ids[ext_n++] = eid; }
+        }
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    doc_list docs = {0};
+    size_t docs_hint = user_n > 0 ? (user_n * 4096) : 4096;
+    if (!doc_list_reserve(&docs, docs_hint)) {
+        free(detail_root);
+        free_str_arr(g_users, g_users_n);
+        free(user_ids);
+        free(user_selected);
+        free(ext_ids);
+        free_str_list(&kw_raw);
+        free_str_list(&ext_raw);
+        free_str_list(&user_raw);
+        free_str_list(&kw_tokens);
+        free_str_arr(g_exts, g_exts_cap);
+        return 1;
+    }
+    uint32_t seq_doc_id = 0;
+    size_t scanned = 0;
+
+    /* Iterate every user, read their file parts */
+    for (size_t ui = 0; ui < g_users_n; ui++) {
+        const char *username = g_users[ui];
+        uint32_t uid = (uint32_t)ui;
+
+        /* Apply user filter */
+        if (user_selected && (uid >= g_users_n || !user_selected[uid])) continue;
+
+        char *user_safedir = safe_user_dir(username);
+        if (!user_safedir) continue;
+
+        /* Build path: detail_root/users/<safedir> */
+        size_t base_n = strlen(detail_root) + 8;  /* "/users/" */
+        size_t user_dir_n = base_n + strlen(user_safedir) + 2;
+        char *user_dir = (char *)malloc(user_dir_n);
+        if (user_dir) {
+            snprintf(user_dir, user_dir_n, "%s/users/%s", detail_root, user_safedir);
+
+            char **file_parts = NULL;
+            size_t file_parts_n = 0;
+            if (load_user_file_parts(user_dir, &file_parts, &file_parts_n)) {
+                for (size_t pi = 0; pi < file_parts_n; pi++) {
+                    char *part_rel = file_parts[pi];
+                    if (!part_rel) continue;
+
+                    size_t part_path_n = strlen(user_dir) + 1 + strlen(part_rel) + 1;
+                    char *part_path = (char *)malloc(part_path_n);
+                    if (!part_path) continue;
+                    snprintf(part_path, part_path_n, "%s/%s", user_dir, part_rel);
+
+                    FILE *pf = fopen(part_path, "r");
+                    if (!pf) { free(part_path); continue; }
+
+                    char *line = NULL;
+                    size_t line_cap = 0;
+                    ssize_t nread;
+                    while ((nread = getline(&line, &line_cap, pf)) > 0) {
+                        if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
+                        if (!*line) continue;
+
+                        /* New per-user format: {"p":"<path>","s":<bytes>,"x":"<ext>"} */
+                        uint64_t size = 0;
+                        if (!json_get_u64(line, "s", &size)) continue;
+
+                        if (has_min && size < size_min) continue;
+                        if (has_max && size > size_max) continue;
+
+                        /* path + keyword match */
+                        char *path_str = json_get_str(line, "p");
+                        if (!path_str) continue;
+                        if (!kw_match_any(path_str, &kw_tokens)) { free(path_str); continue; }
+
+                        uint32_t eid = 0;
+                        char *ext_str = NULL;
+                        char *ext_norm = NULL;
+                        if (ext_n > 0 || output_docs) {
+                            ext_str = json_get_str(line, "x");
+                            ext_norm = ext_str ? norm_lower_token(ext_str, 1) : NULL;
+                            if (ext_norm) {
+                                if (!find_id_exact(g_exts, g_exts_n, ext_norm, &eid)) {
+                                    if (!ensure_str_slot(&g_exts, &g_exts_cap, g_exts_n)) {
+                                        free(ext_norm);
+                                        free(ext_str);
+                                        free(path_str);
+                                        continue;
+                                    }
+                                    g_exts[g_exts_n] = dupstr(ext_norm);
+                                    eid = (uint32_t)g_exts_n;
+                                    g_exts_n++;
+                                }
+                            }
+                        }
+                        if (!pass_id_filter(eid, ext_ids, ext_n)) {
+                            free(ext_norm); free(path_str); free(ext_str); continue;
+                        }
+
+                        uint32_t gid = seq_doc_id;
+                        if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) {
+                            free(path_str); free(ext_norm); free(ext_str);
+                            continue;
+                        }
+                        free(g_paths[gid]);
+                        g_paths[gid] = path_str;
+                        if (!g_paths[gid]) {
+                            free(path_str); free(ext_norm); free(ext_str);
+                            continue;
+                        }
+
+                        scanned++;
+                        append_filter_doc(&docs, seq_doc_id++, gid, uid, eid, size);
+                        free(ext_norm); free(ext_str);
+                    }
+                    free(line);
+                    fclose(pf);
+                    free(part_path);
+                }
+            }
+            free(file_parts);
+            file_parts = NULL;
+            free(user_dir);
+        }
+        free(user_safedir);
+    }
+
+    /* g_paths/g_paths_n now hold inline per-doc paths for output/sorting */
+
+    /* sort */
+    if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_asc);
+    else if (sort_mode == SORT_SIZE_DESC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_desc);
+    else if (sort_mode == SORT_PATH_ASC) {
+        qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_path_asc);
+    }
+
+    size_t matched = docs.count;
     size_t start = (offset < matched) ? offset : matched;
     size_t remain = (start < matched) ? (matched - start) : 0;
-    size_t emit = (limit > 0 && remain > limit) ? limit : remain;
-
-    /* Load paths when needed: docs.path output OR path_asc sorting */
-    gid_path *path_map = NULL;
-    size_t path_map_n = 0;
-    unsigned int effective_mask = output_docs ? (fields_mask ? fields_mask : F_ALL) : 0;
-    int need_path_for_docs = output_json && output_docs && (effective_mask & F_PATH) && emit > 0;
-    int need_path_for_sort = (sort_mode == SORT_PATH_ASC && matched > 0);
-    if (need_path_for_docs || need_path_for_sort) {
-        size_t gid_n = need_path_for_sort ? matched : emit;
-        uint32_t *gids = (uint32_t *)calloc(gid_n, sizeof(uint32_t));
-        if (gids) {
-            if (need_path_for_sort) {
-                for (size_t i = 0; i < matched; i++) gids[i] = keys[i].gid;
-            } else {
-                for (size_t i = 0; i < emit; i++) gids[i] = keys[start + i].gid;
-            }
-            load_paths_for_gids(paths_bin_path, gids, gid_n, &path_map, &path_map_n);
-            free(gids);
-        }
-    }
-
-    if (sort_mode == SORT_PATH_ASC && matched > 0 && path_map_n > 0) {
-        g_sort_path_map = path_map;
-        g_sort_path_map_n = path_map_n;
-        qsort(keys, matched, sizeof(doc_key), cmp_doc_key_path_asc);
-        g_sort_path_map = NULL;
-        g_sort_path_map_n = 0;
-        start = (offset < matched) ? offset : matched;
-        remain = (start < matched) ? (matched - start) : 0;
-        emit = (limit > 0 && remain > limit) ? limit : remain;
-    }
+    size_t emit = (remain > limit) ? limit : remain;
 
     if (output_json) {
-        printf("{\"matched\":%zu,\"returned\":%zu,\"doc_ids\":[", matched, emit);
-        for (size_t i = 0; i < emit; i++) { if (i) putchar(','); printf("%u", keys[start + i].idx); }
+        size_t total_pages = (matched + limit > 0) ? ((matched + limit - 1) / limit) : 1;
+        printf("{\"matched\":%zu,\"returned\":%zu,\"page\":%zu,\"page_size\":%zu,\"total_pages\":%zu,\"doc_ids\":[",
+               matched, emit, page_num, limit, total_pages);
+        for (size_t i = 0; i < emit; i++) {
+            if (i) putchar(',');
+            printf("%u", docs.items[start + i].doc_id);
+        }
         putchar(']');
 
         if (output_docs && emit > 0) {
+            unsigned int mask = fields_mask ? fields_mask : F_ALL;
             printf(",\"docs\":[");
             for (size_t i = 0; i < emit; i++) {
-                uint32_t id = keys[start + i].idx;
                 if (i) putchar(',');
-                if (id < index.doc_count) print_doc(&index.docs[id], effective_mask, path_map, path_map_n, &ext_dict, &user_dict);
-                else { printf("{\"doc_id\":%u}", id); }
+                print_doc_json(&docs.items[start + i], mask, g_paths, g_paths_n, g_exts, g_exts_n, g_users, g_users_n);
             }
             putchar(']');
         }
         puts("}");
     } else {
         printf("matched docs: %zu\n", matched);
-        for (size_t i = 0; i < emit; i++) printf("%u\n", keys[start + i].idx);
+        for (size_t i = 0; i < emit; i++) printf("%u\n", docs.items[start + i].doc_id);
     }
 
-    cdx1_free_docset(&out);
-    cdx1_close(&index);
-    free_gid_map(path_map, path_map_n);
-    free(keys);
-    free_str_list(&token_dict); free_str_list(&ext_dict); free_str_list(&user_dict);
-    free_str_list(&kws); free_str_list(&exts); free_str_list(&users);
-    free(token_ids); free(ext_ids); free(user_ids);
-    free(mmi_path); free(tokens_path); free(exts_path); free(users_path); free(paths_bin_path);
+    if (show_stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double sec = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        fprintf(stderr, "stats: scanned=%zu matched=%zu returned=%zu elapsed=%.6fs\n", scanned, matched, emit, sec);
+    }
+
+    free_doc_list(&docs);
+    free(ext_ids); free(user_ids); free(user_selected);
+    free_str_list(&kw_raw); free_str_list(&ext_raw); free_str_list(&user_raw); free_str_list(&kw_tokens);
+    free_str_arr(g_exts, g_exts_cap);
+    free_str_arr(g_users, g_users_cap);
+    free(detail_root);
     return 0;
 }

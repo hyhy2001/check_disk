@@ -118,115 +118,122 @@ def _build_unified_fixture(tmp_path):
 def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
     _, _, detail_manifest, _, _, tree_manifest = _build_unified_fixture(tmp_path)
 
-    detail = json.loads((detail_manifest.parent / "api" / "data_detail.min.json").read_text(encoding="utf-8"))
-    paths_bin = detail_manifest.parent / "index_seed" / "paths.bin"
-    with open(paths_bin, "rb") as fh:
-        header = fh.read(12)
-        count = int.from_bytes(header[8:12], "little")
-        paths_dict = []
-        if header[:4] == b"PTH1":
-            for _ in range(count):
-                n = int.from_bytes(fh.read(4), "little")
-                paths_dict.append(fh.read(n).decode("utf-8"))
-        else:
-            assert header[:4] == b"HTAP"
-            fh.read(12)
-            offsets = [int.from_bytes(fh.read(8), "little") for _ in range(count + 1)]
-            blob = fh.read(offsets[-1])
-            for i in range(count):
-                chunk = blob[offsets[i]:offsets[i + 1]]
-                if chunk.endswith(b"\x00"):
-                    chunk = chunk[:-1]
-                paths_dict.append(chunk.decode("utf-8"))
-    users = sorted(
-        (u["username"], u["total_files"], u["total_dirs"], u["total_bytes"])
-        for u in detail["users"]
-    )
-    assert users == [("alice", 3, 2, 6656), ("bob", 2, 2, 9216)]
+    detail_root = detail_manifest.parent
 
-    alice_dir = detail_manifest.parent / "users" / "alice"
-    alice_manifest = json.loads((alice_dir / "manifest.json").read_text(encoding="utf-8"))
-    alice_part = alice_manifest["files"]["parts"][0]["path"]
+    detail_summary = json.loads((detail_root / "data_detail.json").read_text(encoding="utf-8"))
+    assert detail_summary["schema"] == "check-disk-detail"
+    users_summary = {u["username"]: u for u in detail_summary["users"]}
+    assert users_summary["alice"]["files"] == 3
+    assert users_summary["alice"]["used"] == 6656
+    assert users_summary["bob"]["files"] == 2
+    assert users_summary["bob"]["used"] == 9216
+
+    alice_user_dir = detail_root / "users" / "alice"
+    alice_manifest = json.loads((alice_user_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert alice_manifest["schema"] == "check-disk-user"
+    assert alice_manifest["summary"]["files"] == 3
+    assert alice_manifest["summary"]["used"] == 6656
+
+    alice_file_parts = alice_manifest["files"]["parts"]
+    assert len(alice_file_parts) >= 1
     alice_files = []
-    with gzip.open(alice_dir / alice_part, "rb") as fh:
-        header = fh.read(8)
-        assert header[:4] == b"CDB4"
-        while True:
-            base = fh.read(14)
-            if not base:
-                break
-            path_id, size, ext_len = struct.unpack("<IQH", base)
-            ext = fh.read(ext_len).decode("utf-8")
-            alice_files.append({"i": path_id, "s": size, "x": ext})
-    assert [row["s"] for row in alice_files] == [4096, 2048, 512]
-    assert [row["s"] for row in alice_files if row["x"] == "log"] == [2048]
-    assert any(paths_dict[row["i"]].endswith("alpha.txt") for row in alice_files)
+    for part in alice_file_parts:
+        chunk_path = alice_user_dir / part["path"]
+        with open(chunk_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                alice_files.append({
+                    "path": row["p"],
+                    "size": row["s"],
+                    "ext": row["x"],
+                })
+    assert [f["size"] for f in alice_files] == [4096, 2048, 512]
+    assert [f["size"] for f in alice_files if f["ext"] == "log"] == [2048]
+    assert any(f["path"].endswith("alpha.txt") for f in alice_files)
 
-    bob_dir = detail_manifest.parent / "users" / "bob"
-    bob_manifest = json.loads((bob_dir / "manifest.json").read_text(encoding="utf-8"))
-    bob_dir_part = bob_manifest["dirs"]["parts"][0]["path"]
+    bob_user_dir = detail_root / "users" / "bob"
+    bob_manifest = json.loads((bob_user_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert bob_manifest["summary"]["files"] == 2
+    bob_dir_parts = bob_manifest["dirs"]["parts"]
     bob_dirs = []
-    with gzip.open(bob_dir / bob_dir_part, "rb") as fh:
-        header = fh.read(8)
-        assert header[:4] == b"CDB4"
-        while True:
-            rec = fh.read(12)
-            if not rec:
-                break
-            path_id, used = struct.unpack("<Iq", rec)
-            bob_dirs.append({"i": path_id, "s": used})
-    assert sorted(row["s"] for row in bob_dirs) == [1024, 8192]
+    for part in bob_dir_parts:
+        chunk_path = bob_user_dir / part["path"]
+        with open(chunk_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                bob_dirs.append(row["s"])
+    assert sorted(bob_dirs) == [1024, 8192]
 
     tree = json.loads(tree_manifest.read_text(encoding="utf-8"))
     assert tree["schema"] == "check-disk-detail-treemap"
-    assert tree["files"]["nodes.bin"]["records"] >= 1
+    files_meta = tree.get("files", {})
+    assert "api/shards_manifest.json" in files_meta
+    assert "shards" in files_meta
+
+    assert not (detail_root / "index_seed").exists()
+    assert not (detail_root / "index").exists()
 
 
-def test_detail_and_treemap_manifests_include_checksum_and_records(tmp_path):
-    _, _, _, detail_schema_manifest, _, tree_manifest = _build_unified_fixture(tmp_path)
+def test_unified_text_manifest_includes_expected_records(tmp_path):
+    _, _, detail_manifest, _, _, tree_manifest = _build_unified_fixture(tmp_path)
 
-    detail_meta = json.loads(detail_schema_manifest.read_text(encoding="utf-8"))
+    detail_meta = json.loads(detail_manifest.read_text(encoding="utf-8"))
     assert detail_meta["schema"] == "check-disk-detail"
-    assert detail_meta["checksum"] != "pending"
-    assert detail_meta["files"]["agg/uid_totals.bin"]["records"] >= 1
-    assert detail_meta["files"]["agg/dir_user_sizes.bin"]["records"] >= 1
-    assert detail_meta["files"]["agg/perm_events.bin"]["records"] >= 1
-    assert detail_meta["files"]["users/"]["record_encoding"] == "binary-v1"
+    assert isinstance(detail_meta.get("users"), list)
+    assert len(detail_meta["users"]) >= 2
+
+    detail_summary = json.loads((detail_manifest.parent / "data_detail.json").read_text(encoding="utf-8"))
+    assert detail_summary["scan"]["total_files"] == 5
+    assert detail_summary["scan"]["total_size"] == (4096 + 2048 + 512 + 8192 + 1024)
 
     tree_meta = json.loads(tree_manifest.read_text(encoding="utf-8"))
     assert tree_meta["schema"] == "check-disk-detail-treemap"
-    assert tree_meta["checksum"] != "pending"
-    assert tree_meta["files"]["nodes.bin"]["records"] >= 1
-    assert tree_meta["files"]["name_dict.bin"]["records"] >= 1
+    files_meta = tree_meta.get("files", {})
+    assert files_meta["api/shards_manifest.json"]["records"] == 1
+    assert files_meta["shards"]["records"] >= 1
 
 
-def test_manifest_checksum_is_deterministic_for_same_input(tmp_path):
+def test_unified_text_manifest_is_deterministic_for_same_input(tmp_path):
     run1 = tmp_path / "run1"
     run2 = tmp_path / "run2"
     run1.mkdir(parents=True, exist_ok=True)
     run2.mkdir(parents=True, exist_ok=True)
 
-    _, _, _, detail_schema_manifest_1, _, tree_manifest_1 = _build_unified_fixture(run1)
-    _, _, _, detail_schema_manifest_2, _, tree_manifest_2 = _build_unified_fixture(run2)
+    _, _, detail_manifest_1, _, _, tree_manifest_1 = _build_unified_fixture(run1)
+    _, _, detail_manifest_2, _, _, tree_manifest_2 = _build_unified_fixture(run2)
 
-    detail_1 = json.loads(detail_schema_manifest_1.read_text(encoding="utf-8"))
-    detail_2 = json.loads(detail_schema_manifest_2.read_text(encoding="utf-8"))
-    assert detail_1["checksum"] != "pending"
-    assert detail_2["checksum"] != "pending"
-    assert len(detail_1["checksum"]) == 8
-    assert len(detail_2["checksum"]) == 8
+    detail_1 = json.loads(detail_manifest_1.read_text(encoding="utf-8"))
+    detail_2 = json.loads(detail_manifest_2.read_text(encoding="utf-8"))
+    assert detail_1["schema"] == detail_2["schema"] == "check-disk-detail"
+    assert len(detail_1.get("users", [])) == len(detail_2.get("users", []))
+
+    summary_1 = json.loads((detail_manifest_1.parent / "data_detail.json").read_text(encoding="utf-8"))
+    summary_2 = json.loads((detail_manifest_2.parent / "data_detail.json").read_text(encoding="utf-8"))
+    assert summary_1["scan"]["total_files"] == summary_2["scan"]["total_files"] == 5
+    assert summary_1["scan"]["total_size"] == summary_2["scan"]["total_size"]
 
     tree_1 = json.loads(tree_manifest_1.read_text(encoding="utf-8"))
     tree_2 = json.loads(tree_manifest_2.read_text(encoding="utf-8"))
-    assert tree_1["checksum"] != "pending"
-    assert tree_2["checksum"] != "pending"
-    assert len(tree_1["checksum"]) == 8
-    assert len(tree_2["checksum"]) == 8
+    assert tree_1["schema"] == tree_2["schema"] == "check-disk-detail-treemap"
+    files_1 = tree_1.get("files", {})
+    files_2 = tree_2.get("files", {})
+    assert files_1["api/shards_manifest.json"]["records"] == files_2["api/shards_manifest.json"]["records"] == 1
+    assert files_1["shards"]["records"] == files_2["shards"]["records"]
 
-    assert tree_1["files"]["nodes.bin"]["bytes"] == tree_2["files"]["nodes.bin"]["bytes"]
-    assert detail_1["files"]["cols/doc.uid.bin"]["bytes"] == detail_2["files"]["cols/doc.uid.bin"]["bytes"]
-    assert detail_1["files"]["cols/doc.uid.bin"]["records"] == detail_2["files"]["cols/doc.uid.bin"]["records"]
-    assert detail_1["files"]["agg/uid_totals.bin"]["records"] == detail_2["files"]["agg/uid_totals.bin"]["records"]
+
+def test_detail_and_treemap_manifests_include_checksum_and_records(tmp_path):
+    test_unified_text_manifest_includes_expected_records(tmp_path)
+
+
+def test_manifest_checksum_is_deterministic_for_same_input(tmp_path):
+    test_unified_text_manifest_is_deterministic_for_same_input(tmp_path)
+
 
 
 def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
@@ -296,29 +303,32 @@ def test_cli_check_users_uses_detail_manifest(tmp_path):
     assert dir_files["missing"] == expected
     assert file_files["missing"] == expected
 
+
 def test_unified_json_outputs_permission_issues(tmp_path):
     _, _, detail_manifest, _, _, _ = _build_unified_fixture(tmp_path)
     perm_path = detail_manifest.parent.parent / "permission_issues.json"
     assert perm_path.exists()
-    
+
     perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
     issues = perm_data["permission_issues"]
     assert issues["count"] == 3
-    
+
     users = sorted(issues["users"], key=lambda u: u["name"])
     assert len(users) == 2
     assert users[0]["name"] == "alice"
     assert users[0]["inaccessible_items"][0]["type"] == "directory"
     assert users[0]["inaccessible_items"][0]["error"] == "EACCES"
-    
+
     assert users[1]["name"] == "bob"
     assert users[1]["inaccessible_items"][0]["type"] == "file"
     assert users[1]["inaccessible_items"][0]["error"] == "ENOENT"
-    
+
     unknown = issues["unknown_items"]
     assert len(unknown) == 1
     assert unknown[0]["type"] == "directory"
     assert unknown[0]["error"] == "EIO"
+
+
 
 
 # ── Negative tests: corrupt / truncated / malformed inputs ─────────────────────

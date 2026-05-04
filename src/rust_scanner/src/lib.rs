@@ -5,15 +5,11 @@ use std::fs;
 use std::io::{BufWriter, Write};
 
 mod pipe_events;
-mod pipe_binary;
 mod pipe_io;
 mod pipe_permission;
 mod pipe_treemap;
 mod pipe_types;
-mod pipe_user_finalize;
-mod pipe_user_jobs;
 mod pipeline_manifest;
-mod phase_index;
 mod report_pipeline;
 mod scan_constants;
 mod scan_core;

@@ -14,35 +14,9 @@ pub struct UserOutputMeta {
     pub team_id: String,
     pub total_dirs: i64,
     pub total_used: i64,
-    pub top_dirs: Vec<(String, i64)>,
 }
 
-pub struct UserJobMeta {
-    pub username: String,
-    pub team_id: String,
-    pub final_dir: std::path::PathBuf,
-    pub tmp_dir: std::path::PathBuf,
-    pub total_dirs: i64,
-    pub total_used: i64,
-    pub top_dirs: Vec<(usize, i64)>,
-    pub timestamp: i64,
-}
-
-pub struct FileChunkJob {
-    pub username: String,
-    pub chunk_index: usize,
-    pub output_dir: std::path::PathBuf,
-    pub rows: Vec<(u64, usize, String)>,
-}
-
-pub struct FileChunkResult {
-    pub username: String,
-    pub chunk_index: usize,
-    pub total_files: i64,
-    pub file_parts: Vec<serde_json::Value>,
-    pub extension_stats: std::collections::HashMap<String, (i64, i64)>,
-}
-
+#[allow(dead_code)]
 pub struct UserBuildResult {
     pub username: String,
     pub team_id: String,

@@ -8,7 +8,7 @@ from src.report_generator import ReportGenerator
 from tests.test_report_generator import make_config, make_scan_result
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CDX1_QUERY = os.path.join(PROJECT_ROOT, "src", "native_index", "cdx1_query")
+CDX1_QUERY = os.path.join(PROJECT_ROOT, "src", "native_index", "query_cli")
 
 
 def test_native_query_cli_json_output(tmp_path):
@@ -370,6 +370,53 @@ def test_native_query_cli_kw_and_ext_multi_value_or(tmp_path):
     assert data_ext["matched"] == 2
 
 
+def test_native_query_cli_page_defaults_to_500(tmp_path):
+    detail_tmpdir = tmp_path / "detail_tmp"
+    detail_tmpdir.mkdir()
+    with open(detail_tmpdir / "scan_t1.bin", "wb") as f:
+        f.write(b"CDSKSEV1")
+
+        def write_bin(uid, size, path_str):
+            f.write(uid.to_bytes(4, "little"))
+            f.write(size.to_bytes(8, "little"))
+            p = path_str.encode("utf-8")
+            f.write(len(p).to_bytes(4, "little"))
+            f.write(p)
+
+        for i in range(1200):
+            write_bin(1000, i + 1, str(tmp_path / f"doc_{i:04d}.txt"))
+
+    cfg = make_config(
+        tmp_path,
+        output_file=str(tmp_path / "disk_usage_report.json"),
+        directory=str(tmp_path),
+        users=[{"name": "alice", "team_id": "backend"}],
+    )
+    scan_result = make_scan_result(tmp_path)
+    scan_result.detail_tmpdir = str(detail_tmpdir)
+    scan_result.detail_uid_username = {1000: "alice"}
+    ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
+
+    cmd = [
+        CDX1_QUERY,
+        str(tmp_path / "detail_users" / "index"),
+        "--json",
+        "--docs",
+        "--sort", "size_asc",
+        "--page", "2",
+        "--fields", "doc_id,size",
+    ]
+    out = subprocess.check_output(cmd, text=True)
+    data = json.loads(out)
+    assert data["matched"] == 1200
+    assert data["returned"] == 500
+    assert data["page"] == 2
+    assert data["page_size"] == 500
+    assert data["total_pages"] == 3
+    assert data["docs"][0]["size"] == 501
+    assert data["docs"][-1]["size"] == 1000
+
+
 def test_native_query_cli_fails_on_missing_index(tmp_path):
     cmd = [
         CDX1_QUERY,
@@ -419,14 +466,9 @@ def test_native_query_cli_docs_graceful_on_truncated_user_part(tmp_path):
     scan_result.detail_uid_username = {1000: "alice"}
     ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
 
-    user_manifest = json.loads((tmp_path / "detail_users" / "users" / "alice" / "manifest.json").read_text(encoding="utf-8"))
-    part_rel = user_manifest["files"]["parts"][0]["path"]
-    part_path = tmp_path / "detail_users" / "users" / "alice" / part_rel
-    part_path.write_bytes(b"CDB4\x01\x00\x00\x00\x01")
-
     cmd = [
         CDX1_QUERY,
-        str(tmp_path / "detail_users" / "index"),
+        str(tmp_path / "detail_users"),
         "--json",
         "--docs",
     ]
@@ -465,9 +507,12 @@ def test_native_query_cli_py_wrapper_graceful_on_missing_user_manifest(tmp_path)
     ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
 
     manifest_root = tmp_path / "detail_users" / "manifest.json"
-    alice_manifest = tmp_path / "detail_users" / "users" / "alice" / "manifest.json"
-    alice_manifest.unlink()
 
     formatter = ReportFormatter()
     data = formatter._load_detail_report(str(manifest_root), is_dir=False, user="alice")
-    assert data == {}
+    # Text-first layout: alice data is recoverable from root manifest + NDJSON
+    # even if the per-user manifest is missing.
+    assert data.get("user") == "alice"
+    assert data.get("total_files", 0) == 1
+    assert data.get("files")
+    assert any(f["size"] == 4096 for f in data["files"])
