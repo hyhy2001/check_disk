@@ -142,31 +142,8 @@ def _build_ssh_base(user: str, host: str, password: str = None, control_socket: 
     return ["ssh", "-q", *ctl_args, target], env_extra
 
 
-def _build_sshpass_env(password: str = None):
-    """Return env dict with SSHPASS set (if password provided)."""
-    if password:
-        return {"SSHPASS": password}
-    return {}
-
-
 class ReportSyncer:
     """Handles syncing reports to a remote server over SSH."""
-
-    @staticmethod
-    def _remote_has_binary(ssh_base: list, env: dict, binary: str) -> bool:
-        """Check whether a binary exists on remote host."""
-        cmd = ssh_base + [f"command -v {binary} >/dev/null 2>&1"]
-        try:
-            res = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env={**os.environ, **env},
-                timeout=SSH_TIMEOUT,
-            )
-            return res.returncode == 0
-        except (subprocess.TimeoutExpired, OSError):
-            return False
 
     @staticmethod
     def _remote_supports_codec(ssh_base: list, env: dict, codec_bin: str) -> bool:
@@ -280,7 +257,6 @@ class ReportSyncer:
 
         rel_dir = os.path.dirname(rel_path)
         remote_dir = f"{dest_dir}/{rel_dir}" if rel_dir else dest_dir
-        remote_file = f"{dest_dir}/{rel_path}"
 
         extract_cmd = ssh_base + [f"mkdir -p '{remote_dir}' && tar -xzf - -C '{remote_dir}'"]
         try:
@@ -380,7 +356,7 @@ class ReportSyncer:
                 stderr=subprocess.PIPE,
             )
             ssh_proc = subprocess.run(
-                ssh_base + [f"bash --noprofile --norc -lc {shlex.quote(f'tar -xzf - -C {q_staging}')}"] ,
+                ssh_base + [f"bash --noprofile --norc -lc {shlex.quote(f'tar -xzf - -C {q_staging}')}"],
                 stdin=tar_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -416,7 +392,6 @@ class ReportSyncer:
         except Exception as e:
             _sync_log(f"[SYNC EXCEPTION] Batch tar stream failed for {rel_path}/: {e}")
             return False
-
 
 
 def _should_compress(file_path: str) -> bool:
