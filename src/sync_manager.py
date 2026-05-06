@@ -353,7 +353,7 @@ class ReportSyncer:
 
         def _run_stage(stage_name: str, remote_cmd: str, timeout: int = SSH_TIMEOUT) -> bool:
             proc = subprocess.run(
-                ssh_base + [remote_cmd],
+                ssh_base + [f"bash --noprofile --norc -lc {shlex.quote(remote_cmd)}"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -380,7 +380,7 @@ class ReportSyncer:
                 stderr=subprocess.PIPE,
             )
             ssh_proc = subprocess.run(
-                ssh_base + [f"tar -xzf - -C {q_staging}"],
+                ssh_base + [f"bash --noprofile --norc -lc {shlex.quote(f'tar -xzf - -C {q_staging}')}"] ,
                 stdin=tar_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -400,7 +400,7 @@ class ReportSyncer:
 
             if not _run_stage("cleanup_old", f"rm -rf {q_old}"):
                 return False
-            if not _run_stage("rotate_current", f"if [ -d {q_target} ]; then mv {q_target} {q_old}; fi"):
+            if not _run_stage("rotate_current", f"if [ -d {q_target} ]; then mv -T {q_target} {q_old} 2>/dev/null || rm -rf {q_old}; fi"):
                 return False
             if not _run_stage("promote_staging", f"mv {q_staging} {q_target}"):
                 return False
