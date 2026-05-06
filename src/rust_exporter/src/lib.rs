@@ -20,7 +20,7 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 struct JsonItem {
     #[serde(alias = "p")]
     path: Option<String>,
-    #[serde(default, rename = "i")]
+    #[serde(default, rename = "i", alias = "gid")]
     short_path_id: Option<usize>,
     #[serde(default)]
     size: Option<u64>,
@@ -341,6 +341,23 @@ fn read_paths_binary(path: &Path) -> Option<Vec<String>> {
     None
 }
 
+fn parse_path_dict_ndjson(path: &Path) -> Option<Vec<String>> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut rows: Vec<String> = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(item) = serde_json::from_str::<JsonItem>(&line) {
+            if let (Some(gid), Some(p)) = (item.short_path_id, item.path) {
+                if rows.len() <= gid {
+                    rows.resize(gid + 1, String::new());
+                }
+                rows[gid] = p;
+            }
+        }
+    }
+    Some(rows)
+}
+
 fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, entries: &mut Vec<ExportEntry>) {
     let detail_dir = Path::new(manifest_path).parent().unwrap_or_else(|| Path::new("."));
     let safe_user: String = user
@@ -366,7 +383,12 @@ fn parse_manifest_items(user: &str, manifest_path: &str, kind: &'static str, ent
     let user_dir = user_manifest_path.parent().unwrap_or(detail_dir);
 
     let path_dict: Option<Vec<String>> = if user_manifest.paths_dict.is_empty() {
-        None
+        let fallback_ndjson = detail_dir.join("api").join("path_dict.ndjson");
+        if fallback_ndjson.exists() {
+            parse_path_dict_ndjson(&fallback_ndjson)
+        } else {
+            None
+        }
     } else {
         let dict_path = user_dir.join(&user_manifest.paths_dict);
         let is_bin = dict_path

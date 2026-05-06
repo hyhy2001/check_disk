@@ -134,6 +134,15 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
     assert alice_manifest["summary"]["files"] == 3
     assert alice_manifest["summary"]["used"] == 6656
 
+    path_dict = {}
+    with open(detail_root / "api" / "path_dict.ndjson", "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            path_dict[row["gid"]] = row["p"]
+
     alice_file_parts = alice_manifest["files"]["parts"]
     assert len(alice_file_parts) >= 1
     alice_files = []
@@ -146,7 +155,7 @@ def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
                     continue
                 row = json.loads(line)
                 alice_files.append({
-                    "path": row["p"],
+                    "path": path_dict.get(row["gid"], ""),
                     "size": row["s"],
                     "ext": row["x"],
                 })
@@ -384,8 +393,12 @@ def test_unified_scan_truncated_scan_bin_reports_zero_files(tmp_path):
         detail_uid_username={1000: "alice"},
     )
     ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
-    detail = json.loads((tmp_path / "detail_users" / "api" / "data_detail.min.json").read_text(encoding="utf-8"))
-    assert detail["scan"]["total_files"] == 0
+    detail = json.loads((tmp_path / "detail_users" / "manifest.json").read_text(encoding="utf-8"))
+    assert detail.get("users", []) == []
+
+    summary = json.loads((tmp_path / "detail_users" / "data_detail.json").read_text(encoding="utf-8"))
+    assert summary["scan"]["total_files"] == 0
+    assert summary["scan"]["total_size"] == 0
 
 
 def test_unified_corrupt_permission_tsv_reports_zero_permission_issues(tmp_path):

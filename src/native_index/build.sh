@@ -32,5 +32,5 @@ else
 fi
 
 echo ""
-echo "==> Done. glibc requirements (libcdx1.so):"
-objdump -p "$SCRIPT_DIR/libcdx1.so" | grep GLIBC | sort -V || true
+echo "==> Done. glibc requirements (libnative_index.so):"
+objdump -p "$SCRIPT_DIR/libnative_index.so" | grep GLIBC | sort -V || true

@@ -62,18 +62,6 @@ def _users_from_detail_manifest(manifest_path: str) -> list:
         )
         if users:
             return users
-
-        api_users_index = os.path.join(os.path.dirname(manifest_path), "api", "users_index.min.json")
-        if os.path.exists(api_users_index):
-            with open(api_users_index, "r", encoding="utf-8") as fh:
-                rows = json.load(fh)
-            return sorted(
-                str(r.get("username"))
-                for r in rows
-                if isinstance(r, dict)
-                and r.get("username")
-                and not str(r.get("username")).startswith("uid-")
-            )
     except Exception:
         return []
 
@@ -211,13 +199,7 @@ def main() -> None:
 
     rss_now = _get_rss_mb()
     peak_rss = max(peak_rss, rss_now)
-    print(
-        f"\rProgress: {total}/{total} users processed | RSS: {rss_now:.1f} MB | Peak: {peak_rss:.1f} MB",
-        end="",
-        flush=True,
-    )
-
-    print("")
+    print(f"Progress: {total}/{total} users processed | RSS: {rss_now:.1f} MB | Peak: {peak_rss:.1f} MB")
 
     written_files = len(written_paths)
     print(f"Done. {total}/{total} user job(s) exported, {written_files} TXT file(s) written.")

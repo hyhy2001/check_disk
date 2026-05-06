@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "index.h"
+#include "native_index_api.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,7 +25,7 @@ typedef struct {
     uint64_t ext_values_offset;
     uint64_t user_entries_offset;
     uint64_t user_values_offset;
-} cdx1_header;
+} native_index_header;
 
 static int bounds_ok(size_t file_size, uint64_t off, uint64_t bytes) {
     if (off > file_size) {
@@ -37,7 +37,7 @@ static int bounds_ok(size_t file_size, uint64_t off, uint64_t bytes) {
     return 1;
 }
 
-int cdx1_open(const char *path, cdx1_index *out) {
+int native_index_open(const char *path, native_index_index *out) {
     if (!path || !out) {
         return EINVAL;
     }
@@ -54,7 +54,7 @@ int cdx1_open(const char *path, cdx1_index *out) {
         close(fd);
         return err;
     }
-    if (st.st_size < (off_t)sizeof(cdx1_header)) {
+    if (st.st_size < (off_t)sizeof(native_index_header)) {
         close(fd);
         return EPROTO;
     }
@@ -69,17 +69,17 @@ int cdx1_open(const char *path, cdx1_index *out) {
     madvise(mapped, (size_t)st.st_size, MADV_SEQUENTIAL);
 
     const uint8_t *base = (const uint8_t *)mapped;
-    const cdx1_header *hdr = (const cdx1_header *)base;
-    if (hdr->magic != CDX1_MAGIC || hdr->version != 1) {
+    const native_index_header *hdr = (const native_index_header *)base;
+    if (hdr->magic != NATIVE_INDEX_MAGIC || hdr->version != 1) {
         munmap(mapped, (size_t)st.st_size);
         close(fd);
         return EPROTO;
     }
 
-    uint64_t docs_bytes = (uint64_t)hdr->doc_count * sizeof(cdx1_doc_ref);
-    uint64_t token_entries_bytes = (uint64_t)hdr->token_count * sizeof(cdx1_posting_entry);
-    uint64_t ext_entries_bytes = (uint64_t)hdr->ext_count * sizeof(cdx1_posting_entry);
-    uint64_t user_entries_bytes = (uint64_t)hdr->user_count * sizeof(cdx1_posting_entry);
+    uint64_t docs_bytes = (uint64_t)hdr->doc_count * sizeof(native_index_doc_ref);
+    uint64_t token_entries_bytes = (uint64_t)hdr->token_count * sizeof(native_index_posting_entry);
+    uint64_t ext_entries_bytes = (uint64_t)hdr->ext_count * sizeof(native_index_posting_entry);
+    uint64_t user_entries_bytes = (uint64_t)hdr->user_count * sizeof(native_index_posting_entry);
 
     if (!bounds_ok((size_t)st.st_size, hdr->docs_offset, docs_bytes) ||
         !bounds_ok((size_t)st.st_size, hdr->token_entries_offset, token_entries_bytes) ||
@@ -101,18 +101,18 @@ int cdx1_open(const char *path, cdx1_index *out) {
     out->ext_count = hdr->ext_count;
     out->user_count = hdr->user_count;
 
-    out->docs = (const cdx1_doc_ref *)(base + hdr->docs_offset);
-    out->token_entries = (const cdx1_posting_entry *)(base + hdr->token_entries_offset);
+    out->docs = (const native_index_doc_ref *)(base + hdr->docs_offset);
+    out->token_entries = (const native_index_posting_entry *)(base + hdr->token_entries_offset);
     out->token_values = (const uint32_t *)(base + hdr->token_values_offset);
-    out->ext_entries = (const cdx1_posting_entry *)(base + hdr->ext_entries_offset);
+    out->ext_entries = (const native_index_posting_entry *)(base + hdr->ext_entries_offset);
     out->ext_values = (const uint32_t *)(base + hdr->ext_values_offset);
-    out->user_entries = (const cdx1_posting_entry *)(base + hdr->user_entries_offset);
+    out->user_entries = (const native_index_posting_entry *)(base + hdr->user_entries_offset);
     out->user_values = (const uint32_t *)(base + hdr->user_values_offset);
 
     return 0;
 }
 
-void cdx1_close(cdx1_index *index) {
+void native_index_close(native_index_index *index) {
     if (!index) {
         return;
     }
@@ -125,7 +125,7 @@ void cdx1_close(cdx1_index *index) {
     memset(index, 0, sizeof(*index));
 }
 
-static int posting_lookup(const cdx1_posting_entry *entries,
+static int posting_lookup(const native_index_posting_entry *entries,
                          const uint32_t *values,
                          uint32_t entry_count,
                          uint32_t key_id,
@@ -181,7 +181,7 @@ static uint32_t *intersect_sorted(const uint32_t *a,
     return out;
 }
 
-static int apply_filter_ids_or(const cdx1_posting_entry *entries,
+static int apply_filter_ids_or(const native_index_posting_entry *entries,
                             const uint32_t *values,
                             uint32_t entry_count,
                             const uint32_t *ids,
@@ -271,7 +271,7 @@ static int apply_filter_ids_or(const cdx1_posting_entry *entries,
     return 0;
 }
 
-int cdx1_query_docs(const cdx1_index *index, const cdx1_query *query, cdx1_docset *out) {
+int native_index_query_docs(const native_index_index *index, const native_index_query *query, native_index_docset *out) {
     if (!index || !query || !out) {
         return EINVAL;
     }
@@ -345,7 +345,7 @@ int cdx1_query_docs(const cdx1_index *index, const cdx1_query *query, cdx1_docse
     return 0;
 }
 
-void cdx1_free_docset(cdx1_docset *set) {
+void native_index_free_docset(native_index_docset *set) {
     if (!set) {
         return;
     }

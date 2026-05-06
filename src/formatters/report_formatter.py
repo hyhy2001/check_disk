@@ -279,20 +279,6 @@ class ReportFormatter(BaseFormatter):
         )
 
         scan_meta: Dict[str, Any] = root_manifest.get("scan", {}) if isinstance(root_manifest, dict) else {}
-        if not user_entry:
-            users_index_path = os.path.join(base_dir, "api", "users_index.min.json")
-            if os.path.exists(users_index_path):
-                with open(users_index_path, "r", encoding="utf-8") as fh:
-                    users_index = json.load(fh)
-                user_entry = next(
-                    (entry for entry in users_index if isinstance(entry, dict) and entry.get("username") == user),
-                    None,
-                )
-            data_detail_min = os.path.join(base_dir, "api", "data_detail.min.json")
-            if os.path.exists(data_detail_min):
-                with open(data_detail_min, "r", encoding="utf-8") as fh:
-                    min_meta = json.load(fh)
-                scan_meta = min_meta.get("scan", {}) if isinstance(min_meta, dict) else {}
 
         safe_user = "".join(c if c.isalnum() or c in "-_." else "_" for c in user)
         manifest_rel = user_entry.get("manifest", "") if isinstance(user_entry, dict) else ""
@@ -303,7 +289,7 @@ class ReportFormatter(BaseFormatter):
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
         user_dir = os.path.dirname(manifest_path)
-        path_dict = self._load_paths_dict(user_dir, manifest)
+        path_dict = self._load_paths_dict(base_dir, user_dir, manifest)
         summary = manifest.get("summary", {})
         data: Dict[str, Any] = {
             "date": int(manifest.get("scan_date", scan_meta.get("timestamp", 0)) or 0),
@@ -315,7 +301,9 @@ class ReportFormatter(BaseFormatter):
         }
 
         def _resolve_path(item: Dict[str, Any]) -> str:
-            path_id = item.get("i")
+            path_id = item.get("gid")
+            if not isinstance(path_id, int):
+                path_id = item.get("i")
             if isinstance(path_id, int) and 0 <= path_id < len(path_dict):
                 return path_dict[path_id]
             return item.get("p", "")
@@ -360,18 +348,42 @@ class ReportFormatter(BaseFormatter):
                 data["files"] = files
         return data
 
-    def _load_paths_dict(self, user_dir: str, manifest: Dict[str, Any]) -> List[str]:
+    def _load_paths_dict(self, detail_root: str, user_dir: str, manifest: Dict[str, Any]) -> List[str]:
         dict_rel = manifest.get("paths_dict", "")
-        if not dict_rel:
-            return []
-        dict_path = os.path.join(user_dir, dict_rel)
-        if not os.path.exists(dict_path):
-            return []
-        open_fn = gzip.open if dict_path.endswith(".gz") else open
-        with open_fn(dict_path, "rt", encoding="utf-8") as fh:
-            loaded = json.load(fh)
-        if isinstance(loaded, list):
-            return [str(item) for item in loaded]
+        candidate_paths = []
+        if dict_rel:
+            candidate_paths.append(os.path.join(user_dir, dict_rel))
+        candidate_paths.append(os.path.join(detail_root, "api", "path_dict.ndjson"))
+
+        for dict_path in candidate_paths:
+            if not os.path.exists(dict_path):
+                continue
+            if dict_path.endswith(".ndjson") or dict_path.endswith(".ndjson.gz"):
+                open_fn = gzip.open if dict_path.endswith(".gz") else open
+                rows: List[str] = []
+                with open_fn(dict_path, "rt", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except ValueError:
+                            continue
+                        gid = obj.get("gid")
+                        path = obj.get("p")
+                        if isinstance(gid, int) and gid >= 0 and isinstance(path, str):
+                            while len(rows) <= gid:
+                                rows.append("")
+                            rows[gid] = path
+                return rows
+
+            open_fn = gzip.open if dict_path.endswith(".gz") else open
+            with open_fn(dict_path, "rt", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, list):
+                return [str(item) for item in loaded]
+
         return []
 
     def _load_detail_from_ndjson(self, path: str, is_dir: bool, path_dict: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -400,7 +412,9 @@ class ReportFormatter(BaseFormatter):
                     continue
 
                 if is_dir:
-                    path_id = obj.get("i")
+                    path_id = obj.get("gid")
+                    if not isinstance(path_id, int):
+                        path_id = obj.get("i")
                     p = None
                     if isinstance(path_id, int) and path_dict and 0 <= path_id < len(path_dict):
                         p = path_dict[path_id]
@@ -412,7 +426,9 @@ class ReportFormatter(BaseFormatter):
                             "used": int(obj.get("s", 0) or 0),
                         })
                 else:
-                    path_id = obj.get("i")
+                    path_id = obj.get("gid")
+                    if not isinstance(path_id, int):
+                        path_id = obj.get("i")
                     p = None
                     if isinstance(path_id, int) and path_dict and 0 <= path_id < len(path_dict):
                         p = path_dict[path_id]
@@ -536,12 +552,12 @@ class ReportFormatter(BaseFormatter):
 
         scan_date = 0
         scan_root = ""
-        api_detail = os.path.join(detail_dir, "api", "data_detail.min.json")
-        if os.path.exists(api_detail):
+        manifest_path = os.path.join(detail_dir, "manifest.json")
+        if os.path.exists(manifest_path):
             try:
-                with open(api_detail, "r", encoding="utf-8") as fh:
+                with open(manifest_path, "r", encoding="utf-8") as fh:
                     detail = json.load(fh)
-                scan_date = int(detail.get("scan", {}).get("timestamp", 0) or 0)
+                scan_date = int(detail.get("created_at", 0) or 0)
                 scan_root = str(detail.get("scan", {}).get("root", "") or "")
             except Exception:
                 pass

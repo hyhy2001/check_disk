@@ -54,7 +54,7 @@ def _get_control_socket(user: str, host: str, password: str = None) -> str:
 
     The master is started as a background process with ``-MNf``
     (master mode, no remote command, go to background).
-    Subsequent SSH/rsync/scp commands that specify the same ``ControlPath``
+    Subsequent SSH commands that specify the same ``ControlPath``
     will re-use this connection — eliminating per-command handshake.
     """
     key = (user, host)
@@ -142,26 +142,6 @@ def _build_sshpass_env(password: str = None):
     return {}
 
 
-def _should_compress(file_path: str) -> bool:
-    """Determine if rsync should use -z for this file.
-
-    JSON, NDJSON, TSV, and other text reports benefit from compression.
-    Already-compressed files (gz, xz, zst) should not be double-compressed.
-    """
-    ext = os.path.splitext(file_path)[1].lower()
-    compressible = {".json", ".tsv", ".csv", ".txt", ".ndjson", ".sql"}
-    skip = {".gz", ".xz", ".zst", ".bz2", ".lz4", ".zip", ".tar"}
-    if ext in skip:
-        return False
-    if ext in compressible:
-        return True
-    # For unknown extensions, compress if file is >= 1 MB
-    try:
-        return os.path.getsize(file_path) >= 1_048_576
-    except OSError:
-        return False
-
-
 class ReportSyncer:
     """Handles syncing reports to a remote server over SSH."""
 
@@ -214,65 +194,18 @@ class ReportSyncer:
 
         print(f"\n[SYNC] Initiating remote sync to {user}@{host}:{dest_dir}...")
 
-        # Try to use ControlMaster
         control_socket = _get_control_socket(user, host, password)
         ssh_base, env = _build_ssh_base(user, host, password, control_socket)
         output_dir_clean = output_dir.rstrip("/")
-
-        use_rsync = shutil.which("rsync") is not None and ReportSyncer._remote_has_binary(ssh_base, env, "rsync")
-        if use_rsync:
-            mkdir_cmd = ssh_base + [f"mkdir -p '{dest_dir}'"]
-            try:
-                mkdir_proc = subprocess.run(
-                    mkdir_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env={**os.environ, **env},
-                    timeout=SSH_TIMEOUT,
-                )
-                if mkdir_proc.returncode != 0:
-                    print("[SYNC WARN] Could not prepare remote directory for rsync; falling back to archive stream.")
-                else:
-                    ssh_e = "ssh -q" + (
-                        f" -o ControlPath={control_socket} -o ControlMaster=auto"
-                        if control_socket else ""
-                    )
-                    rsync_cmd = [
-                        *(["sshpass", "-e"] if password else []),
-                        "rsync", "-az", "--delete", "--delete-delay",
-                        "--partial", "--inplace", "--no-whole-file",
-                        "-e", ssh_e,
-                        f"{output_dir_clean}/",
-                        f"{user}@{host}:{dest_dir}/",
-                    ]
-                    rsync_proc = subprocess.run(
-                        rsync_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        env={**os.environ, **env},
-                        timeout=RSYNC_TIMEOUT,
-                    )
-                    if rsync_proc.returncode == 0:
-                        print(f"[SYNC] Successfully synced reports to {host} using rsync.")
-                        return True
-                    print(f"[SYNC WARN] rsync failed (code {rsync_proc.returncode}); falling back to archive stream.")
-                    if rsync_proc.stderr:
-                        print(f"[SYNC WARN DETAILS]:\n{rsync_proc.stderr.strip()}")
-            except subprocess.TimeoutExpired:
-                print("[SYNC WARN] rsync timed out; falling back to archive stream.")
-            except Exception as e:
-                print(f"[SYNC WARN] rsync path failed ({e}); falling back to archive stream.")
 
         use_xz = shutil.which("xz") is not None and ReportSyncer._remote_supports_codec(ssh_base, env, "xz")
 
         if use_xz:
             compress_flag = "--use-compress-program=xz"
-            remote_extract = f"mkdir -p '{dest_dir}' && tar --use-compress-program=xz -xf - -C '{dest_dir}'"
+            remote_extract = f"rm -rf '{dest_dir}' && mkdir -p '{dest_dir}' && tar --use-compress-program=xz -xf - -C '{dest_dir}'"
         else:
             compress_flag = "-z"
-            remote_extract = f"mkdir -p '{dest_dir}' && tar -xzf - -C '{dest_dir}'"
+            remote_extract = f"rm -rf '{dest_dir}' && mkdir -p '{dest_dir}' && tar -xzf - -C '{dest_dir}'"
 
         tar_create = ["tar", compress_flag, "-cf", "-", "-C", output_dir_clean, "."]
         ssh_extract = ssh_base + [remote_extract]
@@ -331,7 +264,6 @@ class ReportSyncer:
         if rel_path.startswith(".."):
             rel_path = os.path.basename(file_abs)
 
-        # Use ControlMaster socket from cache if available
         control_socket = ""
         if _capability_cache is not None:
             control_socket = _capability_cache.get("control_socket", "")
@@ -343,103 +275,37 @@ class ReportSyncer:
         remote_dir = f"{dest_dir}/{rel_dir}" if rel_dir else dest_dir
         remote_file = f"{dest_dir}/{rel_path}"
 
-        mkdir_cmd = ssh_base + [f"mkdir -p '{remote_dir}'"]
-
+        extract_cmd = ssh_base + [f"mkdir -p '{remote_dir}' && tar -xzf - -C '{remote_dir}'"]
         try:
-            mkdir_proc = subprocess.run(
-                mkdir_cmd,
+            tar_proc = subprocess.Popen(
+                ["tar", "-czf", "-", "-C", os.path.dirname(file_abs), os.path.basename(file_abs)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                env=merged_env,
-                timeout=SSH_TIMEOUT,
             )
-            if mkdir_proc.returncode != 0:
-                print(f"[SYNC ERROR] Cannot prepare remote dir for {rel_path}.")
-                if mkdir_proc.stderr:
-                    print(f"[SYNC ERROR DETAILS]:\n{mkdir_proc.stderr.strip()}")
-                return False
-        except subprocess.TimeoutExpired:
-            print(f"[SYNC ERROR] mkdir timed out for {rel_path}.")
-            return False
-        except Exception as e:
-            print(f"[SYNC EXCEPTION] mkdir failed for {rel_path}: {str(e)}")
-            return False
-
-        has_rsync = False
-        if _capability_cache is not None:
-            has_rsync = _capability_cache.get("has_rsync", False)
-        else:
-            has_rsync = (
-                shutil.which("rsync") is not None
-                and ReportSyncer._remote_has_binary(ssh_base, env, "rsync")
-            )
-
-        if has_rsync:
-            ssh_e = "ssh -q" + (
-                f" -o ControlPath={control_socket} -o ControlMaster=auto"
-                if control_socket else ""
-            )
-            # Add -z for compressible files (SQLite, JSON, etc.)
-            compress_flag = ["-z"] if _should_compress(file_abs) else []
-            rsync_cmd = [
-                *(["sshpass", "-e"] if password else []),
-                "rsync", "-a", *compress_flag, "--partial", "--inplace", "--no-whole-file",
-                "-e", ssh_e,
-                file_abs,
-                f"{user}@{host}:{remote_file}",
-            ]
-            try:
-                rsync_proc = subprocess.run(
-                    rsync_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=merged_env,
-                    timeout=RSYNC_TIMEOUT,
-                )
-                if rsync_proc.returncode == 0:
-                    print(f"[SYNC] Synced file: {rel_path}")
-                    return True
-                print(f"[SYNC WARN] rsync failed for {rel_path} (code {rsync_proc.returncode}), fallback scp.")
-                if rsync_proc.stderr:
-                    print(f"[SYNC WARN DETAILS]:\n{rsync_proc.stderr.strip()}")
-            except subprocess.TimeoutExpired:
-                print(f"[SYNC WARN] rsync timed out for {rel_path}, fallback scp.")
-            except Exception as e:
-                print(f"[SYNC WARN] rsync path failed for {rel_path} ({e}), fallback scp.")
-
-        scp_cmd = [
-            *(["sshpass", "-e"] if password else []),
-            # -O: force legacy SCP protocol (required on OpenSSH >= 9.0 which
-            # defaults to SFTP; without -O the ControlMaster socket is not
-            # negotiated correctly and the transfer fails with "Connection closed")
-            "scp", "-O", "-q",
-            *_ssh_control_args(control_socket),
-            file_abs,
-            f"{user}@{host}:{remote_file}",
-        ]
-        try:
-            scp_proc = subprocess.run(
-                scp_cmd,
+            ssh_proc = subprocess.run(
+                extract_cmd,
+                stdin=tar_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
                 timeout=SCP_TIMEOUT,
             )
-            if scp_proc.returncode == 0:
-                print(f"[SYNC] Synced file: {rel_path} (scp fallback)")
+            tar_proc.stdout.close()
+            tar_proc.wait(timeout=30)
+
+            if ssh_proc.returncode == 0:
+                print(f"[SYNC] Synced file: {rel_path} (tar)")
                 return True
-            print(f"[SYNC ERROR] scp failed for {rel_path} (code {scp_proc.returncode}).")
-            if scp_proc.stderr:
-                print(f"[SYNC ERROR DETAILS]:\n{scp_proc.stderr.strip()}")
+            print(f"[SYNC ERROR] tar stream failed for {rel_path} (code {ssh_proc.returncode}).")
+            if ssh_proc.stderr:
+                print(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
             return False
         except subprocess.TimeoutExpired:
-            print(f"[SYNC ERROR] scp timed out for {rel_path}.")
+            print(f"[SYNC ERROR] tar stream timed out for {rel_path}.")
             return False
         except Exception as e:
-            print(f"[SYNC EXCEPTION] scp failed for {rel_path}: {str(e)}")
+            print(f"[SYNC EXCEPTION] tar stream failed for {rel_path}: {str(e)}")
             return False
 
     @staticmethod
@@ -452,13 +318,7 @@ class ReportSyncer:
         password: str = None,
         _capability_cache: dict = None,
     ) -> bool:
-        """Batch-sync an entire local directory to remote using a single rsync command.
-
-        This is far more efficient than syncing files one-by-one because:
-          1. Only one SSH connection (via ControlMaster or fresh)
-          2. rsync builds a single file-list and transfers deltas in bulk
-          3. Compression (-z) is applied once for the whole batch
-        """
+        """Batch-sync an entire local directory to remote using a single tar stream."""
         if not local_dir or not os.path.isdir(local_dir):
             return False
 
@@ -480,96 +340,6 @@ class ReportSyncer:
         ssh_base, env = _build_ssh_base(user, host, password, control_socket)
         merged_env = {**os.environ, **env}
 
-        has_rsync = False
-        if _capability_cache is not None:
-            has_rsync = _capability_cache.get("has_rsync", False)
-        else:
-            has_rsync = (
-                shutil.which("rsync") is not None
-                and ReportSyncer._remote_has_binary(ssh_base, env, "rsync")
-            )
-
-        if has_rsync:
-            ssh_e = "ssh -q" + (
-                f" -o ControlPath={control_socket} -o ControlMaster=auto"
-                if control_socket else ""
-            )
-            prepare_cmd = ssh_base + [
-                "set -e; "
-                f"rm -rf {shlex.quote(remote_staging)}; "
-                f"if [ -d {shlex.quote(remote_target)} ]; then "
-                f"cp -al {shlex.quote(remote_target)} {shlex.quote(remote_staging)}; "
-                "else "
-                f"mkdir -p {shlex.quote(remote_staging)}; "
-                "fi"
-            ]
-            swap_cmd = ssh_base + [
-                "set -e; "
-                f"rm -rf {shlex.quote(remote_old)}; "
-                f"if [ -d {shlex.quote(remote_target)} ]; then "
-                f"mv {shlex.quote(remote_target)} {shlex.quote(remote_old)}; "
-                "fi; "
-                f"mv {shlex.quote(remote_staging)} {shlex.quote(remote_target)}; "
-                f"rm -rf {shlex.quote(remote_old)}"
-            ]
-            rsync_cmd = [
-                *(["sshpass", "-e"] if password else []),
-                "rsync", "-az", "--compress-level=1",
-                "--delete", "--delete-delay",
-                "--partial", "--no-whole-file",
-                "-e", ssh_e,
-                f"{local_abs}/",
-                f"{user}@{host}:{remote_staging}/",
-            ]
-            try:
-                prepare_proc = subprocess.run(
-                    prepare_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=merged_env,
-                    timeout=SSH_TIMEOUT,
-                )
-                if prepare_proc.returncode != 0:
-                    print(f"[SYNC WARN] Could not prepare staging dir for {rel_path}/.")
-                    if prepare_proc.stderr:
-                        print(f"[SYNC WARN DETAILS]:\n{prepare_proc.stderr.strip()}")
-                    return False
-
-                rsync_proc = subprocess.run(
-                    rsync_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=merged_env,
-                    timeout=RSYNC_TIMEOUT,
-                )
-                if rsync_proc.returncode == 0:
-                    swap_proc = subprocess.run(
-                        swap_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        env=merged_env,
-                        timeout=SSH_TIMEOUT,
-                    )
-                    if swap_proc.returncode == 0:
-                        file_count = sum(1 for _ in os.scandir(local_abs) if _.is_file())
-                        print(f"[SYNC] Batch synced directory via staging swap: {rel_path}/ ({file_count} files)")
-                        return True
-                    print(f"[SYNC ERROR] Atomic swap failed for {rel_path}/ (code {swap_proc.returncode}).")
-                    if swap_proc.stderr:
-                        print(f"[SYNC ERROR DETAILS]:\n{swap_proc.stderr.strip()}")
-                    return False
-                print(f"[SYNC WARN] Batch rsync failed for {rel_path}/ (code {rsync_proc.returncode}).")
-                if rsync_proc.stderr:
-                    print(f"[SYNC WARN DETAILS]:\n{rsync_proc.stderr.strip()}")
-            except subprocess.TimeoutExpired:
-                print(f"[SYNC WARN] Batch rsync timed out for {rel_path}/.")
-            except Exception as e:
-                print(f"[SYNC WARN] Batch rsync failed for {rel_path}/: {e}")
-
-        # Fallback: tar+gzip stream into staging, then atomic swap.
         ssh_extract_cmd = ssh_base + [
             "set -e; "
             f"rm -rf {shlex.quote(remote_staging)}; "
@@ -614,6 +384,22 @@ class ReportSyncer:
             return False
 
 
+
+def _should_compress(file_path: str) -> bool:
+    """Compatibility helper retained for legacy tests; tar-only flow ignores this."""
+    ext = os.path.splitext(file_path)[1].lower()
+    compressible = {".json", ".tsv", ".csv", ".txt", ".ndjson", ".sql"}
+    skip = {".gz", ".xz", ".zst", ".bz2", ".lz4", ".zip", ".tar"}
+    if ext in skip:
+        return False
+    if ext in compressible:
+        return True
+    try:
+        return os.path.getsize(file_path) >= 1_048_576
+    except OSError:
+        return False
+
+
 class AsyncSyncPipeline:
     """Async pipeline that syncs files to remote as they are enqueued.
 
@@ -634,8 +420,8 @@ class AsyncSyncPipeline:
         self._capability_cache = self._probe_capabilities()
 
     def _probe_capabilities(self) -> dict:
-        """Probe remote once: establish ControlMaster + check rsync availability."""
-        cache: Dict[str, object] = {"has_rsync": False, "control_socket": ""}
+        """Probe remote once: establish ControlMaster socket."""
+        cache: Dict[str, object] = {"control_socket": ""}
         if not self.user or not self.host:
             return cache
 
@@ -643,9 +429,6 @@ class AsyncSyncPipeline:
         control_socket = _get_control_socket(self.user, self.host, self.password)
         cache["control_socket"] = control_socket
 
-        ssh_base, env = _build_ssh_base(self.user, self.host, self.password, control_socket)
-        if shutil.which("rsync") is not None:
-            cache["has_rsync"] = ReportSyncer._remote_has_binary(ssh_base, env, "rsync")
         return cache
 
     def enqueue_file(self, file_path: str):
@@ -669,7 +452,7 @@ class AsyncSyncPipeline:
             self._futures.append(fut)
 
     def enqueue_directory(self, dir_path: str):
-        """Enqueue an entire directory for batch sync (single rsync command).
+        """Enqueue an entire directory for batch sync (single tar stream).
 
         Much more efficient than enqueue_file() for each file in the directory.
         Falls back to file-by-file if batch fails.

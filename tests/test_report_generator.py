@@ -151,21 +151,35 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
                 continue
             alice_file_rows.append(json.loads(line))
     assert len(alice_file_rows) == 2
-    assert any(row["p"].endswith("alpha.txt") for row in alice_file_rows)
-    assert any(row["p"].endswith("beta.log") for row in alice_file_rows)
+    assert all("gid" in row for row in alice_file_rows)
     assert all("x" in row for row in alice_file_rows)
     total_bytes = sum(row["s"] for row in alice_file_rows)
     assert total_bytes == 6144
+
+    path_dict = tmp_path / "detail_users" / "api" / "path_dict.ndjson"
+    assert path_dict.exists()
+    gid_to_path = {}
+    with open(path_dict, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            gid_to_path[row["gid"]] = row["p"]
+
+    resolved_paths = [gid_to_path.get(row["gid"], "") for row in alice_file_rows]
+    assert any(path.endswith("alpha.txt") for path in resolved_paths)
+    assert any(path.endswith("beta.log") for path in resolved_paths)
 
     # alice's dirs chunk
     alice_dirs = tmp_path / "detail_users" / "users" / "alice" / "dirs" / "chunk-00000" / "part-00000.ndjson"
     assert alice_dirs.exists()
 
-    detail = json.loads((detail_root / "api" / "data_detail.min.json").read_text(encoding="utf-8"))
+    detail = json.loads((detail_root / "manifest.json").read_text(encoding="utf-8"))
     alice_user_entry = next(u for u in detail["users"] if u["username"] == "alice")
-    assert alice_user_entry["total_files"] == 2
-    assert alice_user_entry["total_dirs"] >= 1
-    assert alice_user_entry["total_bytes"] == 6144
+    assert alice_user_entry["files"] == 2
+    assert alice_user_entry["dirs"] >= 1
+    assert alice_user_entry["used"] == 6144
 
     assert treemap_json.exists()
     assert treemap_manifest.exists()

@@ -43,6 +43,8 @@ typedef struct {
 
 typedef struct {
     char *id;
+    uint32_t gid;
+    int has_gid;
     char *name;
     char *owner;
     char *path;
@@ -59,6 +61,13 @@ typedef struct {
 
 static char **g_paths = NULL;
 static size_t g_paths_n = 0;
+static int g_treemap_paths_loaded = 0;
+
+static const char *treemap_row_path(const treemap_row *r);
+static void clear_global_paths(void);
+static int load_treemap_path_dict(const char *data_dir);
+static int load_detail_path_dict(const char *detail_root);
+static void clear_treemap_runtime_state(void);
 
 static char *json_get_str(const char *line, const char *key);
 static void free_str_arr(char **arr, size_t count);
@@ -129,6 +138,45 @@ static int split_csv(const char *s, str_list *out) {
             out->count++;
         }
         tok = strtok(NULL, ",");
+    }
+    free(buf);
+    return 0;
+}
+
+static int split_pipe_terms(const char *s, str_list *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !*s) return 0;
+    char *buf = dupstr(s);
+    if (!buf) return 1;
+    size_t cap = 8;
+    out->items = (char **)calloc(cap, sizeof(char *));
+    if (!out->items) {
+        free(buf);
+        return 1;
+    }
+    char *tok = strtok(buf, "|");
+    while (tok) {
+        while (*tok == ' ') tok++;
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') tok[--len] = '\0';
+        if (len > 0) {
+            if (out->count == cap) {
+                cap *= 2;
+                char **next = (char **)realloc(out->items, cap * sizeof(char *));
+                if (!next) {
+                    free(buf);
+                    return 1;
+                }
+                out->items = next;
+            }
+            out->items[out->count] = dupstr(tok);
+            if (!out->items[out->count]) {
+                free(buf);
+                return 1;
+            }
+            out->count++;
+        }
+        tok = strtok(NULL, "|");
     }
     free(buf);
     return 0;
@@ -573,6 +621,94 @@ static void free_str_arr(char **arr, size_t count) {
     free(arr);
 }
 
+static void clear_global_paths(void) {
+    if (g_paths) {
+        free_str_arr(g_paths, g_paths_n);
+    }
+    g_paths = NULL;
+    g_paths_n = 0;
+    g_treemap_paths_loaded = 0;
+}
+
+static void clear_treemap_runtime_state(void) {
+    clear_global_paths();
+}
+
+static const char *treemap_row_path(const treemap_row *r) {
+    if (!r) return NULL;
+    if (r->has_gid && g_treemap_paths_loaded && r->gid < g_paths_n && g_paths[r->gid]) return g_paths[r->gid];
+    return r->path;
+}
+
+
+static int load_treemap_path_dict(const char *data_dir) {
+    char *dict_path = build_path2(data_dir, "api/path_dict.ndjson");
+    if (!dict_path) return 0;
+    FILE *f = fopen(dict_path, "r");
+    free(dict_path);
+    if (!f) return 0;
+
+    clear_global_paths();
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t nread;
+    int loaded = 0;
+    while ((nread = getline(&line, &line_cap, f)) > 0) {
+        if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
+        if (!*line) continue;
+        uint32_t gid = 0;
+        if (!json_get_u32(line, "gid", &gid)) continue;
+        char *path = json_get_str(line, "p");
+        if (!path) continue;
+        if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) {
+            free(path);
+            continue;
+        }
+        free(g_paths[gid]);
+        g_paths[gid] = path;
+        loaded++;
+    }
+    free(line);
+    fclose(f);
+    g_treemap_paths_loaded = loaded > 0;
+    return loaded > 0;
+}
+
+
+static int load_detail_path_dict(const char *detail_root) {
+    char *dict_path = build_path2(detail_root, "api/path_dict.ndjson");
+    if (!dict_path) return 0;
+    FILE *f = fopen(dict_path, "r");
+    free(dict_path);
+    if (!f) return 0;
+
+    clear_global_paths();
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t nread;
+    int loaded = 0;
+    while ((nread = getline(&line, &line_cap, f)) > 0) {
+        if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
+        if (!*line) continue;
+        uint32_t gid = 0;
+        if (!json_get_u32(line, "gid", &gid)) continue;
+        char *path = json_get_str(line, "p");
+        if (!path) continue;
+        if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) {
+            free(path);
+            continue;
+        }
+        free(g_paths[gid]);
+        g_paths[gid] = path;
+        loaded++;
+    }
+    free(line);
+    fclose(f);
+    return loaded > 0;
+}
+
 static char *parent_path_dup(const char *path) {
     if (!path || !*path) return dupstr("");
     const char *end = path + strlen(path) - 1;
@@ -588,27 +724,33 @@ static char *parent_path_dup(const char *path) {
     return out;
 }
 
+static int str_contains_ci(const char *haystack, const char *needle) {
+    if (!needle || !*needle) return 1;
+    if (!haystack) return 0;
+    size_t hlen = strlen(haystack);
+    size_t nlen = strlen(needle);
+    if (nlen > hlen) return 0;
+    for (size_t pos = 0; pos <= hlen - nlen; pos++) {
+        size_t j = 0;
+        while (j < nlen) {
+            unsigned char ca = (unsigned char)haystack[pos + j];
+            unsigned char cb = (unsigned char)needle[j];
+            if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+            if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+            if (ca != cb) break;
+            j++;
+        }
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
 static int kw_match_any(const char *path, const str_list *kw_tokens) {
     if (kw_tokens->count == 0) return 1;
-    if (!path) return 0;
-    size_t path_len = strlen(path);
     for (size_t ti = 0; ti < kw_tokens->count; ti++) {
         const char *tok = kw_tokens->items[ti];
         if (!tok || !*tok) continue;
-        size_t tok_len = strlen(tok);
-        if (tok_len > path_len) continue;
-        for (size_t pos = 0; pos <= path_len - tok_len; pos++) {
-            size_t j = 0;
-            while (j < tok_len) {
-                unsigned char ca = (unsigned char)path[pos + j];
-                unsigned char cb = (unsigned char)tok[j];
-                if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
-                if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
-                if (ca != cb) break;
-                j++;
-            }
-            if (j == tok_len) return 1;
-        }
+        if (str_contains_ci(path, tok)) return 1;
     }
     return 0;
 }
@@ -702,6 +844,8 @@ static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
 
             treemap_row r = {0};
             r.id = json_get_str(line, "id");
+            if (json_get_u32(line, "gid", &r.gid)) r.has_gid = 1;
+            else { r.gid = 0; r.has_gid = 0; }
             r.name = json_get_str(line, "n");
             r.owner = json_get_str(line, "o");
             r.path = json_get_str(line, "p");
@@ -709,7 +853,7 @@ static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
             if (!json_get_u64(line, "v", &r.value)) r.value = 0;
             if (!json_get_bool(line, "h", &r.has_children)) r.has_children = 0;
 
-            if (r.path && r.name) {
+            if ((r.path || r.has_gid) && r.name) {
                 if (!treemap_rows_push(rows, &r)) {
                     free(r.id); free(r.name); free(r.owner); free(r.path); free(r.type);
                 }
@@ -726,6 +870,7 @@ static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
 }
 
 static int load_treemap_rows(const char *detail_root, treemap_rows *rows) {
+    clear_treemap_runtime_state();
     memset(rows, 0, sizeof(*rows));
     char *manifest = build_path2(detail_root, "manifest.json");
     if (!manifest) return 0;
@@ -755,8 +900,13 @@ static int load_treemap_rows(const char *detail_root, treemap_rows *rows) {
     free(parent);
 
     int ok = load_treemap_shards_dir(tree_map_data, rows);
+    if (!ok) {
+        free(tree_map_data);
+        return 0;
+    }
+    (void)load_treemap_path_dict(tree_map_data);
     free(tree_map_data);
-    return ok;
+    return 1;
 }
 
 static __attribute__((unused)) int list_ids_from_filter(const str_list *inputs, char **dict, size_t dict_n,
@@ -915,40 +1065,9 @@ int main(int argc, char **argv) {
         }
 
         str_list kw_raw = {0}, user_raw = {0};
-        split_csv(kw_csv ? kw_csv : "", &kw_raw);
+        split_pipe_terms(kw_csv ? kw_csv : "", &kw_raw);
         split_csv(user_csv ? user_csv : "", &user_raw);
 
-        str_list kw_tokens = {0};
-        if (kw_raw.count > 0) {
-            kw_tokens.items = (char **)calloc(kw_raw.count * 4 + 1, sizeof(char *));
-            if (!kw_tokens.items) {
-                free_treemap_rows(&rows);
-                free_str_list(&kw_raw);
-                free_str_list(&user_raw);
-                free(detail_root);
-                return 1;
-            }
-            for (size_t i = 0; i < kw_raw.count; i++) {
-                char *norm = norm_lower_token(kw_raw.items[i], 0);
-                if (!norm) continue;
-                char cur[256];
-                size_t cn = 0;
-                for (const char *p = norm; ; p++) {
-                    int c = (unsigned char)*p;
-                    if (isalnum(c)) {
-                        if (cn + 1 < sizeof(cur)) cur[cn++] = (char)c;
-                    } else {
-                        if (cn > 0) {
-                            cur[cn] = '\0';
-                            kw_tokens.items[kw_tokens.count++] = dupstr(cur);
-                            cn = 0;
-                        }
-                        if (c == '\0') break;
-                    }
-                }
-                free(norm);
-            }
-        }
 
         doc_list docs = {0};
         size_t treemap_hint = rows.count < 4096 ? rows.count : 4096;
@@ -956,16 +1075,17 @@ int main(int argc, char **argv) {
             free_treemap_rows(&rows);
             free_str_list(&kw_raw);
             free_str_list(&user_raw);
-            free_str_list(&kw_tokens);
             free(detail_root);
             return 1;
         }
         for (size_t i = 0; i < rows.count; i++) {
             treemap_row *r = &rows.items[i];
-            if (!r->path) continue;
+            const char *resolved_path = treemap_row_path(r);
+            if (!resolved_path) continue;
+
             if (has_min && r->value < size_min) continue;
             if (has_max && r->value > size_max) continue;
-            if (!kw_match_any(r->path, &kw_tokens) && !kw_match_any(r->name ? r->name : "", &kw_tokens)) continue;
+            if (!kw_match_any(resolved_path, &kw_raw) && !kw_match_any(r->name ? r->name : "", &kw_raw)) continue;
 
             if (user_raw.count > 0) {
                 int owner_ok = 0;
@@ -978,11 +1098,16 @@ int main(int argc, char **argv) {
                 if (!owner_ok) continue;
             }
 
-            uint32_t gid = (uint32_t)docs.count;
-            if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) continue;
-            free(g_paths[gid]);
-            g_paths[gid] = dupstr(r->path);
-            if (!g_paths[gid]) continue;
+            uint32_t gid = 0;
+            if (r->has_gid && g_treemap_paths_loaded && r->gid < g_paths_n && g_paths[r->gid]) {
+                gid = r->gid;
+            } else {
+                gid = (uint32_t)docs.count;
+                if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) continue;
+                free(g_paths[gid]);
+                g_paths[gid] = dupstr(resolved_path);
+                if (!g_paths[gid]) continue;
+            }
             append_filter_doc(&docs, (uint32_t)docs.count, gid, 0, 0, r->value);
         }
 
@@ -1010,8 +1135,9 @@ int main(int argc, char **argv) {
                     if (i) putchar(',');
                     uint32_t did = docs.items[start + i].doc_id;
                     treemap_row *r = (did < rows.count) ? &rows.items[did] : NULL;
+                    const char *resolved_path = treemap_row_path(r);
                     printf("{\"doc_id\":%u,\"path\":", docs.items[start + i].doc_id);
-                    if (r && r->path) print_json_escaped(r->path); else printf("null");
+                    if (resolved_path) print_json_escaped(resolved_path); else printf("null");
                     printf(",\"size\":%llu,\"user\":", (unsigned long long)docs.items[start + i].size);
                     if (r && r->owner) print_json_escaped(r->owner); else printf("null");
                     printf(",\"name\":");
@@ -1019,8 +1145,8 @@ int main(int argc, char **argv) {
                     printf(",\"type\":");
                     if (r && r->type) print_json_escaped(r->type); else printf("null");
                     printf(",\"parent_path\":");
-                    if (r && r->path) {
-                        char *pp = parent_path_dup(r->path);
+                    if (resolved_path) {
+                        char *pp = parent_path_dup(resolved_path);
                         if (pp) {
                             print_json_escaped(pp);
                             free(pp);
@@ -1044,8 +1170,7 @@ int main(int argc, char **argv) {
         free_treemap_rows(&rows);
         free_str_list(&kw_raw);
         free_str_list(&user_raw);
-        free_str_list(&kw_tokens);
-        free(detail_root);
+                free(detail_root);
         return 0;
     }
     if (!is_text_layout(detail_root)) {
@@ -1057,44 +1182,24 @@ int main(int argc, char **argv) {
     /* ── Load user list from root manifest ── */
     char **g_users = NULL;
     size_t g_users_n = 0;
-    size_t g_users_cap = 0;
     if (!load_root_users(detail_root, &g_users, &g_users_n)) {
         fprintf(stderr, "failed to load user list from manifest\n");
         free(detail_root);
         return 1;
     }
 
+    (void)load_detail_path_dict(detail_root);
+
     /* ── Collect all file rows from per-user chunks ── */
     size_t g_exts_cap = 256, g_exts_n = 0;
     char **g_exts = (char **)calloc(g_exts_cap, sizeof(char *));
     
     str_list kw_raw = {0}, ext_raw = {0}, user_raw = {0};
-    split_csv(kw_csv ? kw_csv : "", &kw_raw);
+    split_pipe_terms(kw_csv ? kw_csv : "", &kw_raw);
     split_csv(ext_csv ? ext_csv : "", &ext_raw);
     split_csv(user_csv ? user_csv : "", &user_raw);
 
-    /* Build keyword tokens for path matching */
-    str_list kw_tokens = {0};
-    if (kw_raw.count > 0) {
-        kw_tokens.items = (char **)calloc(kw_raw.count * 4 + 1, sizeof(char *));
-        if (!kw_tokens.items) { free(detail_root); return 1; }
-        for (size_t i = 0; i < kw_raw.count; i++) {
-            char *norm = norm_lower_token(kw_raw.items[i], 0);
-            if (!norm) continue;
-            char cur[256];
-            size_t cn = 0;
-            for (const char *p = norm; ; p++) {
-                int c = (unsigned char)*p;
-                if (isalnum(c)) {
-                    if (cn + 1 < sizeof(cur)) cur[cn++] = (char)c;
-                } else {
-                    if (cn > 0) { cur[cn] = '\0'; kw_tokens.items[kw_tokens.count++] = dupstr(cur); cn = 0; }
-                    if (c == '\0') break;
-                }
-            }
-            free(norm);
-        }
-    }
+    /* kw terms are split only by '|' and matched as whole substrings */
 
     /* Build user_id filter list */
     uint32_t *user_ids = NULL;
@@ -1118,7 +1223,6 @@ int main(int argc, char **argv) {
             free_str_list(&kw_raw);
             free_str_list(&ext_raw);
             free_str_list(&user_raw);
-            free_str_list(&kw_tokens);
             return 1;
         }
         for (size_t i = 0; i < user_n; i++) {
@@ -1165,8 +1269,7 @@ int main(int argc, char **argv) {
         free_str_list(&kw_raw);
         free_str_list(&ext_raw);
         free_str_list(&user_raw);
-        free_str_list(&kw_tokens);
-        free_str_arr(g_exts, g_exts_cap);
+                free_str_arr(g_exts, g_exts_cap);
         return 1;
     }
     uint32_t seq_doc_id = 0;
@@ -1219,10 +1322,21 @@ int main(int argc, char **argv) {
                         if (has_min && size < size_min) continue;
                         if (has_max && size > size_max) continue;
 
-                        /* path + keyword match */
-                        char *path_str = json_get_str(line, "p");
-                        if (!path_str) continue;
-                        if (!kw_match_any(path_str, &kw_tokens)) { free(path_str); continue; }
+                        uint32_t gid = 0;
+                        int has_gid = json_get_u32(line, "gid", &gid);
+
+                        char *path_owned = NULL;
+                        const char *path_view = NULL;
+                        if (has_gid && gid < g_paths_n && g_paths[gid]) {
+                            path_view = g_paths[gid];
+                        } else {
+                            path_owned = json_get_str(line, "p");
+                            if (!path_owned) continue;
+                            path_view = path_owned;
+                            has_gid = 0;
+                        }
+
+                        if (!kw_match_any(path_view, &kw_raw)) { free(path_owned); continue; }
 
                         uint32_t eid = 0;
                         char *ext_str = NULL;
@@ -1235,7 +1349,7 @@ int main(int argc, char **argv) {
                                     if (!ensure_str_slot(&g_exts, &g_exts_cap, g_exts_n)) {
                                         free(ext_norm);
                                         free(ext_str);
-                                        free(path_str);
+                                        free(path_owned);
                                         continue;
                                     }
                                     g_exts[g_exts_n] = dupstr(ext_norm);
@@ -1245,31 +1359,34 @@ int main(int argc, char **argv) {
                             }
                         }
                         if (!pass_id_filter(eid, ext_ids, ext_n)) {
-                            free(ext_norm); free(path_str); free(ext_str); continue;
+                            free(ext_norm); free(path_owned); free(ext_str); continue;
                         }
 
-                        uint32_t gid = seq_doc_id;
-                        if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) {
-                            free(path_str); free(ext_norm); free(ext_str);
-                            continue;
-                        }
-                        free(g_paths[gid]);
-                        g_paths[gid] = path_str;
-                        if (!g_paths[gid]) {
-                            free(path_str); free(ext_norm); free(ext_str);
-                            continue;
+                        if (!has_gid) {
+                            gid = seq_doc_id;
+                            if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) {
+                                free(path_owned); free(ext_norm); free(ext_str);
+                                continue;
+                            }
+                            free(g_paths[gid]);
+                            g_paths[gid] = path_owned;
+                            if (!g_paths[gid]) {
+                                free(path_owned); free(ext_norm); free(ext_str);
+                                continue;
+                            }
+                            path_owned = NULL;
                         }
 
                         scanned++;
                         append_filter_doc(&docs, seq_doc_id++, gid, uid, eid, size);
-                        free(ext_norm); free(ext_str);
+                        free(ext_norm); free(ext_str); free(path_owned);
                     }
                     free(line);
                     fclose(pf);
                     free(part_path);
                 }
             }
-            free(file_parts);
+            free_str_arr(file_parts, file_parts_n);
             file_parts = NULL;
             free(user_dir);
         }
@@ -1323,9 +1440,8 @@ int main(int argc, char **argv) {
 
     free_doc_list(&docs);
     free(ext_ids); free(user_ids); free(user_selected);
-    free_str_list(&kw_raw); free_str_list(&ext_raw); free_str_list(&user_raw); free_str_list(&kw_tokens);
-    free_str_arr(g_exts, g_exts_cap);
-    free_str_arr(g_users, g_users_cap);
+    free_str_list(&kw_raw); free_str_list(&ext_raw); free_str_list(&user_raw);     free_str_arr(g_exts, g_exts_n);
+    free_str_arr(g_users, g_users_n);
     free(detail_root);
     return 0;
 }

@@ -338,7 +338,6 @@ class ReportGenerator:
         if not hasattr(_fast_scanner, "build_pipeline"):
             raise RuntimeError("fast_scanner.build_pipeline is required")
         print("[Phase 2] Rust pipeline started (large datasets may take a while)...")
-        build_started = time.time()
         total_files_holder: Dict[str, int] = {"value": 0}
         build_error_holder: Dict[str, Optional[Exception]] = {"error": None}
 
@@ -360,8 +359,7 @@ class ReportGenerator:
         while build_thread.is_alive():
             build_thread.join(timeout=10.0)
             if build_thread.is_alive():
-                elapsed = int(time.time() - build_started)
-                print(f"[Phase 2] Still processing... elapsed {elapsed}s")
+                print("[Phase 2] Still processing...")
 
         if build_error_holder["error"] is not None:
             raise build_error_holder["error"]

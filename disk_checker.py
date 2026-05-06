@@ -465,6 +465,10 @@ def main():
             if heartbeat:
                 heartbeat.stop()
             _update_status(sync_pipeline, out_dir, "error", False, f"Scan failed: {e}", str(e), started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
+            err_text = str(e)
+            if "No space left on device" in err_text or "ENOSPC" in err_text:
+                print(f"\nTemporary storage is full: {e}")
+                sys.exit(2)
             print(f"\nUnexpected error: {e}")
             traceback.print_exc()
             sys.exit(1)

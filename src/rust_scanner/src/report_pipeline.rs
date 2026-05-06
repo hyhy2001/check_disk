@@ -151,19 +151,13 @@ fn write_text_outputs(
     detail_root: &Path,
     _tree_root: &Path,
     global_paths: &[String],
-    _global_parent_path_id: &[u32],
     users_dict: &[String],
     team_map: &HashMap<String, String>,
-    _exts: &[String],
     user_file_artifacts: &HashMap<u32, UserFileArtifacts>,
     total_docs: u64,
     total_size: u64,
-    _uid_totals_rows: &[(u32, u64, u64, u64)],
     dir_user_rows: &[(u32, u32, u64)],
-    _perm_records: &[(u32, u32, u16, u8)],
     uid_totals_map: &HashMap<u32, (u64, u64, u64)>,
-    top_dirs_by_uid: &HashMap<u32, Vec<(u32, i64)>>,
-    _user_results: &[crate::pipe_types::UserBuildResult],
     timestamp: i64,
 ) -> Result<(), String> {
     fs::create_dir_all(detail_root).map_err(|e| e.to_string())?;
@@ -220,10 +214,7 @@ fn write_text_outputs(
             let part_path = chunk_dir.join(part_name);
             let mut w = BufWriter::with_capacity(512 * 1024, fs::File::create(&part_path).map_err(|e| e.to_string())?);
             for (size, path_id) in chunk {
-                let path = global_paths
-                    .get(*path_id as usize)
-                    .ok_or_else(|| format!("invalid dir path id {}", path_id))?;
-                serde_json::to_writer(&mut w, &json!({"p": path, "s": size}))
+                serde_json::to_writer(&mut w, &json!({"gid": path_id, "s": size}))
                     .map_err(|e| e.to_string())?;
                 w.write_all(b"\n").map_err(|e| e.to_string())?;
             }
@@ -334,50 +325,19 @@ fn write_text_outputs(
     .map_err(|e| e.to_string())?;
 
     fs::create_dir_all(detail_root.join("api")).map_err(|e| e.to_string())?;
-    let users_index: Vec<_> = users_dict
-        .iter()
-        .enumerate()
-        .map(|(idx, username)| {
-            let uid_key = idx as u32;
-            let (files, bytes, dirs) = uid_totals_map.get(&uid_key).copied().unwrap_or((0, 0, 0));
-            let mut top_dirs = top_dirs_by_uid.get(&uid_key).cloned().unwrap_or_default();
-            top_dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            json!({
-                "uid_id": idx,
-                "username": username,
-                "team_id": team_map.get(username).cloned().unwrap_or_default(),
-                "total_files": files,
-                "total_bytes": bytes,
-                "total_dirs": dirs,
-                "top_dirs": top_dirs
-            })
-        })
-        .collect();
 
-    let api_detail = json!({
-        "scan": {
-            "timestamp": timestamp,
-            "total_files": total_files_u64,
-            "total_dirs": total_dirs_u64,
-            "total_size": total_size
-        },
-        "totals": {
-            "users": users_dict.len(),
-            "docs": total_docs as usize,
-            "paths": global_paths.len()
-        },
-        "users": users_index
-    });
-    fs::write(
-        detail_root.join("api/data_detail.min.json"),
-        serde_json::to_vec(&api_detail).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    fs::write(
-        detail_root.join("api/users_index.min.json"),
-        serde_json::to_vec(&api_detail["users"]).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let path_dict_path = detail_root.join("api/path_dict.ndjson");
+    let mut path_dict_writer = BufWriter::with_capacity(
+        512 * 1024,
+        fs::File::create(&path_dict_path).map_err(|e| e.to_string())?,
+    );
+    for (gid, path) in global_paths.iter().enumerate() {
+        serde_json::to_writer(&mut path_dict_writer, &json!({"gid": gid as u32, "p": path}))
+            .map_err(|e| e.to_string())?;
+        path_dict_writer.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    path_dict_writer.flush().map_err(|e| e.to_string())?;
+
 
     Ok(())
 }
@@ -640,18 +600,12 @@ pub fn build_pipeline_dbs_impl(
         let mut global_paths: Vec<String> = vec!["/".to_string()];
         let mut global_parent_path_id: Vec<u32> = vec![0u32];
         global_path_to_id.insert("/".to_string(), 0usize);
-        let mut ext_to_id: HashMap<String, u32> = HashMap::new();
-        let mut exts: Vec<String> = Vec::new();
-        ext_to_id.insert(String::new(), 0);
-        exts.push(String::new());
 
         let mut user_to_uid: HashMap<String, u32> = HashMap::new();
         let mut users_dict: Vec<String> = Vec::new();
         let mut user_file_artifacts: HashMap<u32, UserFileArtifacts> = HashMap::new();
         let mut total_docs: u64 = 0;
         let mut total_size: u64 = 0;
-        let mut top_dirs_by_uid: HashMap<u32, Vec<(u32, i64)>> = HashMap::new();
-        let mut team_ids_by_uid: HashMap<u32, u32> = HashMap::new();
         let mut user_timings: Vec<(String, f64, usize, usize)> = Vec::new();
         let mut user_results: Vec<crate::pipe_types::UserBuildResult> = Vec::with_capacity(user_keys.len());
 
@@ -726,11 +680,6 @@ pub fn build_pipeline_dbs_impl(
 
                     let safe_path = String::from_utf8_lossy(&path_bytes).to_string();
                     let ext = String::from_utf8_lossy(&ext_bytes).to_string();
-                    if !ext_to_id.contains_key(&ext) {
-                        let id = exts.len() as u32;
-                        exts.push(ext.clone());
-                        ext_to_id.insert(ext.clone(), id);
-                    }
 
                     if part_writer.is_none() {
                         let chunk_dir = user_dir.join("files").join(format!("chunk-{:05}", part_index));
@@ -743,8 +692,15 @@ pub fn build_pipeline_dbs_impl(
                         part_records = 0;
                     }
 
+                    let path_id = ensure_path_id(
+                        &safe_path,
+                        &mut global_path_to_id,
+                        &mut global_paths,
+                        &mut global_parent_path_id,
+                    ) as u32;
+
                     if let Some(writer) = part_writer.as_mut() {
-                        serde_json::to_writer(&mut *writer, &json!({"p": safe_path, "s": size, "x": ext}))
+                        serde_json::to_writer(&mut *writer, &json!({"gid": path_id, "s": size, "x": ext}))
                             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                         writer.write_all(b"\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     }
@@ -798,14 +754,6 @@ pub fn build_pipeline_dbs_impl(
                 },
             );
 
-            top_dirs_by_uid.entry(uid).or_default();
-
-            let team_id_num = team_map
-                .get(&username)
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0);
-            team_ids_by_uid.insert(uid, team_id_num);
-
             let team_id = if user.team_id.is_empty() {
                 team_map.get(&username).cloned().unwrap_or_default()
             } else {
@@ -824,12 +772,13 @@ pub fn build_pipeline_dbs_impl(
             }
 
             done_users += 1;
-            let pct = (done_users as f64 / total_users as f64) * 100.0;
-            print!(
-                "\r[Phase 2] Detail reports: {}/{} users ({:.1}%) ... ",
-                done_users, total_users, pct
-            );
-            let _ = std::io::stdout().flush();
+            if done_users % 10 == 0 || done_users == total_users {
+                let pct = (done_users as f64 / total_users as f64) * 100.0;
+                println!(
+                    "[Phase 2] Detail reports: {}/{} users ({:.1}%)",
+                    done_users, total_users, pct
+                );
+            }
 
             if debug {
                 let user_time_s = user_t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0);
@@ -840,7 +789,6 @@ pub fn build_pipeline_dbs_impl(
                 user_timings.push((username, user_time_s, spills.len(), part_count));
             }
         }
-        println!();
         t_chunk_parallel = t3.elapsed().as_secs_f64();
 
         let t4 = Instant::now();
@@ -867,13 +815,6 @@ pub fn build_pipeline_dbs_impl(
                 let id = users_dict.len() as u32;
                 users_dict.push(username.clone());
                 user_to_uid.insert(username.clone(), id);
-                team_ids_by_uid.insert(
-                    id,
-                    team_map
-                        .get(&username)
-                        .and_then(|v| v.parse::<u32>().ok())
-                        .unwrap_or(0),
-                );
                 id
             };
             let safe_path = crate::sanitise_path(&event.path);
@@ -911,12 +852,6 @@ pub fn build_pipeline_dbs_impl(
                 );
             }
         }
-        let mut uid_totals_rows: Vec<(u32, u64, u64, u64)> = uid_totals_map
-            .iter()
-            .map(|(uid, (files, bytes, dirs))| (*uid, *files, *bytes, *dirs))
-            .collect();
-        uid_totals_rows.sort_by_key(|(uid, _, _, _)| *uid);
-
         let mut dir_user_rows: Vec<(u32, u32, u64)> = Vec::new();
         for (dir_path, users_sizes) in dir_sizes.iter() {
             let dir_id = ensure_path_id(
@@ -935,10 +870,6 @@ pub fn build_pipeline_dbs_impl(
                     .unwrap_or_else(|| format!("uid-{}", owner_uid));
                 if let Some(uid_id) = user_to_uid.get(&username) {
                     dir_user_rows.push((dir_id, *uid_id, *bytes as u64));
-                    top_dirs_by_uid
-                        .entry(*uid_id)
-                        .or_default()
-                        .push((dir_id, *bytes));
                 }
             }
         }
@@ -951,19 +882,13 @@ pub fn build_pipeline_dbs_impl(
             &detail_work_root,
             &tree_work_dir,
             &global_paths,
-            &global_parent_path_id,
             &users_dict,
             &team_map,
-            &exts,
             &user_file_artifacts,
             total_docs,
             total_size,
-            &uid_totals_rows,
             &dir_user_rows,
-            &perm_records,
             &uid_totals_map,
-            &top_dirs_by_uid,
-            &user_results,
             timestamp,
         )
         .map_err(PyRuntimeError::new_err)?;
@@ -975,6 +900,7 @@ pub fn build_pipeline_dbs_impl(
         t_perm_write = t7.elapsed().as_secs_f64();
 
         let t8 = Instant::now();
+        let _ = fs::remove_dir_all(&spool_root);
         swap_dir_atomic(&detail_work_root, &detail_root)?;
         t_swap_detail = t8.elapsed().as_secs_f64();
 
@@ -1016,8 +942,6 @@ pub fn build_pipeline_dbs_impl(
         } else {
             let _ = fs::remove_dir_all(&tree_work_dir);
         }
-
-        let _ = fs::remove_dir_all(&spool_root);
 
         if debug {
             let rss_mb = crate::pipe_types::get_rss_mb();

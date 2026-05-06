@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
+
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -84,14 +85,30 @@ pub fn write_treemap_json_outputs(
     let mut writers: HashMap<String, BufWriter<File>> = HashMap::new();
     let mut records_per_prefix: HashMap<String, u64> = HashMap::new();
     let mut total_records: u64 = 0;
+    let mut path_to_gid: HashMap<String, u32> = HashMap::new();
+    let mut gid_paths: Vec<String> = Vec::new();
+
+    let mut ensure_gid = |p: &str| -> u32 {
+        if let Some(existing) = path_to_gid.get(p) {
+            return *existing;
+        }
+        let gid = gid_paths.len() as u32;
+        gid_paths.push(p.to_string());
+        path_to_gid.insert(p.to_string(), gid);
+        gid
+    };
+
+    let progress_step = usize::max(1, total_paths / 10);
+    let mut last_logged_done: usize = 0;
 
     for path in &paths {
         let size = recursive_sizes.get(path).copied().unwrap_or(0);
         if size < min_size_bytes && path != &root {
             let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 10_000 == 0 || done == total_paths {
+            if (done % progress_step == 0 || done == total_paths) && done != last_logged_done {
                 let percent = (done as f64 / total_paths as f64) * 100.0;
-                print!("\r[Phase 2] TreeMap shards: {}/{} ({:.1}%) ... ", done, total_paths, percent);
+                println!("[Phase 2] TreeMap shards: {}/{} ({:.1}%)", done, total_paths, percent);
+                last_logged_done = done;
             }
             continue;
         }
@@ -106,13 +123,22 @@ pub fn write_treemap_json_outputs(
             BufWriter::with_capacity(BUF_SIZE, inner)
         });
 
+        let parent_path = tm_parent(path).to_string();
+        let gid = ensure_gid(path);
+        let _parent_gid = ensure_gid(&parent_path);
+        let owner = dir_owner_map
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let has_children = has_children_paths.contains(path);
         let row = json!({
             "id": shard_id,
+            "pid": shard_id_for_path(&parent_path),
+            "gid": gid,
             "n": tm_basename(path),
             "v": size,
-            "o": dir_owner_map.get(path).cloned().unwrap_or_else(|| "unknown".to_string()),
-            "p": path,
-            "h": has_children_paths.contains(path),
+            "o": owner,
+            "h": has_children,
             "t": "d"
         });
 
@@ -125,18 +151,17 @@ pub fn write_treemap_json_outputs(
         total_records += 1;
 
         let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-        if done % 10_000 == 0 || done == total_paths {
+        if done % progress_step == 0 || done == total_paths {
             let percent = (done as f64 / total_paths as f64) * 100.0;
-            print!("\r[Phase 2] TreeMap shards: {}/{} ({:.1}%) ... ", done, total_paths, percent);
+            println!("[Phase 2] TreeMap shards: {}/{} ({:.1}%)", done, total_paths, percent);
         }
     }
-    println!();
 
     let root_shard_id = shard_id_for_path(&root);
     let root_node = json!({
         "version": 1,
         "format": "check-disk-treemap-json",
-        "name": tm_basename(&root),
+        "name": "/",
         "path": root,
         "value": recursive_sizes.get(&root).copied().unwrap_or(0),
         "type": "directory",
@@ -151,15 +176,40 @@ pub fn write_treemap_json_outputs(
     });
     write_json_file(Path::new(json_path), &root_node)?;
 
+    let api_dir = data_dir.join("api");
+    fs::create_dir_all(&api_dir)
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to create treemap api dir: {}", e)))?;
+
+    let path_dict_path = api_dir.join("path_dict.ndjson");
+    let mut path_dict_writer = BufWriter::with_capacity(
+        BUF_SIZE,
+        File::create(&path_dict_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create treemap path dict: {}", e)))?,
+    );
+    for (gid, p) in gid_paths.iter().enumerate() {
+        let row = json!({"gid": gid as u32, "p": p});
+        serde_json::to_writer(&mut path_dict_writer, &row)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to write treemap path dict row: {}", e)))?;
+        path_dict_writer
+            .write_all(b"\n")
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to terminate treemap path dict row: {}", e)))?;
+    }
+    path_dict_writer
+        .flush()
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to flush treemap path dict: {}", e)))?;
+
+
     write_json_file(
-        &data_dir.join("api").join("shards_manifest.json"),
+        &api_dir.join("shards_manifest.json"),
         &json!({
-            "version": 3,
+            "version": 6,
             "format": "check-disk-treemap-shards-ndjson",
             "root_shard_id": root_shard_id,
             "shard_count": total_records,
             "bucket_count": records_per_prefix.len(),
             "shard_lookup_key": "id",
+            "path_lookup_key": "gid",
+            "path_dict": "api/path_dict.ndjson",
             "shard_path_template": "shards/{prefix}/bucket.ndjson"
         }),
     )?;
@@ -168,9 +218,10 @@ pub fn write_treemap_json_outputs(
         &data_dir.join("manifest.json"),
         &json!({
             "schema": "check-disk-detail-treemap",
-            "version": 3,
+            "version": 6,
             "files": {
                 "api/shards_manifest.json": {"records": 1},
+                "api/path_dict.ndjson": {"records": gid_paths.len()},
                 "shards": {"records": total_records}
             }
         }),

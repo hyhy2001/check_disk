@@ -1,6 +1,6 @@
 <?php
 
-class Cdx1QueryHelper
+class NativeIndexQueryHelper
 {
     private $cliPath;
 
@@ -59,12 +59,12 @@ class Cdx1QueryHelper
         $fullCmd = implode(' ', $cmd) . ' 2>&1';
         $raw = shell_exec($fullCmd);
         if ($raw === null) {
-            throw new Exception('cdx1_query execution failed');
+            throw new Exception('native query execution failed');
         }
 
         $data = json_decode($raw, true);
         if (!is_array($data)) {
-            throw new Exception('Invalid JSON from cdx1_query: ' . $raw);
+            throw new Exception('Invalid JSON from native query: ' . $raw);
         }
 
         return $data;
