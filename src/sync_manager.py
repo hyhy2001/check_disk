@@ -9,8 +9,8 @@ from threading import Lock
 from typing import Dict
 
 SSH_TIMEOUT = 30
-RSYNC_TIMEOUT = 300
-SCP_TIMEOUT = 120
+RSYNC_TIMEOUT = 7200
+SCP_TIMEOUT = 7200
 
 _SYNC_PRINT_LOCK = Lock()
 
