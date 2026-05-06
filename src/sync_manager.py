@@ -12,6 +12,13 @@ SSH_TIMEOUT = 30
 RSYNC_TIMEOUT = 300
 SCP_TIMEOUT = 120
 
+_SYNC_PRINT_LOCK = Lock()
+
+
+def _sync_log(message: str) -> None:
+    with _SYNC_PRINT_LOCK:
+        print(message)
+
 # ── SSH ControlMaster settings ──────────────────────────────────────────
 _CONTROL_DIR = None          # lazily created temp dir for sockets
 _CONTROL_SOCKETS: dict = {}  # (user, host) -> socket path
@@ -104,10 +111,10 @@ def _get_control_socket(user: str, host: str, password: str = None) -> str:
             # Master failed — return empty so callers fall back to normal SSH
             stderr_msg = proc.stderr.decode("utf-8", errors="replace").strip() if proc.stderr else ""
             if stderr_msg:
-                print(f"[SYNC WARN] SSH ControlMaster failed for {user}@{host}: {stderr_msg}")
+                _sync_log(f"[SYNC WARN] SSH ControlMaster failed for {user}@{host}: {stderr_msg}")
             return ""
     except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"[SYNC WARN] SSH ControlMaster setup failed: {e}")
+        _sync_log(f"[SYNC WARN] SSH ControlMaster setup failed: {e}")
         return ""
 
 
@@ -185,14 +192,14 @@ class ReportSyncer:
     def sync_to_remote(output_dir: str, user: str, host: str, dest_dir: str, password: str = None) -> bool:
         """Compresses and streams the contents of output_dir to a remote server."""
         if not os.path.exists(output_dir):
-            print(f"Error: Sync failed. Local report directory '{output_dir}' does not exist.")
+            _sync_log(f"Error: Sync failed. Local report directory '{output_dir}' does not exist.")
             return False
 
         if not user or not host or not dest_dir:
-            print("Error: Missing required SSH sync parameters (--sync-user, --sync-host, --sync-dest-dir).")
+            _sync_log("Error: Missing required SSH sync parameters (--sync-user, --sync-host, --sync-dest-dir).")
             return False
 
-        print(f"\n[SYNC] Initiating remote sync to {user}@{host}:{dest_dir}...")
+        _sync_log(f"\n[SYNC] Initiating remote sync to {user}@{host}:{dest_dir}...")
 
         control_socket = _get_control_socket(user, host, password)
         ssh_base, env = _build_ssh_base(user, host, password, control_socket)
@@ -230,17 +237,17 @@ class ReportSyncer:
 
             if ssh_proc.returncode == 0:
                 codec = "xz" if use_xz else "gzip"
-                print(f"[SYNC] Successfully synced reports to {host} using tar+{codec} stream.")
+                _sync_log(f"[SYNC] Successfully synced reports to {host} using tar+{codec} stream.")
                 return True
-            print(f"[SYNC ERROR] Archive stream failed (code {ssh_proc.returncode}).")
+            _sync_log(f"[SYNC ERROR] Archive stream failed (code {ssh_proc.returncode}).")
             if ssh_proc.stderr:
-                print(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
+                _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
             return False
         except subprocess.TimeoutExpired:
-            print("[SYNC ERROR] Archive stream timed out.")
+            _sync_log("[SYNC ERROR] Archive stream timed out.")
             return False
         except Exception as e:
-            print(f"[SYNC EXCEPTION] Archive stream failed: {str(e)}")
+            _sync_log(f"[SYNC EXCEPTION] Archive stream failed: {str(e)}")
             return False
 
     @staticmethod
@@ -295,17 +302,17 @@ class ReportSyncer:
             tar_proc.wait(timeout=30)
 
             if ssh_proc.returncode == 0:
-                print(f"[SYNC] Synced file: {rel_path} (tar)")
+                _sync_log(f"[SYNC] Synced file: {rel_path} (tar)")
                 return True
-            print(f"[SYNC ERROR] tar stream failed for {rel_path} (code {ssh_proc.returncode}).")
+            _sync_log(f"[SYNC ERROR] tar stream failed for {rel_path} (code {ssh_proc.returncode}).")
             if ssh_proc.stderr:
-                print(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
+                _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
             return False
         except subprocess.TimeoutExpired:
-            print(f"[SYNC ERROR] tar stream timed out for {rel_path}.")
+            _sync_log(f"[SYNC ERROR] tar stream timed out for {rel_path}.")
             return False
         except Exception as e:
-            print(f"[SYNC EXCEPTION] tar stream failed for {rel_path}: {str(e)}")
+            _sync_log(f"[SYNC EXCEPTION] tar stream failed for {rel_path}: {str(e)}")
             return False
 
     @staticmethod
@@ -340,26 +347,40 @@ class ReportSyncer:
         ssh_base, env = _build_ssh_base(user, host, password, control_socket)
         merged_env = {**os.environ, **env}
 
-        ssh_extract_cmd = ssh_base + [
-            "set -e; "
-            f"rm -rf {shlex.quote(remote_staging)}; "
-            f"mkdir -p {shlex.quote(remote_staging)}; "
-            f"tar -xzf - -C {shlex.quote(remote_staging)}; "
-            f"rm -rf {shlex.quote(remote_old)}; "
-            f"if [ -d {shlex.quote(remote_target)} ]; then "
-            f"mv {shlex.quote(remote_target)} {shlex.quote(remote_old)}; "
-            "fi; "
-            f"mv {shlex.quote(remote_staging)} {shlex.quote(remote_target)}; "
-            f"rm -rf {shlex.quote(remote_old)}"
-        ]
+        q_staging = shlex.quote(remote_staging)
+        q_target = shlex.quote(remote_target)
+        q_old = shlex.quote(remote_old)
+
+        def _run_stage(stage_name: str, remote_cmd: str, timeout: int = SSH_TIMEOUT) -> bool:
+            proc = subprocess.run(
+                ssh_base + [remote_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=merged_env,
+                timeout=timeout,
+            )
+            if proc.returncode == 0:
+                return True
+            _sync_log(f"[SYNC ERROR] Stage failed [{stage_name}] for {rel_path}/ (code {proc.returncode}).")
+            details = (proc.stderr or proc.stdout or "").strip()
+            if details:
+                _sync_log(f"[SYNC ERROR DETAILS][{stage_name}]:\n{details}")
+            return False
+
         try:
+            if not _run_stage("cleanup_staging", f"rm -rf {q_staging}"):
+                return False
+            if not _run_stage("create_staging", f"mkdir -p {q_staging}"):
+                return False
+
             tar_proc = subprocess.Popen(
                 ["tar", "-czf", "-", "-C", local_abs, "."],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
             ssh_proc = subprocess.run(
-                ssh_extract_cmd,
+                ssh_base + [f"tar -xzf - -C {q_staging}"],
                 stdin=tar_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -370,17 +391,30 @@ class ReportSyncer:
             tar_proc.stdout.close()
             tar_proc.wait(timeout=30)
 
-            if ssh_proc.returncode == 0:
-                file_count = sum(1 for _ in os.scandir(local_abs) if _.is_file())
-                print(f"[SYNC] Batch synced directory: {rel_path}/ ({file_count} files, tar+gzip)")
-                return True
-            print(f"[SYNC ERROR] Batch tar stream failed for {rel_path}/ (code {ssh_proc.returncode}).")
-            return False
-        except subprocess.TimeoutExpired:
-            print(f"[SYNC ERROR] Batch tar stream timed out for {rel_path}/.")
+            if ssh_proc.returncode != 0:
+                _sync_log(f"[SYNC ERROR] Stage failed [stream_extract] for {rel_path}/ (code {ssh_proc.returncode}).")
+                details = (ssh_proc.stderr or ssh_proc.stdout or "").strip()
+                if details:
+                    _sync_log(f"[SYNC ERROR DETAILS][stream_extract]:\n{details}")
+                return False
+
+            if not _run_stage("cleanup_old", f"rm -rf {q_old}"):
+                return False
+            if not _run_stage("rotate_current", f"if [ -d {q_target} ]; then mv {q_target} {q_old}; fi"):
+                return False
+            if not _run_stage("promote_staging", f"mv {q_staging} {q_target}"):
+                return False
+            if not _run_stage("cleanup_old_final", f"rm -rf {q_old}"):
+                return False
+
+            file_count = sum(1 for entry in os.scandir(local_abs) if entry.is_file())
+            _sync_log(f"[SYNC] Batch synced directory: {rel_path}/ ({file_count} files, tar+gzip)")
+            return True
+        except subprocess.TimeoutExpired as e:
+            _sync_log(f"[SYNC ERROR] Batch tar stage timed out for {rel_path}/: {e}")
             return False
         except Exception as e:
-            print(f"[SYNC EXCEPTION] Batch tar stream failed for {rel_path}/: {e}")
+            _sync_log(f"[SYNC EXCEPTION] Batch tar stream failed for {rel_path}/: {e}")
             return False
 
 
@@ -485,7 +519,7 @@ class AsyncSyncPipeline:
             return True
 
         # Fallback: sync each file individually
-        print(f"[SYNC] Falling back to file-by-file sync for {dir_path}")
+        _sync_log(f"[SYNC] Falling back to file-by-file sync for {dir_path}")
         results = []
         try:
             for entry in os.scandir(dir_path):
@@ -501,7 +535,7 @@ class AsyncSyncPipeline:
                     )
                     results.append(r)
         except OSError as e:
-            print(f"[SYNC ERROR] Could not list directory {dir_path}: {e}")
+            _sync_log(f"[SYNC ERROR] Could not list directory {dir_path}: {e}")
             return False
         return all(results) if results else False
 
@@ -512,7 +546,7 @@ class AsyncSyncPipeline:
             try:
                 fut.result()
             except Exception as e:
-                print(f"[SYNC WARN] Async sync error: {e}")
+                _sync_log(f"[SYNC WARN] Async sync error: {e}")
 
     def close(self):
         self.wait()
