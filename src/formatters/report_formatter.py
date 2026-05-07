@@ -7,8 +7,8 @@ Contains the ReportFormatter class for formatting and displaying reports.
 import json
 import os
 import gzip
+import heapq
 import struct
-from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils import format_size, format_timestamp
@@ -252,14 +252,14 @@ class ReportFormatter(BaseFormatter):
         for user in users:
             dir_path  = dir_files.get(user)
             file_path = file_files.get(user)
-            dir_data  = self._load_detail_report(dir_path, is_dir=True, user=user) if dir_path else None
-            file_data = self._load_detail_report(file_path, is_dir=False, user=user) if file_path else None
+            dir_data  = self._load_detail_report(dir_path, is_dir=True, user=user, top=top) if dir_path else None
+            file_data = self._load_detail_report(file_path, is_dir=False, user=user, top=top) if file_path else None
             self.display_user_detail_report(user, dir_data, file_data, top)
 
-    def _load_detail_report(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
+    def _load_detail_report(self, path: str, is_dir: bool, user: str = "", top: int = 30) -> Dict[str, Any]:
         """Load detail report from generated manifest, NDJSON, or JSON."""
         if path.endswith('manifest.json'):
-            return self._load_detail_from_manifest(path, is_dir, user=user)
+            return self._load_detail_from_manifest(path, is_dir, user=user, top=top)
         if path.endswith('.ndjson') or path.endswith('.ndjson.gz'):
             return self._load_detail_from_ndjson(path, is_dir)
         if path.endswith('.bin.gz') or path.endswith('.bin'):
@@ -268,7 +268,7 @@ class ReportFormatter(BaseFormatter):
         from ..utils import load_json_report
         return load_json_report(path)
 
-    def _load_detail_from_manifest(self, path: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
+    def _load_detail_from_manifest(self, path: str, is_dir: bool, user: str = "", top: int = 30) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as fh:
             root_manifest = json.load(fh)
         base_dir = os.path.dirname(path)
@@ -289,7 +289,6 @@ class ReportFormatter(BaseFormatter):
         with open(manifest_path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
         user_dir = os.path.dirname(manifest_path)
-        path_dict = self._load_paths_dict(base_dir, user_dir, manifest)
         summary = manifest.get("summary", {})
         data: Dict[str, Any] = {
             "date": int(manifest.get("scan_date", scan_meta.get("timestamp", 0)) or 0),
@@ -299,13 +298,76 @@ class ReportFormatter(BaseFormatter):
             "total_files": int(summary.get("files", 0) or 0),
             "total_used": int(summary.get("used", 0) or 0),
         }
+        def _build_path_resolver(detail_root: str, user_dir: str, manifest: Dict[str, Any]):
+            """Return gid->path resolver using path_dict.seek when available."""
+            seek_path = os.path.join(detail_root, "api", "path_dict.seek")
+            ndjson_path = os.path.join(detail_root, "api", "path_dict.ndjson")
+            if os.path.exists(seek_path) and os.path.exists(ndjson_path):
+                import struct as _struct
+                sfh = open(seek_path, "rb")
+                dfh = open(ndjson_path, "rb")
+                magic = sfh.read(4)
+                version_raw = sfh.read(4)
+                count_raw = sfh.read(4)
+                if magic == b"PDX1" and len(version_raw) == 4 and len(count_raw) == 4:
+                    version = _struct.unpack("<I", version_raw)[0]
+                    count = _struct.unpack("<I", count_raw)[0]
+                    if version == 1 and count > 0:
+                        cache: Dict[int, str] = {}
+                        rec_size = 16
+
+                        def resolver(gid: int) -> str:
+                            if gid < 0:
+                                return ""
+                            if gid in cache:
+                                return cache[gid]
+                            left, right = 0, count - 1
+                            out = ""
+                            while left <= right:
+                                mid = (left + right) // 2
+                                sfh.seek(12 + mid * rec_size)
+                                gid_bytes = sfh.read(4)
+                                off_bytes = sfh.read(8)
+                                len_bytes = sfh.read(4)
+                                if len(gid_bytes) < 4 or len(off_bytes) < 8 or len(len_bytes) < 4:
+                                    break
+                                cur_gid = _struct.unpack("<I", gid_bytes)[0]
+                                if cur_gid < gid:
+                                    left = mid + 1
+                                elif cur_gid > gid:
+                                    right = mid - 1
+                                else:
+                                    off_parts = _struct.unpack("<II", off_bytes)
+                                    offset = off_parts[0] + (off_parts[1] << 32)
+                                    row_len = _struct.unpack("<I", len_bytes)[0]
+                                    if 0 < row_len <= 16777216:
+                                        dfh.seek(offset)
+                                        line_bytes = dfh.read(row_len)
+                                        try:
+                                            obj = json.loads(line_bytes.decode("utf-8", errors="ignore").rstrip())
+                                            if isinstance(obj, dict) and isinstance(obj.get("p"), str):
+                                                out = obj["p"]
+                                        except Exception:
+                                            pass
+                                    break
+                            cache[gid] = out
+                            return out
+
+                        return resolver
+            path_dict = self._load_paths_dict(detail_root, user_dir, manifest)
+            return lambda gid: path_dict[gid] if 0 <= gid < len(path_dict) else ""
+
+
+        path_resolver = _build_path_resolver(base_dir, user_dir, manifest)
 
         def _resolve_path(item: Dict[str, Any]) -> str:
             path_id = item.get("gid")
             if not isinstance(path_id, int):
                 path_id = item.get("i")
-            if isinstance(path_id, int) and 0 <= path_id < len(path_dict):
-                return path_dict[path_id]
+            if isinstance(path_id, int) and path_id >= 0:
+                resolved = path_resolver(path_id)
+                if resolved:
+                    return resolved
             return item.get("p", "")
 
         def _decode_file_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -326,26 +388,52 @@ class ReportFormatter(BaseFormatter):
                 with open(top_path, "r", encoding="utf-8") as fh:
                     data["dirs"] = [_decode_dir_item(x) for x in json.load(fh)]
             else:
-                dirs = []
+                # Streaming top-N: use heapq to keep only largest N dirs during scan
+                heap = []
+                seq = 0
                 for part in manifest.get("dirs", {}).get("parts", []):
                     part_path = os.path.join(user_dir, part.get("path", ""))
                     part_loader = self._load_detail_from_bin if part_path.endswith(".bin") or part_path.endswith(".bin.gz") else self._load_detail_from_ndjson
-                    part_data = part_loader(part_path, True, path_dict=path_dict)
-                    dirs.extend(part_data.get("dirs", []))
-                data["dirs"] = dirs
+                    part_data = part_loader(part_path, True)
+                    for d in part_data.get("dirs", []):
+                        used = int(d.get("used", 0) or 0)
+                        seq += 1
+                        if len(heap) < top:
+                            heapq.heappush(heap, (used, seq, d))
+                        elif used > heap[0][0]:
+                            heapq.heapreplace(heap, (used, seq, d))
+                selected = [item[2] for item in sorted(heap, key=lambda x: x[0], reverse=True)]
+                for d in selected:
+                    if not d.get("path") and isinstance(d.get("gid"), int):
+                        d["path"] = path_resolver(int(d.get("gid")))
+                data["dirs"] = selected
+                heap.clear()
         else:
             top_path = os.path.join(user_dir, manifest.get("top_files", "top_files.json"))
             if os.path.exists(top_path):
                 with open(top_path, "r", encoding="utf-8") as fh:
                     data["files"] = [_decode_file_item(x) for x in json.load(fh)]
             else:
-                files = []
+                # Streaming top-N: use heapq to keep only largest N files during scan
+                heap = []
+                seq = 0
                 for part in manifest.get("files", {}).get("parts", []):
                     part_path = os.path.join(user_dir, part.get("path", ""))
                     part_loader = self._load_detail_from_bin if part_path.endswith(".bin") or part_path.endswith(".bin.gz") else self._load_detail_from_ndjson
-                    part_data = part_loader(part_path, False, path_dict=path_dict)
-                    files.extend(part_data.get("files", []))
-                data["files"] = files
+                    part_data = part_loader(part_path, False)
+                    for f in part_data.get("files", []):
+                        size = int(f.get("size", 0) or 0)
+                        seq += 1
+                        if len(heap) < top:
+                            heapq.heappush(heap, (size, seq, f))
+                        elif size > heap[0][0]:
+                            heapq.heapreplace(heap, (size, seq, f))
+                selected = [item[2] for item in sorted(heap, key=lambda x: x[0], reverse=True)]
+                for f in selected:
+                    if not f.get("path") and isinstance(f.get("gid"), int):
+                        f["path"] = path_resolver(int(f.get("gid")))
+                data["files"] = selected
+                heap.clear()
         return data
 
     def _load_paths_dict(self, detail_root: str, user_dir: str, manifest: Dict[str, Any]) -> List[str]:
@@ -386,7 +474,7 @@ class ReportFormatter(BaseFormatter):
 
         return []
 
-    def _load_detail_from_ndjson(self, path: str, is_dir: bool, path_dict: Optional[List[str]] = None) -> Dict[str, Any]:
+    def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
         data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
         open_fn = gzip.open if path.endswith(".gz") else open
         with open_fn(path, "rt", encoding="utf-8") as fh:
@@ -411,38 +499,16 @@ class ReportFormatter(BaseFormatter):
                         data["total_used"] = int(meta.get("total_used", 0) or 0)
                     continue
 
+                path_id = obj.get("gid")
+                if not isinstance(path_id, int):
+                    path_id = obj.get("i")
                 if is_dir:
-                    path_id = obj.get("gid")
-                    if not isinstance(path_id, int):
-                        path_id = obj.get("i")
-                    p = None
-                    if isinstance(path_id, int) and path_dict and 0 <= path_id < len(path_dict):
-                        p = path_dict[path_id]
-                    elif "p" in obj:
-                        p = obj.get("p")
-                    if p is not None:
-                        data.setdefault("dirs", []).append({
-                            "path": p,
-                            "used": int(obj.get("s", 0) or 0),
-                        })
+                    data.setdefault("dirs", []).append({"gid": path_id, "used": int(obj.get("s", 0) or 0)})
                 else:
-                    path_id = obj.get("gid")
-                    if not isinstance(path_id, int):
-                        path_id = obj.get("i")
-                    p = None
-                    if isinstance(path_id, int) and path_dict and 0 <= path_id < len(path_dict):
-                        p = path_dict[path_id]
-                    elif "p" in obj:
-                        p = obj.get("p")
-                    if p is not None:
-                        data.setdefault("files", []).append({
-                            "path": p,
-                            "size": int(obj.get("s", 0) or 0),
-                            "ext": obj.get("x", ""),
-                        })
+                    data.setdefault("files", []).append({"gid": path_id, "size": int(obj.get("s", 0) or 0), "ext": obj.get("x", "")})
         return data
 
-    def _load_detail_from_bin(self, path: str, is_dir: bool, path_dict: Optional[List[str]] = None) -> Dict[str, Any]:
+    def _load_detail_from_bin(self, path: str, is_dir: bool) -> Dict[str, Any]:
         data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
         open_fn = gzip.open if path.endswith(".gz") else open
         with open_fn(path, "rb") as fh:
@@ -463,10 +529,7 @@ class ReportFormatter(BaseFormatter):
                     if len(chunk) < 12:
                         break
                     path_id, used = struct.unpack("<Iq", chunk)
-                    p = ""
-                    if path_dict and 0 <= path_id < len(path_dict):
-                        p = path_dict[path_id]
-                    data.setdefault("dirs", []).append({"path": p, "used": int(used)})
+                    data.setdefault("dirs", []).append({"gid": int(path_id), "used": int(used)})
             else:
                 while True:
                     base = fh.read(14)
@@ -478,11 +541,8 @@ class ReportFormatter(BaseFormatter):
                     ext_raw = fh.read(ext_len)
                     if len(ext_raw) < ext_len:
                         break
-                    p = ""
-                    if path_dict and 0 <= path_id < len(path_dict):
-                        p = path_dict[path_id]
                     data.setdefault("files", []).append({
-                        "path": p,
+                        "gid": int(path_id),
                         "size": int(size),
                         "ext": ext_raw.decode("utf-8", errors="ignore"),
                     })

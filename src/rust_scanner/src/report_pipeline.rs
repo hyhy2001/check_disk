@@ -305,6 +305,9 @@ fn write_text_outputs(
             "total_files": total_files_u64,
             "total_size": total_size
         },
+        "path_dict": "api/path_dict.ndjson",
+        "path_dict_seek": "api/path_dict.seek",
+        "path_dict_seek_record_size": 16,
         "users": users_for_root
     });
     fs::write(
@@ -331,13 +334,39 @@ fn write_text_outputs(
         512 * 1024,
         fs::File::create(&path_dict_path).map_err(|e| e.to_string())?,
     );
+    let mut seek_records: Vec<(u32, u64, u32)> = Vec::with_capacity(global_paths.len());
+    let mut ndjson_offset: u64 = 0;
     for (gid, path) in global_paths.iter().enumerate() {
-        serde_json::to_writer(&mut path_dict_writer, &json!({"gid": gid as u32, "p": path}))
-            .map_err(|e| e.to_string())?;
-        path_dict_writer.write_all(b"\n").map_err(|e| e.to_string())?;
+        let row_bytes = {
+            let mut buf = Vec::new();
+            serde_json::to_writer(&mut buf, &json!({"gid": gid as u32, "p": path}))
+                .map_err(|e| e.to_string())?;
+            buf.push(b'\n');
+            buf
+        };
+        let row_len = row_bytes.len() as u32;
+        seek_records.push((gid as u32, ndjson_offset, row_len));
+        ndjson_offset += row_len as u64;
+        path_dict_writer.write_all(&row_bytes).map_err(|e| e.to_string())?;
     }
     path_dict_writer.flush().map_err(|e| e.to_string())?;
 
+    let seek_path = detail_root.join("api/path_dict.seek");
+    let mut seek_writer = BufWriter::with_capacity(
+        512 * 1024,
+        fs::File::create(&seek_path).map_err(|e| e.to_string())?,
+    );
+    seek_writer.write_all(b"PDX1").map_err(|e| e.to_string())?;
+    seek_writer.write_all(&1u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    seek_writer
+        .write_all(&(seek_records.len() as u32).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    for (gid, off, len) in &seek_records {
+        seek_writer.write_all(&gid.to_le_bytes()).map_err(|e| e.to_string())?;
+        seek_writer.write_all(&off.to_le_bytes()).map_err(|e| e.to_string())?;
+        seek_writer.write_all(&len.to_le_bytes()).map_err(|e| e.to_string())?;
+    }
+    seek_writer.flush().map_err(|e| e.to_string())?;
 
     Ok(())
 }

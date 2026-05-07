@@ -45,6 +45,7 @@ typedef struct {
     char *id;
     uint32_t gid;
     int has_gid;
+    char *pid;
     char *name;
     char *owner;
     char *path;
@@ -65,7 +66,7 @@ static int g_treemap_paths_loaded = 0;
 
 static const char *treemap_row_path(const treemap_row *r);
 static void clear_global_paths(void);
-static int load_treemap_path_dict(const char *data_dir);
+static int load_treemap_path_dict_seek(const char *data_dir);
 static int load_detail_path_dict(const char *detail_root);
 static void clear_treemap_runtime_state(void);
 
@@ -81,7 +82,7 @@ static char *parent_path_dup(const char *path);
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s <detail_users|detail_users/index>\n"
-            "  [--kw a,b] [--ext .txt,.log] [--user u1,u2]\n"
+            "  [--kw a,b] [--ext .txt,.log] [--user u1,u2] [--type dir|file]\n"
             "  [--min n] [--max n] [--limit n] [--offset n] [--page n]\n"
             "  [--sort size_asc|size_desc|path_asc]\n"
             "  [--json] [--docs] [--fields doc_id,gid,path,user,...] [--stats]\n",
@@ -249,9 +250,22 @@ static int is_text_layout(const char *detail_root) {
 
 static int is_treemap_layout(const char *detail_root) {
     char *manifest = build_path2(detail_root, "manifest.json");
-    if (!manifest) return 0;
-    char *buf = read_file_all(manifest);
-    free(manifest);
+    if (manifest) {
+        char *buf = read_file_all(manifest);
+        free(manifest);
+        if (buf) {
+            int ok = strstr(buf, "check-disk-detail-treemap") != NULL;
+            free(buf);
+            if (ok) return 1;
+        }
+    }
+    /* Fallback: check tree_map_data/manifest.json alongside current root */
+    size_t tm_n = strlen(detail_root) + strlen("/tree_map_data/manifest.json") + 1;
+    char *tm_manifest = (char *)malloc(tm_n);
+    if (!tm_manifest) return 0;
+    snprintf(tm_manifest, tm_n, "%s/tree_map_data/manifest.json", detail_root);
+    char *buf = read_file_all(tm_manifest);
+    free(tm_manifest);
     if (!buf) return 0;
     int ok = strstr(buf, "check-disk-detail-treemap") != NULL;
     free(buf);
@@ -637,11 +651,88 @@ static void clear_treemap_runtime_state(void) {
 static const char *treemap_row_path(const treemap_row *r) {
     if (!r) return NULL;
     if (r->has_gid && g_treemap_paths_loaded && r->gid < g_paths_n && g_paths[r->gid]) return g_paths[r->gid];
-    return r->path;
+    if (r->path && *r->path) return r->path;
+    return NULL;
 }
 
 
+static int load_treemap_path_dict_seek(const char *data_dir) {
+    char *seek_path = build_path2(data_dir, "api/path_dict.seek");
+    if (!seek_path) return 0;
+    FILE *sf = fopen(seek_path, "rb");
+    free(seek_path);
+    if (!sf) return 0;
+
+    char magic[4];
+    if (fread(magic, 1, 4, sf) != 4 || memcmp(magic, "PDX1", 4) != 0) {
+        fclose(sf);
+        return 0;
+    }
+
+    uint32_t version = 0;
+    uint32_t count = 0;
+    if (fread(&version, sizeof(uint32_t), 1, sf) != 1 || fread(&count, sizeof(uint32_t), 1, sf) != 1) {
+        fclose(sf);
+        return 0;
+    }
+    if (version != 1) {
+        fclose(sf);
+        return 0;
+    }
+
+    char *dict_path = build_path2(data_dir, "api/path_dict.ndjson");
+    if (!dict_path) {
+        fclose(sf);
+        return 0;
+    }
+    FILE *df = fopen(dict_path, "rb");
+    free(dict_path);
+    if (!df) {
+        fclose(sf);
+        return 0;
+    }
+
+    clear_global_paths();
+
+    int loaded = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t gid = 0;
+        uint64_t off = 0;
+        uint32_t len = 0;
+        if (fread(&gid, sizeof(uint32_t), 1, sf) != 1 ||
+            fread(&off, sizeof(uint64_t), 1, sf) != 1 ||
+            fread(&len, sizeof(uint32_t), 1, sf) != 1) {
+            break;
+        }
+        if (len == 0 || len > (16U * 1024U * 1024U)) continue;
+        if (!ensure_str_slot(&g_paths, &g_paths_n, gid)) continue;
+
+        if (fseeko(df, (off_t)off, SEEK_SET) != 0) continue;
+        char *line = (char *)malloc((size_t)len + 1);
+        if (!line) continue;
+        size_t got = fread(line, 1, (size_t)len, df);
+        if (got == 0) { free(line); continue; }
+        line[got] = '\0';
+        while (got > 0 && (line[got - 1] == '\n' || line[got - 1] == '\r')) line[--got] = '\0';
+
+        char *path = json_get_str(line, "p");
+        free(line);
+        if (!path) continue;
+
+        free(g_paths[gid]);
+        g_paths[gid] = path;
+        loaded++;
+    }
+
+    fclose(df);
+    fclose(sf);
+    g_treemap_paths_loaded = loaded > 0;
+    return loaded > 0;
+}
+
 static int load_treemap_path_dict(const char *data_dir) {
+    if (load_treemap_path_dict_seek(data_dir)) return 1;
+
     char *dict_path = build_path2(data_dir, "api/path_dict.ndjson");
     if (!dict_path) return 0;
     FILE *f = fopen(dict_path, "r");
@@ -677,10 +768,65 @@ static int load_treemap_path_dict(const char *data_dir) {
 
 
 static int load_detail_path_dict(const char *detail_root) {
-    char *dict_path = build_path2(detail_root, "api/path_dict.ndjson");
-    if (!dict_path) return 0;
-    FILE *f = fopen(dict_path, "r");
-    free(dict_path);
+    char seek_path[4096], ndjson_path[4096];
+    snprintf(seek_path, sizeof(seek_path), "%s/api/path_dict.seek", detail_root);
+    snprintf(ndjson_path, sizeof(ndjson_path), "%s/api/path_dict.ndjson", detail_root);
+
+    FILE *sf = fopen(seek_path, "rb");
+    FILE *df = fopen(ndjson_path, "rb");
+    if (sf && df) {
+        char magic[4];
+        uint32_t version, count;
+        if (fread(magic, 1, 4, sf) == 4 && memcmp(magic, "PDX1", 4) == 0 &&
+            fread(&version, 4, 1, sf) == 1 && version == 1 &&
+            fread(&count, 4, 1, sf) == 1 && count > 0) {
+
+            clear_global_paths();
+            g_paths = (char **)calloc(count, sizeof(char *));
+            if (!g_paths) {
+                fclose(sf);
+                fclose(df);
+                return 0;
+            }
+            g_paths_n = count;
+
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t gid;
+                uint64_t offset;
+                uint32_t len;
+                if (fread(&gid, 4, 1, sf) != 1 ||
+                    fread(&offset, 8, 1, sf) != 1 ||
+                    fread(&len, 4, 1, sf) != 1) {
+                    break;
+                }
+
+                if (gid >= count) continue;
+                if (fseeko(df, (off_t)offset, SEEK_SET) != 0) continue;
+
+                char *line = (char *)malloc((size_t)len + 1);
+                if (!line) continue;
+                if (fread(line, 1, (size_t)len, df) != len) {
+                    free(line);
+                    continue;
+                }
+                line[len] = '\0';
+
+                char *path = json_get_str(line, "p");
+                if (path) {
+                    free(g_paths[gid]);
+                    g_paths[gid] = path;
+                }
+                free(line);
+            }
+            fclose(sf);
+            fclose(df);
+            return 1;
+        }
+    }
+    if (sf) fclose(sf);
+    if (df) fclose(df);
+
+    FILE *f = fopen(ndjson_path, "r");
     if (!f) return 0;
 
     clear_global_paths();
@@ -802,6 +948,7 @@ static void free_treemap_rows(treemap_rows *lst) {
         free(lst->items[i].id);
         free(lst->items[i].name);
         free(lst->items[i].owner);
+        free(lst->items[i].pid);
         free(lst->items[i].path);
         free(lst->items[i].type);
     }
@@ -848,6 +995,7 @@ static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
             else { r.gid = 0; r.has_gid = 0; }
             r.name = json_get_str(line, "n");
             r.owner = json_get_str(line, "o");
+            r.pid = json_get_str(line, "pid");
             r.path = json_get_str(line, "p");
             r.type = json_get_str(line, "t");
             if (!json_get_u64(line, "v", &r.value)) r.value = 0;
@@ -855,10 +1003,10 @@ static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
 
             if ((r.path || r.has_gid) && r.name) {
                 if (!treemap_rows_push(rows, &r)) {
-                    free(r.id); free(r.name); free(r.owner); free(r.path); free(r.type);
+                    free(r.id); free(r.name); free(r.owner); free(r.pid); free(r.path); free(r.type);
                 }
             } else {
-                free(r.id); free(r.name); free(r.owner); free(r.path); free(r.type);
+                free(r.id); free(r.name); free(r.owner); free(r.pid); free(r.path); free(r.type);
             }
         }
         free(line);
@@ -872,32 +1020,45 @@ static int load_treemap_shards_dir(const char *data_dir, treemap_rows *rows) {
 static int load_treemap_rows(const char *detail_root, treemap_rows *rows) {
     clear_treemap_runtime_state();
     memset(rows, 0, sizeof(*rows));
+
+    char *tree_map_data = NULL;
     char *manifest = build_path2(detail_root, "manifest.json");
-    if (!manifest) return 0;
-    char *buf = read_file_all(manifest);
-    free(manifest);
-    if (!buf) return 0;
+    char *buf = manifest ? read_file_all(manifest) : NULL;
+    if (manifest) free(manifest);
 
-    int is_treemap = strstr(buf, "check-disk-detail-treemap") != NULL;
-    free(buf);
-    if (!is_treemap) return 0;
+    if (buf && strstr(buf, "check-disk-detail-treemap") != NULL) {
+        const char *slash = strrchr(detail_root, '/');
+        if (!slash || slash == detail_root) {
+            free(buf);
+            return 0;
+        }
+        size_t parent_n = (size_t)(slash - detail_root);
+        char *parent = (char *)malloc(parent_n + 1);
+        if (!parent) {
+            free(buf);
+            return 0;
+        }
+        memcpy(parent, detail_root, parent_n);
+        parent[parent_n] = '\0';
 
-    const char *slash = strrchr(detail_root, '/');
-    if (!slash || slash == detail_root) return 0;
-    size_t parent_n = (size_t)(slash - detail_root);
-    char *parent = (char *)malloc(parent_n + 1);
-    if (!parent) return 0;
-    memcpy(parent, detail_root, parent_n);
-    parent[parent_n] = '\0';
-
-    size_t tm_n = strlen(parent) + strlen("/tree_map_data") + 1;
-    char *tree_map_data = (char *)malloc(tm_n);
-    if (!tree_map_data) {
+        size_t tm_n = strlen(parent) + strlen("/tree_map_data") + 1;
+        tree_map_data = (char *)malloc(tm_n);
+        if (!tree_map_data) {
+            free(parent);
+            free(buf);
+            return 0;
+        }
+        snprintf(tree_map_data, tm_n, "%s/tree_map_data", parent);
         free(parent);
-        return 0;
     }
-    snprintf(tree_map_data, tm_n, "%s/tree_map_data", parent);
-    free(parent);
+    free(buf);
+
+    if (!tree_map_data) {
+        size_t tm_n = strlen(detail_root) + strlen("/tree_map_data") + 1;
+        tree_map_data = (char *)malloc(tm_n);
+        if (!tree_map_data) return 0;
+        snprintf(tree_map_data, tm_n, "%s/tree_map_data", detail_root);
+    }
 
     int ok = load_treemap_shards_dir(tree_map_data, rows);
     if (!ok) {
@@ -1006,6 +1167,7 @@ int main(int argc, char **argv) {
 
     const char *input = argv[1];
     const char *kw_csv = NULL, *ext_csv = NULL, *user_csv = NULL;
+    const char *type_filter = NULL;
     uint64_t size_min = 0, size_max = 0;
     int has_min = 0, has_max = 0;
     size_t limit = 0, offset = 0;
@@ -1018,6 +1180,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--kw") == 0 && i + 1 < argc) kw_csv = argv[++i];
         else if (strcmp(argv[i], "--ext") == 0 && i + 1 < argc) ext_csv = argv[++i];
         else if (strcmp(argv[i], "--user") == 0 && i + 1 < argc) user_csv = argv[++i];
+        else if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) type_filter = argv[++i];
         else if (strcmp(argv[i], "--min") == 0 && i + 1 < argc) {
             size_min = strtoull(argv[++i], NULL, 10);
             has_min = 1;
@@ -1044,6 +1207,11 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 2;
         }
+    }
+
+    if (type_filter && strcmp(type_filter, "dir") != 0 && strcmp(type_filter, "file") != 0) {
+        usage(argv[0]);
+        return 2;
     }
 
     if (page_num > 0) {
@@ -1083,6 +1251,8 @@ int main(int argc, char **argv) {
             const char *resolved_path = treemap_row_path(r);
             if (!resolved_path) continue;
 
+            if ((r->type && strcmp(r->type, "g") == 0) || (r->name && strcmp(r->name, "[files]") == 0) || strstr(resolved_path, "__files__") != NULL) continue;
+
             if (has_min && r->value < size_min) continue;
             if (has_max && r->value > size_max) continue;
             if (!kw_match_any(resolved_path, &kw_raw) && !kw_match_any(r->name ? r->name : "", &kw_raw)) continue;
@@ -1108,7 +1278,7 @@ int main(int argc, char **argv) {
                 g_paths[gid] = dupstr(resolved_path);
                 if (!g_paths[gid]) continue;
             }
-            append_filter_doc(&docs, (uint32_t)docs.count, gid, 0, 0, r->value);
+            append_filter_doc(&docs, (uint32_t)i, gid, 0, 0, r->value);
         }
 
         if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_asc);
@@ -1117,35 +1287,53 @@ int main(int argc, char **argv) {
 
         size_t matched = docs.count;
         size_t start = (offset < matched) ? offset : matched;
-        size_t remain = (start < matched) ? (matched - start) : 0;
-        size_t emit = (remain > limit) ? limit : remain;
+        size_t emit = 0;
+        for (size_t i = start; i < matched && emit < limit; i++) {
+            uint32_t did = docs.items[i].doc_id;
+            treemap_row *r = (did < rows.count) ? &rows.items[did] : NULL;
+            const char *resolved_path = treemap_row_path(r);
+            if ((r && r->type && strcmp(r->type, "g") == 0) || (r && r->name && strcmp(r->name, "[files]") == 0) || (resolved_path && strstr(resolved_path, "__files__") != NULL)) continue;
+            emit++;
+        }
 
         if (output_json) {
             size_t total_pages = (matched + limit > 0) ? ((matched + limit - 1) / limit) : 1;
             printf("{\"matched\":%zu,\"returned\":%zu,\"page\":%zu,\"page_size\":%zu,\"total_pages\":%zu,\"doc_ids\":[",
                    matched, emit, page_num, limit, total_pages);
-            for (size_t i = 0; i < emit; i++) {
-                if (i) putchar(',');
-                printf("%u", docs.items[start + i].doc_id);
+            size_t emitted = 0;
+            for (size_t i = start; i < matched && emitted < emit; i++) {
+                uint32_t did = docs.items[i].doc_id;
+                treemap_row *r = (did < rows.count) ? &rows.items[did] : NULL;
+                const char *resolved_path = treemap_row_path(r);
+                if ((r && r->type && strcmp(r->type, "g") == 0) || (r && r->name && strcmp(r->name, "[files]") == 0) || (resolved_path && strstr(resolved_path, "__files__") != NULL)) continue;
+                if (emitted) putchar(',');
+                printf("%u", docs.items[i].doc_id);
+                emitted++;
             }
             putchar(']');
             if (output_docs && emit > 0) {
                 printf(",\"docs\":[");
-                for (size_t i = 0; i < emit; i++) {
-                    if (i) putchar(',');
-                    uint32_t did = docs.items[start + i].doc_id;
+                emitted = 0;
+                for (size_t i = start; i < matched && emitted < emit; i++) {
+                    uint32_t did = docs.items[i].doc_id;
                     treemap_row *r = (did < rows.count) ? &rows.items[did] : NULL;
                     const char *resolved_path = treemap_row_path(r);
-                    printf("{\"doc_id\":%u,\"path\":", docs.items[start + i].doc_id);
+                    if ((r && r->type && strcmp(r->type, "g") == 0) || (r && r->name && strcmp(r->name, "[files]") == 0) || (resolved_path && strstr(resolved_path, "__files__") != NULL)) continue;
+                    if (emitted) putchar(',');
+                    printf("{\"doc_id\":%u,\"path\":", docs.items[i].doc_id);
                     if (resolved_path) print_json_escaped(resolved_path); else printf("null");
-                    printf(",\"size\":%llu,\"user\":", (unsigned long long)docs.items[start + i].size);
+                    printf(",\"size\":%llu,\"user\":", (unsigned long long)docs.items[i].size);
                     if (r && r->owner) print_json_escaped(r->owner); else printf("null");
                     printf(",\"name\":");
                     if (r && r->name) print_json_escaped(r->name); else printf("null");
                     printf(",\"type\":");
                     if (r && r->type) print_json_escaped(r->type); else printf("null");
+                    printf(",\"shard_id\":");
+                    if (r && r->id) print_json_escaped(r->id); else printf("null");
                     printf(",\"parent_path\":");
-                    if (resolved_path) {
+                    if (r && r->pid && *r->pid) {
+                        print_json_escaped(r->pid);
+                    } else if (resolved_path) {
                         char *pp = parent_path_dup(resolved_path);
                         if (pp) {
                             print_json_escaped(pp);
@@ -1157,6 +1345,7 @@ int main(int argc, char **argv) {
                         printf("null");
                     }
                     printf(",\"has_children\":%s}", (r && r->has_children) ? "true" : "false");
+                    emitted++;
                 }
                 putchar(']');
             }
@@ -1293,11 +1482,52 @@ int main(int argc, char **argv) {
         if (user_dir) {
             snprintf(user_dir, user_dir_n, "%s/users/%s", detail_root, user_safedir);
 
-            char **file_parts = NULL;
-            size_t file_parts_n = 0;
-            if (load_user_file_parts(user_dir, &file_parts, &file_parts_n)) {
-                for (size_t pi = 0; pi < file_parts_n; pi++) {
-                    char *part_rel = file_parts[pi];
+            char **parts = NULL;
+            size_t parts_n = 0;
+            int loaded_parts = 0;
+            if (type_filter && strcmp(type_filter, "dir") == 0) {
+                char *manifest_path = build_path2(user_dir, "manifest.json");
+                char *buf = manifest_path ? read_file_all(manifest_path) : NULL;
+                if (manifest_path) free(manifest_path);
+                if (buf) {
+                    char *dirs_sec = strstr(buf, "\"dirs\"");
+                    char *parts_sec = dirs_sec ? strstr(dirs_sec, "\"parts\"") : NULL;
+                    char *arr = parts_sec ? strchr(parts_sec, '[') : NULL;
+                    char *arr_end = arr ? strchr(arr, ']') : NULL;
+                    if (arr && arr_end) {
+                        size_t cap = 4;
+                        parts = (char **)calloc(cap, sizeof(char *));
+                        if (parts) {
+                            const char *p = arr;
+                            while ((p = strstr(p, "\"path\"")) && p < arr_end) {
+                                char *path = json_get_str(p, "path");
+                                if (!path) { p += 6; continue; }
+                                if (parts_n == cap) {
+                                    cap *= 2;
+                                    char **next = (char **)realloc(parts, cap * sizeof(char *));
+                                    if (!next) {
+                                        free(path);
+                                        free_str_arr(parts, parts_n);
+                                        parts = NULL;
+                                        parts_n = 0;
+                                        break;
+                                    }
+                                    parts = next;
+                                }
+                                parts[parts_n++] = path;
+                                p += 6;
+                            }
+                            loaded_parts = 1;
+                        }
+                    }
+                    free(buf);
+                }
+            } else {
+                loaded_parts = load_user_file_parts(user_dir, &parts, &parts_n);
+            }
+            if (loaded_parts) {
+                for (size_t pi = 0; pi < parts_n; pi++) {
+                    char *part_rel = parts[pi];
                     if (!part_rel) continue;
 
                     size_t part_path_n = strlen(user_dir) + 1 + strlen(part_rel) + 1;
@@ -1315,7 +1545,6 @@ int main(int argc, char **argv) {
                         if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
                         if (!*line) continue;
 
-                        /* New per-user format: {"p":"<path>","s":<bytes>,"x":"<ext>"} */
                         uint64_t size = 0;
                         if (!json_get_u64(line, "s", &size)) continue;
 
@@ -1324,6 +1553,7 @@ int main(int argc, char **argv) {
 
                         uint32_t gid = 0;
                         int has_gid = json_get_u32(line, "gid", &gid);
+                        if (!has_gid && json_get_u32(line, "d", &gid)) has_gid = 1;
 
                         char *path_owned = NULL;
                         const char *path_view = NULL;
@@ -1331,6 +1561,7 @@ int main(int argc, char **argv) {
                             path_view = g_paths[gid];
                         } else {
                             path_owned = json_get_str(line, "p");
+                            if (!path_owned) path_owned = json_get_str(line, "n");
                             if (!path_owned) continue;
                             path_view = path_owned;
                             has_gid = 0;
@@ -1341,7 +1572,7 @@ int main(int argc, char **argv) {
                         uint32_t eid = 0;
                         char *ext_str = NULL;
                         char *ext_norm = NULL;
-                        if (ext_n > 0 || output_docs) {
+                        if (!(type_filter && strcmp(type_filter, "dir") == 0) && (ext_n > 0 || output_docs)) {
                             ext_str = json_get_str(line, "x");
                             ext_norm = ext_str ? norm_lower_token(ext_str, 1) : NULL;
                             if (ext_norm) {
@@ -1358,7 +1589,7 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
-                        if (!pass_id_filter(eid, ext_ids, ext_n)) {
+                        if (!(type_filter && strcmp(type_filter, "dir") == 0) && !pass_id_filter(eid, ext_ids, ext_n)) {
                             free(ext_norm); free(path_owned); free(ext_str); continue;
                         }
 
@@ -1386,8 +1617,8 @@ int main(int argc, char **argv) {
                     free(part_path);
                 }
             }
-            free_str_arr(file_parts, file_parts_n);
-            file_parts = NULL;
+            free_str_arr(parts, parts_n);
+            parts = NULL;
             free(user_dir);
         }
         free(user_safedir);
