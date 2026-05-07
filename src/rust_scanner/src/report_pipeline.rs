@@ -803,9 +803,10 @@ pub fn build_pipeline_dbs_impl(
             done_users += 1;
             if done_users % 10 == 0 || done_users == total_users {
                 let pct = (done_users as f64 / total_users as f64) * 100.0;
+                let rss_mb = crate::pipe_types::get_rss_mb();
                 println!(
-                    "[Phase 2] Detail reports: {}/{} users ({:.1}%)",
-                    done_users, total_users, pct
+                    "[Phase 2] Detail reports: {}/{} users ({:.1}%) | RSS: {:.1} MB",
+                    done_users, total_users, pct, rss_mb
                 );
             }
 
