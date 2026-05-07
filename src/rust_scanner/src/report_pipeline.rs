@@ -905,6 +905,12 @@ pub fn build_pipeline_dbs_impl(
         }
         dir_user_rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
+        // Path lookup maps are no longer needed after ID assignment.
+        drop(global_path_to_id);
+        drop(global_parent_path_id);
+        let rss_after_drop = crate::pipe_types::get_rss_mb();
+        println!("[Phase 2] Post-index RSS: {:.1} MB", rss_after_drop);
+
         t_finalize = t4.elapsed().as_secs_f64();
 
         let t5 = Instant::now();
@@ -922,6 +928,9 @@ pub fn build_pipeline_dbs_impl(
             timestamp,
         )
         .map_err(PyRuntimeError::new_err)?;
+        drop(global_paths);
+        let rss_after_text = crate::pipe_types::get_rss_mb();
+        println!("[Phase 2] Post-text RSS: {:.1} MB", rss_after_text);
         t_text_write = t5.elapsed().as_secs_f64();
 
         let t7 = Instant::now();
