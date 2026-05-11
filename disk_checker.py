@@ -437,11 +437,13 @@ def main():
                 heartbeat.set_phase("sync", "Syncing reports to remote server")
                 print("[SYNC] Waiting for async pipeline to complete...")
                 sync_pipeline.wait()
-                sync_pipeline.close()
                 print("[SYNC] Async pipeline done")
 
             heartbeat.stop()
             _update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
+            if sync_pipeline:
+                sync_pipeline.wait()
+                sync_pipeline.close()
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             if main_report_path:
                 print(f"Summary report: {main_report_path}")
