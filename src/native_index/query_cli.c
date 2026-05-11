@@ -74,6 +74,7 @@ static char *json_get_str(const char *line, const char *key);
 static void free_str_arr(char **arr, size_t count);
 static int doc_list_push(doc_list *lst, const doc_ref *d);
 static int json_get_bool(const char *line, const char *key, int *out);
+static int json_get_u64(const char *line, const char *key, uint64_t *out);
 static int treemap_rows_push(treemap_rows *lst, const treemap_row *r);
 static void free_treemap_rows(treemap_rows *lst);
 static int load_treemap_rows(const char *detail_root, treemap_rows *rows);
@@ -380,6 +381,80 @@ static int load_user_file_parts(const char *user_dir, char ***parts_out, size_t 
     }
     *parts_out = parts;
     free(buf);
+    return 1;
+}
+
+static int read_user_file_page_index(const char *user_dir, size_t *page_size_out, size_t *total_files_out, int *sorted_size_desc_out) {
+    if (!page_size_out || !total_files_out || !sorted_size_desc_out) return 0;
+    *page_size_out = 0;
+    *total_files_out = 0;
+    *sorted_size_desc_out = 0;
+
+    char *page_index_path = build_path2(user_dir, "page_index.json");
+    if (!page_index_path) return 0;
+    char *buf = read_file_all(page_index_path);
+    free(page_index_path);
+    if (!buf) return 0;
+
+    uint64_t page_size = 0;
+    if (!json_get_u64(buf, "page_size", &page_size) || page_size == 0) {
+        free(buf);
+        return 0;
+    }
+
+    char *files_sec = strstr(buf, "\"files\"");
+    if (!files_sec) {
+        free(buf);
+        return 0;
+    }
+
+    uint64_t total_full = 0;
+    if (!json_get_u64(files_sec, "total_full", &total_full)) {
+        free(buf);
+        return 0;
+    }
+
+    if (strstr(files_sec, "\"sorted\"") && strstr(files_sec, "\"size_desc\"")) {
+        *sorted_size_desc_out = 1;
+    }
+
+    *page_size_out = (size_t)page_size;
+    *total_files_out = (size_t)total_full;
+    free(buf);
+    return 1;
+}
+
+static int load_user_file_parts_range(const char *user_dir, size_t start_part, size_t end_part, char ***parts_out, size_t *parts_n) {
+    *parts_out = NULL;
+    *parts_n = 0;
+    char **all_parts = NULL;
+    size_t all_n = 0;
+    if (!load_user_file_parts(user_dir, &all_parts, &all_n)) return 0;
+    if (start_part >= end_part || start_part >= all_n) {
+        free_str_arr(all_parts, all_n);
+        return 1;
+    }
+    if (end_part > all_n) end_part = all_n;
+
+    size_t n = end_part - start_part;
+    char **out = (char **)calloc(n, sizeof(char *));
+    if (!out) {
+        free_str_arr(all_parts, all_n);
+        return 0;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        out[i] = dupstr(all_parts[start_part + i]);
+        if (!out[i]) {
+            free_str_arr(out, i);
+            free_str_arr(all_parts, all_n);
+            return 0;
+        }
+    }
+
+    *parts_out = out;
+    *parts_n = n;
+    free_str_arr(all_parts, all_n);
     return 1;
 }
 
@@ -1459,6 +1534,9 @@ int main(int argc, char **argv) {
     }
     uint32_t seq_doc_id = 0;
     size_t scanned = 0;
+    size_t matched_override = 0;
+    int has_matched_override = 0;
+    int is_presorted_size_desc = 0;
 
     /* Iterate every user, read their file parts */
     for (size_t ui = 0; ui < g_users_n; ui++) {
@@ -1481,7 +1559,30 @@ int main(int argc, char **argv) {
             char **parts = NULL;
             size_t parts_n = 0;
             int loaded_parts = 0;
-            if (type_filter && strcmp(type_filter, "dir") == 0) {
+            int pre_sorted_output = 0;
+
+            /* Fast path: single user, files, no filters, size_desc sort → sorted page index */
+            if (user_n == 1 && !(type_filter && strcmp(type_filter, "dir") == 0) &&
+                kw_raw.count == 0 && ext_n == 0 && !has_min && !has_max &&
+                sort_mode == SORT_SIZE_DESC) {
+
+                size_t page_size = 0, total_files = 0;
+                int sorted_ok = 0;
+                if (read_user_file_page_index(user_dir, &page_size, &total_files, &sorted_ok) && sorted_ok && page_size > 0) {
+                    size_t start_part = offset / page_size;
+                    size_t end_part = (offset + limit + page_size - 1) / page_size;
+                    if (load_user_file_parts_range(user_dir, start_part, end_part, &parts, &parts_n)) {
+                        matched_override = total_files;
+                        has_matched_override = 1;
+                        offset = offset - start_part * page_size;
+                        pre_sorted_output = 1;
+                        loaded_parts = 1;
+                    }
+                }
+            }
+
+            if (!loaded_parts) {
+                if (type_filter && strcmp(type_filter, "dir") == 0) {
                 char *manifest_path = build_path2(user_dir, "manifest.json");
                 char *buf = manifest_path ? read_file_all(manifest_path) : NULL;
                 if (manifest_path) free(manifest_path);
@@ -1521,6 +1622,8 @@ int main(int argc, char **argv) {
             } else {
                 loaded_parts = load_user_file_parts(user_dir, &parts, &parts_n);
             }
+            }
+            if (pre_sorted_output) is_presorted_size_desc = 1;
             if (loaded_parts) {
                 /* Pre-allocate line buffer once per user (avoids repeated realloc) */
                 char *line = NULL;
@@ -1626,14 +1729,17 @@ int main(int argc, char **argv) {
     /* g_paths/g_paths_n now hold inline per-doc paths for output/sorting */
 
     /* sort - partial sort when limit << matched to reduce O(n log n) to O(k log k) */
-    size_t matched = docs.count;
+    /* skip sort entirely when fast path guarantees pre-sorted output */
+    size_t matched = has_matched_override ? matched_override : docs.count;
     size_t needed = offset + limit;
-    size_t sort_count = (limit > 0 && needed < matched) ? needed : matched;
+    size_t sort_count = (limit > 0 && needed < docs.count) ? needed : docs.count;
 
-    if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_size_asc);
-    else if (sort_mode == SORT_SIZE_DESC) qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_size_desc);
-    else if (sort_mode == SORT_PATH_ASC) {
-        qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_path_asc);
+    if (!is_presorted_size_desc) {
+        if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_size_asc);
+        else if (sort_mode == SORT_SIZE_DESC) qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_size_desc);
+        else if (sort_mode == SORT_PATH_ASC) {
+            qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_path_asc);
+        }
     }
 
     size_t start = (offset < matched) ? offset : matched;

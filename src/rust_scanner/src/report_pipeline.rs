@@ -163,6 +163,7 @@ struct UserFileArtifacts {
     file_parts: Vec<serde_json::Value>,
     ext_rows: Vec<serde_json::Value>,
     total_files: usize,
+    files_sorted_by: String,
 }
 
 fn write_text_outputs(
@@ -212,6 +213,9 @@ fn write_text_outputs(
             .map(|a| a.file_parts.clone())
             .unwrap_or_default();
         let file_total = file_artifacts.map(|a| a.total_files).unwrap_or(0);
+        let file_sorted_by = file_artifacts
+            .map(|a| a.files_sorted_by.clone())
+            .unwrap_or_else(|| "size_desc".to_string());
         let ext_rows = file_artifacts
             .map(|a| a.ext_rows.clone())
             .unwrap_or_default();
@@ -252,7 +256,10 @@ fn write_text_outputs(
             },
             "files": {
                 "pages": file_parts.len(),
-                "total_full": file_total
+                "total_full": file_total,
+                "sorted": {
+                    "by": file_sorted_by
+                }
             },
             "page_size": FILE_PART_RECORDS
         });
@@ -678,8 +685,7 @@ pub fn build_pipeline_dbs_impl(
 
             let mut ext_map: HashMap<String, (u64, u64)> = HashMap::new();
             let mut file_parts: Vec<serde_json::Value> = Vec::new();
-            let mut part_writer: Option<BufWriter<fs::File>> = None;
-            let mut part_records: usize = 0;
+            let mut sorted_file_rows: Vec<(u32, u64, String)> = Vec::new();
             let mut part_index: usize = 0;
             let mut total_user_files: usize = 0;
 
@@ -725,17 +731,6 @@ pub fn build_pipeline_dbs_impl(
                     let safe_path = String::from_utf8_lossy(&path_bytes).to_string();
                     let ext = String::from_utf8_lossy(&ext_bytes).to_string();
 
-                    if part_writer.is_none() {
-                        let chunk_dir = user_dir.join("files").join(format!("chunk-{:05}", part_index));
-                        fs::create_dir_all(&chunk_dir)
-                            .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", chunk_dir.display(), e)))?;
-                        let part_path = chunk_dir.join("part-00000_files.ndjson");
-                        let file = fs::File::create(&part_path)
-                            .map_err(|e| PyRuntimeError::new_err(format!("create {}: {}", part_path.display(), e)))?;
-                        part_writer = Some(BufWriter::with_capacity(512 * 1024, file));
-                        part_records = 0;
-                    }
-
                     let path_id = ensure_path_id(
                         &safe_path,
                         &mut global_path_to_id,
@@ -747,11 +742,7 @@ pub fn build_pipeline_dbs_impl(
                     )
                     .map_err(PyRuntimeError::new_err)? as u32;
 
-                    if let Some(writer) = part_writer.as_mut() {
-                        serde_json::to_writer(&mut *writer, &json!({"gid": path_id, "s": size, "x": ext}))
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        writer.write_all(b"\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    }
+                    sorted_file_rows.push((path_id, size, ext.clone()));
 
                     let entry = ext_map.entry(ext).or_insert((0, 0));
                     entry.0 += 1;
@@ -759,19 +750,44 @@ pub fn build_pipeline_dbs_impl(
                     total_docs += 1;
                     total_size += size;
                     total_user_files += 1;
-                    part_records += 1;
+                }
+            }
 
-                    if part_records >= FILE_PART_RECORDS {
-                        if let Some(mut writer) = part_writer.take() {
-                            writer.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        }
-                        file_parts.push(json!({
-                            "path": format!("files/chunk-{:05}/part-00000_files.ndjson", part_index),
-                            "records": part_records
-                        }));
-                        part_index += 1;
-                        part_records = 0;
+            // Sort all file rows by size DESC for this user
+            sorted_file_rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+            // Write sorted chunks
+            let mut part_writer: Option<BufWriter<fs::File>> = None;
+            let mut part_records: usize = 0;
+            for (path_id, size, ext) in &sorted_file_rows {
+                if part_writer.is_none() {
+                    let chunk_dir = user_dir.join("files").join(format!("chunk-{:05}", part_index));
+                    fs::create_dir_all(&chunk_dir)
+                        .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", chunk_dir.display(), e)))?;
+                    let part_path = chunk_dir.join("part-00000_files.ndjson");
+                    let file = fs::File::create(&part_path)
+                        .map_err(|e| PyRuntimeError::new_err(format!("create {}: {}", part_path.display(), e)))?;
+                    part_writer = Some(BufWriter::with_capacity(512 * 1024, file));
+                    part_records = 0;
+                }
+
+                if let Some(writer) = part_writer.as_mut() {
+                    serde_json::to_writer(&mut *writer, &json!({"gid": path_id, "s": size, "x": ext}))
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    writer.write_all(b"\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                }
+
+                part_records += 1;
+                if part_records >= FILE_PART_RECORDS {
+                    if let Some(mut writer) = part_writer.take() {
+                        writer.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     }
+                    file_parts.push(json!({
+                        "path": format!("files/chunk-{:05}/part-00000_files.ndjson", part_index),
+                        "records": part_records
+                    }));
+                    part_index += 1;
+                    part_records = 0;
                 }
             }
 
@@ -799,6 +815,7 @@ pub fn build_pipeline_dbs_impl(
                     file_parts,
                     ext_rows,
                     total_files: total_user_files,
+                    files_sorted_by: "size_desc".to_string(),
                 },
             );
 
