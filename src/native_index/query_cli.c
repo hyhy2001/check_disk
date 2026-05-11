@@ -237,16 +237,11 @@ static char *read_file_all(const char *path) {
     return buf;
 }
 
-static int is_text_layout(const char *detail_root) {
-    char *manifest = build_path2(detail_root, "manifest.json");
-    if (!manifest) return 0;
-    char *buf = read_file_all(manifest);
-    free(manifest);
-    if (!buf) return 0;
-    int ok = strstr(buf, "check-disk-detail\"") != NULL;
-    free(buf);
-    return ok;
+static int is_text_layout_buf(const char *manifest_buf) {
+    if (!manifest_buf) return 0;
+    return strstr(manifest_buf, "check-disk-detail\"") != NULL;
 }
+
 
 static int is_treemap_layout(const char *detail_root) {
     char *manifest = build_path2(detail_root, "manifest.json");
@@ -388,21 +383,15 @@ static int load_user_file_parts(const char *user_dir, char ***parts_out, size_t 
     return 1;
 }
 
-static int load_root_users(const char *detail_root, char ***users_out, size_t *users_n) {
+static int load_root_users_from_buf(const char *buf, char ***users_out, size_t *users_n) {
     *users_out = NULL;
     *users_n = 0;
-    char *manifest_path = build_path2(detail_root, "manifest.json");
-    if (!manifest_path) return 0;
-    char *buf = read_file_all(manifest_path);
-    free(manifest_path);
     if (!buf) return 0;
 
     size_t cap = 8;
     char **users = (char **)calloc(cap, sizeof(char *));
-    if (!users) {
-        free(buf);
-        return 0;
-    }
+    if (!users) return 0;
+
     const char *p = buf;
     while ((p = strstr(p, "\"username\"")) != NULL) {
         char *name = json_get_str(p, "username");
@@ -416,7 +405,6 @@ static int load_root_users(const char *detail_root, char ***users_out, size_t *u
             if (!next) {
                 free(name);
                 free_str_arr(users, *users_n);
-                free(buf);
                 return 0;
             }
             users = next;
@@ -426,9 +414,9 @@ static int load_root_users(const char *detail_root, char ***users_out, size_t *u
         p += 10;
     }
     *users_out = users;
-    free(buf);
     return 1;
 }
+
 
 static const char *json_find_key(const char *line, const char *key) {
     char pat[128];
@@ -1362,8 +1350,12 @@ int main(int argc, char **argv) {
                 free(detail_root);
         return 0;
     }
-    if (!is_text_layout(detail_root)) {
+    char *root_manifest_path = build_path2(detail_root, "manifest.json");
+    char *root_manifest_buf = root_manifest_path ? read_file_all(root_manifest_path) : NULL;
+    if (root_manifest_path) free(root_manifest_path);
+    if (!is_text_layout_buf(root_manifest_buf)) {
         fprintf(stderr, "detail layout not found at %s (manifest.json schema check failed)\n", detail_root);
+        free(root_manifest_buf);
         free(detail_root);
         return 1;
     }
@@ -1371,13 +1363,17 @@ int main(int argc, char **argv) {
     /* ── Load user list from root manifest ── */
     char **g_users = NULL;
     size_t g_users_n = 0;
-    if (!load_root_users(detail_root, &g_users, &g_users_n)) {
+    if (!load_root_users_from_buf(root_manifest_buf, &g_users, &g_users_n)) {
         fprintf(stderr, "failed to load user list from manifest\n");
+        free(root_manifest_buf);
         free(detail_root);
         return 1;
     }
+    free(root_manifest_buf);
 
-    (void)load_detail_path_dict(detail_root);
+    if (fields_mask & F_PATH) {
+        (void)load_detail_path_dict(detail_root);
+    }
 
     /* ── Collect all file rows from per-user chunks ── */
     size_t g_exts_cap = 256, g_exts_n = 0;
@@ -1526,6 +1522,10 @@ int main(int argc, char **argv) {
                 loaded_parts = load_user_file_parts(user_dir, &parts, &parts_n);
             }
             if (loaded_parts) {
+                /* Pre-allocate line buffer once per user (avoids repeated realloc) */
+                char *line = NULL;
+                size_t line_cap = 0;
+
                 for (size_t pi = 0; pi < parts_n; pi++) {
                     char *part_rel = parts[pi];
                     if (!part_rel) continue;
@@ -1536,10 +1536,9 @@ int main(int argc, char **argv) {
                     snprintf(part_path, part_path_n, "%s/%s", user_dir, part_rel);
 
                     FILE *pf = fopen(part_path, "r");
-                    if (!pf) { free(part_path); continue; }
+                    free(part_path);
+                    if (!pf) continue;
 
-                    char *line = NULL;
-                    size_t line_cap = 0;
                     ssize_t nread;
                     while ((nread = getline(&line, &line_cap, pf)) > 0) {
                         if (nread > 0 && line[nread - 1] == '\n') line[nread - 1] = '\0';
@@ -1572,7 +1571,8 @@ int main(int argc, char **argv) {
                         uint32_t eid = 0;
                         char *ext_str = NULL;
                         char *ext_norm = NULL;
-                        if (!(type_filter && strcmp(type_filter, "dir") == 0) && (ext_n > 0 || output_docs)) {
+                        int need_ext = (!(type_filter && strcmp(type_filter, "dir") == 0)) && (ext_n > 0 || (fields_mask & F_EXT) || output_docs);
+                        if (need_ext) {
                             ext_str = json_get_str(line, "x");
                             ext_norm = ext_str ? norm_lower_token(ext_str, 1) : NULL;
                             if (ext_norm) {
@@ -1589,7 +1589,7 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
-                        if (!(type_filter && strcmp(type_filter, "dir") == 0) && !pass_id_filter(eid, ext_ids, ext_n)) {
+                        if (need_ext && !pass_id_filter(eid, ext_ids, ext_n)) {
                             free(ext_norm); free(path_owned); free(ext_str); continue;
                         }
 
@@ -1612,10 +1612,9 @@ int main(int argc, char **argv) {
                         append_filter_doc(&docs, seq_doc_id++, gid, uid, eid, size);
                         free(ext_norm); free(ext_str); free(path_owned);
                     }
-                    free(line);
                     fclose(pf);
-                    free(part_path);
                 }
+                free(line);
             }
             free_str_arr(parts, parts_n);
             parts = NULL;
@@ -1626,14 +1625,17 @@ int main(int argc, char **argv) {
 
     /* g_paths/g_paths_n now hold inline per-doc paths for output/sorting */
 
-    /* sort */
-    if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_asc);
-    else if (sort_mode == SORT_SIZE_DESC) qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_size_desc);
+    /* sort - partial sort when limit << matched to reduce O(n log n) to O(k log k) */
+    size_t matched = docs.count;
+    size_t needed = offset + limit;
+    size_t sort_count = (limit > 0 && needed < matched) ? needed : matched;
+
+    if (sort_mode == SORT_SIZE_ASC) qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_size_asc);
+    else if (sort_mode == SORT_SIZE_DESC) qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_size_desc);
     else if (sort_mode == SORT_PATH_ASC) {
-        qsort(docs.items, docs.count, sizeof(doc_ref), cmp_doc_path_asc);
+        qsort(docs.items, sort_count, sizeof(doc_ref), cmp_doc_path_asc);
     }
 
-    size_t matched = docs.count;
     size_t start = (offset < matched) ? offset : matched;
     size_t remain = (start < matched) ? (matched - start) : 0;
     size_t emit = (remain > limit) ? limit : remain;
