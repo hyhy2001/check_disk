@@ -116,11 +116,14 @@ fn path_hash(path: &str) -> u64 {
 fn ensure_path_id(
     path: &str,
     global_path_to_id: &mut HashMap<u64, usize>,
-    global_paths: &mut Vec<String>,
     global_parent_path_id: &mut Vec<u32>,
-) -> usize {
+    next_gid: &mut usize,
+    path_dict_writer: &mut BufWriter<fs::File>,
+    seek_offsets: &mut Vec<(u64, u32)>,
+    ndjson_offset: &mut u64,
+) -> Result<usize, String> {
     if let Some(id) = global_path_to_id.get(&path_hash(path)) {
-        return *id;
+        return Ok(*id);
     }
 
     let mut missing_paths: Vec<&str> = Vec::new();
@@ -129,14 +132,21 @@ fn ensure_path_id(
         if let Some(id) = global_path_to_id.get(&path_hash(current)) {
             let mut parent_id = *id;
             for item in missing_paths.iter().rev() {
-                let next_id = global_paths.len();
+                let next_id = *next_gid;
                 let item_string = (*item).to_string();
-                global_paths.push(item_string.clone());
+                let row = serde_json::to_vec(&json!({"gid": next_id as u32, "p": item_string}))
+                    .map_err(|e| e.to_string())?;
+                let row_len = (row.len() + 1) as u32;
+                seek_offsets.push((*ndjson_offset, row_len));
+                *ndjson_offset += row_len as u64;
+                path_dict_writer.write_all(&row).map_err(|e| e.to_string())?;
+                path_dict_writer.write_all(b"\n").map_err(|e| e.to_string())?;
                 global_parent_path_id.push(parent_id as u32);
                 global_path_to_id.insert(path_hash(&item_string), next_id);
+                *next_gid += 1;
                 parent_id = next_id;
             }
-            return parent_id;
+            return Ok(parent_id);
         }
 
         missing_paths.push(current);
@@ -158,7 +168,6 @@ struct UserFileArtifacts {
 fn write_text_outputs(
     detail_root: &Path,
     _tree_root: &Path,
-    global_paths: &[String],
     users_dict: &[String],
     team_map: &HashMap<String, String>,
     user_file_artifacts: &HashMap<u32, UserFileArtifacts>,
@@ -167,6 +176,8 @@ fn write_text_outputs(
     dir_user_rows: &[(u32, u32, u64)],
     uid_totals_map: &HashMap<u32, (u64, u64, u64)>,
     timestamp: i64,
+    path_dict_writer: &mut BufWriter<fs::File>,
+    seek_offsets: &[(u64, u32)],
 ) -> Result<(), String> {
     fs::create_dir_all(detail_root).map_err(|e| e.to_string())?;
     fs::create_dir_all(detail_root.join("users")).map_err(|e| e.to_string())?;
@@ -176,7 +187,7 @@ fn write_text_outputs(
     for (dir_path_id, uid, bytes) in dir_user_rows {
         let u = *uid as usize;
         let p = *dir_path_id as usize;
-        if u < user_dirs.len() && p < global_paths.len() {
+        if u < user_dirs.len() && p < seek_offsets.len() {
             user_dirs[u].push((*bytes, *dir_path_id));
         }
     }
@@ -337,26 +348,6 @@ fn write_text_outputs(
 
     fs::create_dir_all(detail_root.join("api")).map_err(|e| e.to_string())?;
 
-    let path_dict_path = detail_root.join("api/path_dict.ndjson");
-    let mut path_dict_writer = BufWriter::with_capacity(
-        512 * 1024,
-        fs::File::create(&path_dict_path).map_err(|e| e.to_string())?,
-    );
-    let mut seek_records: Vec<(u32, u64, u32)> = Vec::with_capacity(global_paths.len());
-    let mut ndjson_offset: u64 = 0;
-    for (gid, path) in global_paths.iter().enumerate() {
-        let row_bytes = {
-            let mut buf = Vec::new();
-            serde_json::to_writer(&mut buf, &json!({"gid": gid as u32, "p": path}))
-                .map_err(|e| e.to_string())?;
-            buf.push(b'\n');
-            buf
-        };
-        let row_len = row_bytes.len() as u32;
-        seek_records.push((gid as u32, ndjson_offset, row_len));
-        ndjson_offset += row_len as u64;
-        path_dict_writer.write_all(&row_bytes).map_err(|e| e.to_string())?;
-    }
     path_dict_writer.flush().map_err(|e| e.to_string())?;
 
     let seek_path = detail_root.join("api/path_dict.seek");
@@ -367,10 +358,10 @@ fn write_text_outputs(
     seek_writer.write_all(b"PDX1").map_err(|e| e.to_string())?;
     seek_writer.write_all(&1u32.to_le_bytes()).map_err(|e| e.to_string())?;
     seek_writer
-        .write_all(&(seek_records.len() as u32).to_le_bytes())
+        .write_all(&(seek_offsets.len() as u32).to_le_bytes())
         .map_err(|e| e.to_string())?;
-    for (gid, off, len) in &seek_records {
-        seek_writer.write_all(&gid.to_le_bytes()).map_err(|e| e.to_string())?;
+    for (gid, (off, len)) in seek_offsets.iter().enumerate() {
+        seek_writer.write_all(&(gid as u32).to_le_bytes()).map_err(|e| e.to_string())?;
         seek_writer.write_all(&off.to_le_bytes()).map_err(|e| e.to_string())?;
         seek_writer.write_all(&len.to_le_bytes()).map_err(|e| e.to_string())?;
     }
@@ -425,6 +416,7 @@ pub fn build_pipeline_dbs_impl(
         cleanup_stale_build_dirs(&detail_parent, ".detail_users_build_", &detail_work_root);
         recreate_dir(&detail_work_root)?;
         ensure_dir(&detail_work_root.join("users"))?;
+        ensure_dir(&detail_work_root.join("api"))?;
 
         let tree_data_dir = PathBuf::from(&treemap_db);
         let tree_parent = tree_data_dir
@@ -634,9 +626,24 @@ pub fn build_pipeline_dbs_impl(
         let total_users = user_keys.len().max(1);
 
         let mut global_path_to_id: HashMap<u64, usize> = HashMap::new();
-        let mut global_paths: Vec<String> = vec!["/".to_string()];
         let mut global_parent_path_id: Vec<u32> = vec![0u32];
         global_path_to_id.insert(path_hash("/"), 0usize);
+        let path_dict_path = detail_work_root.join("api/path_dict.ndjson");
+        let path_dict_file = fs::File::create(&path_dict_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("create {}: {}", path_dict_path.display(), e)))?;
+        let mut path_dict_writer = BufWriter::with_capacity(2 * 1024 * 1024, path_dict_file);
+        let root_row = serde_json::to_vec(&json!({"gid": 0u32, "p": "/"}))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        path_dict_writer
+            .write_all(&root_row)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        path_dict_writer
+            .write_all(b"\n")
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mut seek_offsets: Vec<(u64, u32)> = Vec::new();
+        seek_offsets.push((0u64, (root_row.len() + 1) as u32));
+        let mut path_dict_ndjson_offset: u64 = (root_row.len() + 1) as u64;
+        let mut next_gid: usize = 1;
 
         let mut user_to_uid: HashMap<String, u32> = HashMap::new();
         let mut users_dict: Vec<String> = Vec::new();
@@ -732,9 +739,13 @@ pub fn build_pipeline_dbs_impl(
                     let path_id = ensure_path_id(
                         &safe_path,
                         &mut global_path_to_id,
-                        &mut global_paths,
                         &mut global_parent_path_id,
-                    ) as u32;
+                        &mut next_gid,
+                        &mut path_dict_writer,
+                        &mut seek_offsets,
+                        &mut path_dict_ndjson_offset,
+                    )
+                    .map_err(PyRuntimeError::new_err)? as u32;
 
                     if let Some(writer) = part_writer.as_mut() {
                         serde_json::to_writer(&mut *writer, &json!({"gid": path_id, "s": size, "x": ext}))
@@ -859,9 +870,13 @@ pub fn build_pipeline_dbs_impl(
             let path_id = ensure_path_id(
                 &safe_path,
                 &mut global_path_to_id,
-                &mut global_paths,
                 &mut global_parent_path_id,
-            ) as u32;
+                &mut next_gid,
+                &mut path_dict_writer,
+                &mut seek_offsets,
+                &mut path_dict_ndjson_offset,
+            )
+            .map_err(PyRuntimeError::new_err)? as u32;
             let errcode_id = if let Some(id) = errcode_map.get(&event.errcode) {
                 *id
             } else {
@@ -895,9 +910,13 @@ pub fn build_pipeline_dbs_impl(
             let dir_id = ensure_path_id(
                 dir_path,
                 &mut global_path_to_id,
-                &mut global_paths,
                 &mut global_parent_path_id,
-            ) as u32;
+                &mut next_gid,
+                &mut path_dict_writer,
+                &mut seek_offsets,
+                &mut path_dict_ndjson_offset,
+            )
+            .map_err(PyRuntimeError::new_err)? as u32;
             for (owner_uid, bytes) in users_sizes {
                 if *bytes <= 0 {
                     continue;
@@ -925,7 +944,6 @@ pub fn build_pipeline_dbs_impl(
         write_text_outputs(
             &detail_work_root,
             &tree_work_dir,
-            &global_paths,
             &users_dict,
             &team_map,
             &user_file_artifacts,
@@ -934,9 +952,12 @@ pub fn build_pipeline_dbs_impl(
             &dir_user_rows,
             &uid_totals_map,
             timestamp,
+            &mut path_dict_writer,
+            &seek_offsets,
         )
         .map_err(PyRuntimeError::new_err)?;
-        drop(global_paths);
+        drop(path_dict_writer);
+        drop(seek_offsets);
         let rss_after_text = crate::pipe_types::get_rss_mb();
         println!("[Phase 2] Post-text RSS: {:.1} MB", rss_after_text);
         t_text_write = t5.elapsed().as_secs_f64();
