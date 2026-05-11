@@ -1,2 +1,0 @@
-GLIBC_2.2
-GLIBC_2.3
