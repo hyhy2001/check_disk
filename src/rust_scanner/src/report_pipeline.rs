@@ -947,21 +947,21 @@ pub fn build_pipeline_dbs_impl(
             println!("[Phase 2] Detail text done. Starting deferred TreeMap JSON build...");
             let t9 = Instant::now();
             let dir_sizes_for_treemap: HashMap<String, Vec<(String, i64)>> = dir_sizes
-                .iter()
+                .into_iter()
                 .map(|(dir, entries)| {
                     let mapped = entries
-                        .iter()
+                        .into_iter()
                         .map(|(owner_uid, size)| {
                             (
                                 uids_map
-                                    .get(owner_uid)
+                                    .get(&owner_uid)
                                     .cloned()
                                     .unwrap_or_else(|| format!("uid-{}", owner_uid)),
-                                *size,
+                                size,
                             )
                         })
                         .collect();
-                    (dir.clone(), mapped)
+                    (dir, mapped)
                 })
                 .collect();
             write_treemap_json_outputs(
@@ -979,6 +979,7 @@ pub fn build_pipeline_dbs_impl(
             swap_dir_atomic(&tree_work_dir, &tree_data_dir)?;
             t_swap_tree = t10.elapsed().as_secs_f64();
         } else {
+            drop(dir_sizes);
             let _ = fs::remove_dir_all(&tree_work_dir);
         }
 
