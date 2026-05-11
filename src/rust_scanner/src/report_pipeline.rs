@@ -3,6 +3,8 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use serde_json::json;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -105,27 +107,33 @@ fn spill_rows_to_disk(
     bytes_written
 }
 
+fn path_hash(path: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn ensure_path_id(
     path: &str,
-    global_path_to_id: &mut HashMap<String, usize>,
+    global_path_to_id: &mut HashMap<u64, usize>,
     global_paths: &mut Vec<String>,
     global_parent_path_id: &mut Vec<u32>,
 ) -> usize {
-    if let Some(id) = global_path_to_id.get(path) {
+    if let Some(id) = global_path_to_id.get(&path_hash(path)) {
         return *id;
     }
 
     let mut missing_paths: Vec<&str> = Vec::new();
     let mut current = path;
     loop {
-        if let Some(id) = global_path_to_id.get(current) {
+        if let Some(id) = global_path_to_id.get(&path_hash(current)) {
             let mut parent_id = *id;
             for item in missing_paths.iter().rev() {
                 let next_id = global_paths.len();
                 let item_string = (*item).to_string();
                 global_paths.push(item_string.clone());
                 global_parent_path_id.push(parent_id as u32);
-                global_path_to_id.insert(item_string, next_id);
+                global_path_to_id.insert(path_hash(&item_string), next_id);
                 parent_id = next_id;
             }
             return parent_id;
@@ -625,10 +633,10 @@ pub fn build_pipeline_dbs_impl(
         user_keys.sort();
         let total_users = user_keys.len().max(1);
 
-        let mut global_path_to_id: HashMap<String, usize> = HashMap::new();
+        let mut global_path_to_id: HashMap<u64, usize> = HashMap::new();
         let mut global_paths: Vec<String> = vec!["/".to_string()];
         let mut global_parent_path_id: Vec<u32> = vec![0u32];
-        global_path_to_id.insert("/".to_string(), 0usize);
+        global_path_to_id.insert(path_hash("/"), 0usize);
 
         let mut user_to_uid: HashMap<String, u32> = HashMap::new();
         let mut users_dict: Vec<String> = Vec::new();
