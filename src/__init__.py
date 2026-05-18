@@ -12,7 +12,6 @@ from .formatters.table_formatter import TableFormatter
 from .report_generator import ReportGenerator
 from .utils import (
     ScanHelper,
-    build_uid_cache,
     create_usage_bar,
     format_size,
     format_timestamp,
@@ -38,7 +37,6 @@ __all__ = [
     'parse_size',
     'get_terminal_size',
     'get_username_from_uid',
-    'build_uid_cache',
     'get_general_system_info',
     'get_owner_from_path',
     'format_timestamp',

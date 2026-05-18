@@ -9,6 +9,7 @@ import glob
 import os
 from typing import Any, Dict, List
 
+from .constants import DETAIL_USERS_DIRNAME
 from .formatters.report_formatter import ReportFormatter
 from .utils import load_json_report
 
@@ -232,23 +233,26 @@ class CLIInterface:
         output_dir: str = ".",
         top: int = 30,
     ) -> None:
-        """Display per-user detail reports from the generated JSON/NDJSON manifest."""
+        """Display per-user detail reports from the generated SQLite database."""
         if prefix:
-            print("Warning: --prefix is ignored for JSON/NDJSON detail manifests")
-        detail_dir = os.path.join(output_dir, "detail_users")
-        detail_manifest = os.path.join(detail_dir, "manifest.json")
+            print("Warning: --prefix is ignored for SQLite detail database")
+        from .constants import DETAIL_USERS_DB_FILENAME
+        detail_dir = os.path.join(output_dir, DETAIL_USERS_DIRNAME)
+        detail_db = os.path.join(detail_dir, DETAIL_USERS_DB_FILENAME)
 
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}
 
+        # Always pass the (possibly missing) detail.db path. The formatter
+        # checks file existence and prints a single, actionable error per
+        # user — no need to log a warning here.
         for user in users:
-            if os.path.exists(detail_manifest):
-                dir_files[user] = detail_manifest
-                file_files[user] = detail_manifest
+            if os.path.exists(detail_db):
+                dir_files[user] = detail_db
+                file_files[user] = detail_db
             else:
                 dir_files[user] = None
                 file_files[user] = None
-                print(f"Warning: detail manifest not found for '{user}' in: {detail_dir}")
 
         self.report_formatter.display_user_detail_reports(
             users, dir_files, file_files, top

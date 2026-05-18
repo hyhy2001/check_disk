@@ -60,7 +60,7 @@ class ConfigManager:
         except IOError as e:
             print(f"Error saving configuration: {e}")
 
-    def initialize_config(self, directory: str, output_file: str = "disk_usage_report.json") -> None:
+    def initialize_config(self, directory: str, output_file: str = None) -> None:
         """
         Initialize a new configuration.
 
@@ -68,9 +68,10 @@ class ConfigManager:
             directory: Path to the directory to scan
             output_file: Path where the report will be saved
         """
+        from .constants import DEFAULT_REPORT_FILENAME
         self._config = {
             "directory": directory,
-            "output_file": output_file,
+            "output_file": output_file or DEFAULT_REPORT_FILENAME,
             "teams": [],
             "users": []
         }

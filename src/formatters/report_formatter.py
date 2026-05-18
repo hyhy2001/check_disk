@@ -6,11 +6,15 @@ Contains the ReportFormatter class for formatting and displaying reports.
 
 import json
 import os
-import gzip
-import heapq
-import struct
+import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..constants import (
+    DETAIL_USERS_DB_FILENAME,
+    DETAIL_USERS_DIRNAME,
+    TREE_MAP_DATA_DIRNAME,
+    TREE_MAP_DB_FILENAME,
+)
 from ..utils import format_size, format_timestamp
 from .base_formatter import BaseFormatter
 from .config_display import ConfigDisplay
@@ -193,11 +197,32 @@ class ReportFormatter(BaseFormatter):
         dir_report: Optional[Dict[str, Any]],
         file_report: Optional[Dict[str, Any]],
         top: int = 30,
+        *,
+        not_found_reason: Optional[str] = None,
     ) -> None:
-        """Render dir + file detail reports for a single user."""
+        """Render dir + file detail reports for a single user.
+
+        Args:
+            user:        username (display only)
+            dir_report:  directory breakdown dict, or None when no data
+            file_report: file breakdown dict, or None when no data
+            top:         truncate breakdown tables to this many rows
+            not_found_reason: optional message displayed verbatim when both
+                reports are None — used to explain WHY (no DB / unknown
+                user / user has no files) instead of the previous opaque
+                "[dir detail report not found]".
+        """
         print("\n" + "=" * 60)
         print(f"DETAIL REPORT - {user}")
         print("=" * 60)
+
+        # Both reports None → display the explanatory reason and bail out.
+        if dir_report is None and file_report is None:
+            if not_found_reason:
+                print(f"  {not_found_reason}")
+            else:
+                print(f"  No data found for user '{user}'.")
+            return
 
         # --- Directory breakdown ---
         if dir_report:
@@ -219,7 +244,7 @@ class ReportFormatter(BaseFormatter):
             else:
                 print("  (no directory data)")
         else:
-            print("  [dir detail report not found]")
+            print("  (no directory data)")
 
         # --- File breakdown ---
         if file_report:
@@ -239,7 +264,7 @@ class ReportFormatter(BaseFormatter):
             else:
                 print("  (no file data)")
         else:
-            print("  [file detail report not found]")
+            print("  (no file data)")
 
     def display_user_detail_reports(
         self,
@@ -248,428 +273,252 @@ class ReportFormatter(BaseFormatter):
         file_files: Dict[str, Optional[str]],
         top: int = 30,
     ) -> None:
-        """Load and render detail reports for multiple users."""
-        for user in users:
-            dir_path  = dir_files.get(user)
-            file_path = file_files.get(user)
-            dir_data  = self._load_detail_report(dir_path, is_dir=True, user=user, top=top) if dir_path else None
-            file_data = self._load_detail_report(file_path, is_dir=False, user=user, top=top) if file_path else None
-            self.display_user_detail_report(user, dir_data, file_data, top)
+        """Load and render detail reports for multiple users from SQLite.
 
-    def _load_detail_report(self, path: str, is_dir: bool, user: str = "", top: int = 30) -> Dict[str, Any]:
-        """Load detail report from generated manifest, NDJSON, or JSON."""
-        if path.endswith('manifest.json'):
-            return self._load_detail_from_manifest(path, is_dir, user=user, top=top)
-        if path.endswith('.ndjson') or path.endswith('.ndjson.gz'):
-            return self._load_detail_from_ndjson(path, is_dir)
-        if path.endswith('.bin.gz') or path.endswith('.bin'):
-            return self._load_detail_from_bin(path, is_dir)
-
-        from ..utils import load_json_report
-        return load_json_report(path)
-
-    def _load_detail_from_manifest(self, path: str, is_dir: bool, user: str = "", top: int = 30) -> Dict[str, Any]:
-        with open(path, "r", encoding="utf-8") as fh:
-            root_manifest = json.load(fh)
-        base_dir = os.path.dirname(path)
-
-        user_entry = next(
-            (entry for entry in root_manifest.get("users", []) if entry.get("username") == user),
+        `dir_files` / `file_files` historically mapped users to NDJSON paths.
+        With the SQLite pipeline both arguments are accepted but only the
+        first non-empty entry is used to derive the output directory: every
+        user reads from the same `data_detail.db`.
+        """
+        sample_path = next(
+            (p for p in list(dir_files.values()) + list(file_files.values()) if p),
             None,
         )
+        detail_db, treemap_db = self._resolve_db_paths(sample_path)
+        if not detail_db or not os.path.isfile(detail_db):
+            db_hint = detail_db or "<output dir>/detail_users/data_detail.db"
+            reason = (
+                f"Detail database not found at: {db_hint}\n"
+                f"  Run a scan first: disk_checker.py --run --output-dir <dir>"
+            )
+            for user in users:
+                self.display_user_detail_report(
+                    user, None, None, top, not_found_reason=reason
+                )
+            return
 
-        scan_meta: Dict[str, Any] = root_manifest.get("scan", {}) if isinstance(root_manifest, dict) else {}
+        conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
+        try:
+            self._configure_read_conn(conn, treemap_db)
+            scan_root = self._meta_get(conn, "scan_root") or "<unknown>"
+            known_users = self._known_usernames(conn)
+            for user in users:
+                if user not in known_users:
+                    reason = (
+                        f"User '{user}' not found in scan results.\n"
+                        f"  Scanned root: {scan_root}\n"
+                        f"  No files owned by this user were captured. "
+                        f"Check the username spelling, or rescan if the user "
+                        f"only recently created files."
+                    )
+                    self.display_user_detail_report(
+                        user, None, None, top, not_found_reason=reason
+                    )
+                    continue
 
-        safe_user = "".join(c if c.isalnum() or c in "-_." else "_" for c in user)
-        manifest_rel = user_entry.get("manifest", "") if isinstance(user_entry, dict) else ""
-        manifest_path = os.path.join(base_dir, manifest_rel) if manifest_rel else os.path.join(base_dir, "users", safe_user, "manifest.json")
-        if not os.path.exists(manifest_path):
-            return {}
+                dir_data = self._load_user_dirs(conn, user, top)
+                file_data = self._load_user_files(conn, user, top)
+                if (
+                    dir_data
+                    and file_data
+                    and (dir_data.get('total_files') or 0) == 0
+                    and (file_data.get('total_files') or 0) == 0
+                ):
+                    reason = (
+                        f"User '{user}' is registered but has no files in scan.\n"
+                        f"  Scanned root: {scan_root}"
+                    )
+                    self.display_user_detail_report(
+                        user, None, None, top, not_found_reason=reason
+                    )
+                    continue
+                self.display_user_detail_report(user, dir_data, file_data, top)
+        finally:
+            conn.close()
 
-        with open(manifest_path, "r", encoding="utf-8") as fh:
-            manifest = json.load(fh)
-        user_dir = os.path.dirname(manifest_path)
-        summary = manifest.get("summary", {})
-        data: Dict[str, Any] = {
-            "date": int(manifest.get("scan_date", scan_meta.get("timestamp", 0)) or 0),
-            "user": user,
-            "directory": scan_meta.get("root", ""),
-            "total_dirs": int(summary.get("dirs", 0) or 0),
-            "total_files": int(summary.get("files", 0) or 0),
-            "total_used": int(summary.get("used", 0) or 0),
-        }
-        def _build_path_resolver(detail_root: str, user_dir: str, manifest: Dict[str, Any]):
-            """Return gid->path resolver using path_dict.seek when available."""
-            seek_path = os.path.join(detail_root, "api", "path_dict.seek")
-            ndjson_path = os.path.join(detail_root, "api", "path_dict.ndjson")
-            if os.path.exists(seek_path) and os.path.exists(ndjson_path):
-                import struct as _struct
-                sfh = open(seek_path, "rb")
-                dfh = open(ndjson_path, "rb")
-                magic = sfh.read(4)
-                version_raw = sfh.read(4)
-                count_raw = sfh.read(4)
-                if magic == b"PDX1" and len(version_raw) == 4 and len(count_raw) == 4:
-                    version = _struct.unpack("<I", version_raw)[0]
-                    count = _struct.unpack("<I", count_raw)[0]
-                    if version == 1 and count > 0:
-                        cache: Dict[int, str] = {}
-                        rec_size = 16
+    @staticmethod
+    def _known_usernames(conn: sqlite3.Connection) -> set:
+        try:
+            return {r[0] for r in conn.execute("SELECT username FROM users")}
+        except sqlite3.DatabaseError:
+            return set()
 
-                        def resolver(gid: int) -> str:
-                            if gid < 0:
-                                return ""
-                            if gid in cache:
-                                return cache[gid]
-                            left, right = 0, count - 1
-                            out = ""
-                            while left <= right:
-                                mid = (left + right) // 2
-                                sfh.seek(12 + mid * rec_size)
-                                gid_bytes = sfh.read(4)
-                                off_bytes = sfh.read(8)
-                                len_bytes = sfh.read(4)
-                                if len(gid_bytes) < 4 or len(off_bytes) < 8 or len(len_bytes) < 4:
-                                    break
-                                cur_gid = _struct.unpack("<I", gid_bytes)[0]
-                                if cur_gid < gid:
-                                    left = mid + 1
-                                elif cur_gid > gid:
-                                    right = mid - 1
-                                else:
-                                    off_parts = _struct.unpack("<II", off_bytes)
-                                    offset = off_parts[0] + (off_parts[1] << 32)
-                                    row_len = _struct.unpack("<I", len_bytes)[0]
-                                    if 0 < row_len <= 16777216:
-                                        dfh.seek(offset)
-                                        line_bytes = dfh.read(row_len)
-                                        try:
-                                            obj = json.loads(line_bytes.decode("utf-8", errors="ignore").rstrip())
-                                            if isinstance(obj, dict) and isinstance(obj.get("p"), str):
-                                                out = obj["p"]
-                                        except Exception:
-                                            pass
-                                    break
-                            cache[gid] = out
-                            return out
-
-                        return resolver
-            path_dict = self._load_paths_dict(detail_root, user_dir, manifest)
-            return lambda gid: path_dict[gid] if 0 <= gid < len(path_dict) else ""
-
-
-        path_resolver = _build_path_resolver(base_dir, user_dir, manifest)
-
-        def _resolve_path(item: Dict[str, Any]) -> str:
-            path_id = item.get("gid")
-            if not isinstance(path_id, int):
-                path_id = item.get("i")
-            if isinstance(path_id, int) and path_id >= 0:
-                resolved = path_resolver(path_id)
-                if resolved:
-                    return resolved
-            return item.get("p", "")
-
-        def _decode_file_item(item: Dict[str, Any]) -> Dict[str, Any]:
-            return {
-                "path": _resolve_path(item),
-                "size": int(item.get("s", 0) or 0),
-                "ext": item.get("x", ""),
-            }
-
-        def _decode_dir_item(item: Dict[str, Any]) -> Dict[str, Any]:
-            return {
-                "path": _resolve_path(item),
-                "used": int(item.get("s", 0) or 0),
-            }
-        if is_dir:
-            top_path = os.path.join(user_dir, manifest.get("top_dirs", "top_dirs.json"))
-            if os.path.exists(top_path):
-                with open(top_path, "r", encoding="utf-8") as fh:
-                    data["dirs"] = [_decode_dir_item(x) for x in json.load(fh)]
-            else:
-                # Streaming top-N: use heapq to keep only largest N dirs during scan
-                heap = []
-                seq = 0
-                for part in manifest.get("dirs", {}).get("parts", []):
-                    part_path = os.path.join(user_dir, part.get("path", ""))
-                    part_loader = self._load_detail_from_bin if part_path.endswith(".bin") or part_path.endswith(".bin.gz") else self._load_detail_from_ndjson
-                    part_data = part_loader(part_path, True)
-                    for d in part_data.get("dirs", []):
-                        used = int(d.get("used", 0) or 0)
-                        seq += 1
-                        if len(heap) < top:
-                            heapq.heappush(heap, (used, seq, d))
-                        elif used > heap[0][0]:
-                            heapq.heapreplace(heap, (used, seq, d))
-                selected = [item[2] for item in sorted(heap, key=lambda x: x[0], reverse=True)]
-                for d in selected:
-                    if not d.get("path") and isinstance(d.get("gid"), int):
-                        d["path"] = path_resolver(int(d.get("gid")))
-                data["dirs"] = selected
-                heap.clear()
+    @staticmethod
+    def _resolve_db_paths(hint_path: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        """Locate `data_detail.db` + `treemap.db` from a sample path the
+        caller passed. Falls back to walking up to find the right output
+        directory.
+        """
+        if not hint_path:
+            return (None, None)
+        # Common shapes:
+        #   .../detail_users/data_detail.db
+        #   .../detail_users/manifest.json (legacy)
+        #   .../detail_users/users/<user>/manifest.json (legacy)
+        cur = os.path.abspath(hint_path)
+        if os.path.isdir(cur):
+            base = cur
         else:
-            top_path = os.path.join(user_dir, manifest.get("top_files", "top_files.json"))
-            if os.path.exists(top_path):
-                with open(top_path, "r", encoding="utf-8") as fh:
-                    data["files"] = [_decode_file_item(x) for x in json.load(fh)]
-            else:
-                # Streaming top-N: use heapq to keep only largest N files during scan
-                heap = []
-                seq = 0
-                for part in manifest.get("files", {}).get("parts", []):
-                    part_path = os.path.join(user_dir, part.get("path", ""))
-                    part_loader = self._load_detail_from_bin if part_path.endswith(".bin") or part_path.endswith(".bin.gz") else self._load_detail_from_ndjson
-                    part_data = part_loader(part_path, False)
-                    for f in part_data.get("files", []):
-                        size = int(f.get("size", 0) or 0)
-                        seq += 1
-                        if len(heap) < top:
-                            heapq.heappush(heap, (size, seq, f))
-                        elif size > heap[0][0]:
-                            heapq.heapreplace(heap, (size, seq, f))
-                selected = [item[2] for item in sorted(heap, key=lambda x: x[0], reverse=True)]
-                for f in selected:
-                    if not f.get("path") and isinstance(f.get("gid"), int):
-                        f["path"] = path_resolver(int(f.get("gid")))
-                data["files"] = selected
-                heap.clear()
-        return data
+            base = os.path.dirname(cur)
+        for _ in range(6):
+            detail_db = os.path.join(base, DETAIL_USERS_DIRNAME, DETAIL_USERS_DB_FILENAME)
+            treemap_db = os.path.join(base, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
+            if os.path.isfile(detail_db):
+                return (
+                    detail_db,
+                    treemap_db if os.path.isfile(treemap_db) else None,
+                )
+            # Maybe `cur` is already the detail_users dir.
+            inline_db = os.path.join(base, DETAIL_USERS_DB_FILENAME)
+            if os.path.isfile(inline_db):
+                tm = os.path.join(
+                    os.path.dirname(base), TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME
+                )
+                return (inline_db, tm if os.path.isfile(tm) else None)
+            parent = os.path.dirname(base)
+            if parent == base:
+                break
+            base = parent
+        return (None, None)
 
-    def _load_paths_dict(self, detail_root: str, user_dir: str, manifest: Dict[str, Any]) -> List[str]:
-        dict_rel = manifest.get("paths_dict", "")
-        candidate_paths = []
-        if dict_rel:
-            candidate_paths.append(os.path.join(user_dir, dict_rel))
-        candidate_paths.append(os.path.join(detail_root, "api", "path_dict.ndjson"))
+    @staticmethod
+    def _configure_read_conn(conn: sqlite3.Connection, treemap_db: Optional[str]) -> None:
+        cur = conn.cursor()
+        try:
+            cur.execute("PRAGMA query_only=1")
+            cur.execute("PRAGMA mmap_size=268435456")
+            cur.execute("PRAGMA cache_size=-65536")
+        except sqlite3.DatabaseError:
+            pass
+        if treemap_db and os.path.isfile(treemap_db):
+            cur.execute(
+                "ATTACH DATABASE ? AS tm",
+                (f"file:{treemap_db}?mode=ro",),
+            )
+        cur.close()
 
-        for dict_path in candidate_paths:
-            if not os.path.exists(dict_path):
-                continue
-            if dict_path.endswith(".ndjson") or dict_path.endswith(".ndjson.gz"):
-                open_fn = gzip.open if dict_path.endswith(".gz") else open
-                rows: List[str] = []
-                with open_fn(dict_path, "rt", encoding="utf-8") as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except ValueError:
-                            continue
-                        gid = obj.get("gid")
-                        path = obj.get("p")
-                        if isinstance(gid, int) and gid >= 0 and isinstance(path, str):
-                            while len(rows) <= gid:
-                                rows.append("")
-                            rows[gid] = path
-                return rows
+    @staticmethod
+    def _has_treemap(conn: sqlite3.Connection) -> bool:
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tm.dirs LIMIT 1"
+            ).fetchone()
+            return bool(row)
+        except sqlite3.DatabaseError:
+            return False
 
-            open_fn = gzip.open if dict_path.endswith(".gz") else open
-            with open_fn(dict_path, "rt", encoding="utf-8") as fh:
-                loaded = json.load(fh)
-            if isinstance(loaded, list):
-                return [str(item) for item in loaded]
+    def _build_path(self, conn: sqlite3.Connection, dir_id: int) -> str:
+        """Reconstruct full path for a treemap dir_id via recursive CTE."""
+        if dir_id is None:
+            return ""
+        try:
+            row = conn.execute(
+                """
+                WITH RECURSIVE walk(id, parent_id, name_id, lvl) AS (
+                    SELECT id, parent_id, name_id, 0 FROM tm.dirs WHERE id = ?
+                    UNION ALL
+                    SELECT d.id, d.parent_id, d.name_id, w.lvl + 1
+                      FROM tm.dirs d JOIN walk w ON d.id = w.parent_id
+                )
+                SELECT GROUP_CONCAT(name, '/')
+                  FROM (
+                      SELECT n.name AS name FROM walk w
+                        JOIN tm.names n ON w.name_id = n.id
+                       ORDER BY w.lvl DESC
+                  )
+                """,
+                (dir_id,),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return ""
+        if not row or not row[0]:
+            return ""
+        joined = row[0]
+        # Root segment is "/" so we can get "//foo/bar". Normalize.
+        return "/" + joined.lstrip("/").lstrip("/")
 
-        return []
+    def _load_user_dirs(
+        self, conn: sqlite3.Connection, user: str, top: int
+    ) -> Optional[Dict[str, Any]]:
+        row = conn.execute(
+            "SELECT uid, total_dirs, total_files, total_size FROM users WHERE username = ?",
+            (user,),
+        ).fetchone()
+        if not row:
+            return None
+        uid, total_dirs, total_files, total_used = row
+        scan_root = self._meta_get(conn, "scan_root")
+        scan_ts = int(self._meta_get(conn, "scan_timestamp") or 0)
 
-    def _load_detail_from_ndjson(self, path: str, is_dir: bool) -> Dict[str, Any]:
-        data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
-        open_fn = gzip.open if path.endswith(".gz") else open
-        with open_fn(path, "rt", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
+        # Always pull dir_user_size — it lives in detail.db, no ATTACH needed.
+        # If treemap.db is also attached, we get human-readable paths via
+        # recursive CTE; otherwise we fall back to "<dir id N>" labels so
+        # the breakdown still appears (rather than silently disappearing
+        # when a scan was run without --tree-map).
+        has_tm = self._has_treemap(conn)
+        dirs: List[Dict[str, Any]] = []
+        cursor = conn.execute(
+            "SELECT dir_id, size FROM dir_user_size "
+            "WHERE uid = ? ORDER BY size DESC LIMIT ?",
+            (uid, top),
+        )
+        for dir_id, size in cursor:
+            path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
+            dirs.append({"path": path, "used": int(size)})
+        return {
+            "date": scan_ts,
+            "user": user,
+            "directory": scan_root,
+            "total_dirs": int(total_dirs or 0),
+            "total_files": int(total_files or 0),
+            "total_used": int(total_used or 0),
+            "dirs": dirs,
+        }
 
-                if "_meta" in obj:
-                    meta = obj.get("_meta") or {}
-                    data["date"] = int(meta.get("date", 0) or 0)
-                    data["user"] = meta.get("user", "")
-                    if is_dir:
-                        data["total_dirs"] = int(meta.get("total_dirs", 0) or 0)
-                        data["total_used"] = int(meta.get("total_used", 0) or 0)
-                    else:
-                        data["total_files"] = int(meta.get("total_files", 0) or 0)
-                        data["total_used"] = int(meta.get("total_used", 0) or 0)
-                    continue
+    def _load_user_files(
+        self, conn: sqlite3.Connection, user: str, top: int
+    ) -> Optional[Dict[str, Any]]:
+        row = conn.execute(
+            "SELECT uid, total_files, total_size FROM users WHERE username = ?",
+            (user,),
+        ).fetchone()
+        if not row:
+            return None
+        uid, total_files, total_used = row
+        scan_root = self._meta_get(conn, "scan_root")
+        scan_ts = int(self._meta_get(conn, "scan_timestamp") or 0)
 
-                path_id = obj.get("gid")
-                if not isinstance(path_id, int):
-                    path_id = obj.get("i")
-                if is_dir:
-                    data.setdefault("dirs", []).append({"gid": path_id, "used": int(obj.get("s", 0) or 0)})
-                else:
-                    data.setdefault("files", []).append({"gid": path_id, "size": int(obj.get("s", 0) or 0), "ext": obj.get("x", "")})
-        return data
+        files: List[Dict[str, Any]] = []
+        has_tm = self._has_treemap(conn)
+        cursor = conn.execute(
+            """
+            SELECT f.dir_id, n.name, e.ext, t.size
+              FROM top_files t
+              JOIN files f ON f.id = t.file_id
+              JOIN names n ON f.name_id = n.id
+              JOIN exts e  ON f.ext_id = e.id
+             WHERE t.uid = ? AND t.rank <= ?
+             ORDER BY t.rank
+            """,
+            (uid, top),
+        )
+        for dir_id, basename, ext, size in cursor:
+            parent = self._build_path(conn, dir_id) if has_tm else ""
+            full_path = f"{parent.rstrip('/')}/{basename}" if parent else basename
+            files.append({"path": full_path, "size": int(size), "ext": ext or ""})
+        return {
+            "date": scan_ts,
+            "user": user,
+            "directory": scan_root,
+            "total_files": int(total_files or 0),
+            "total_used": int(total_used or 0),
+            "files": files,
+        }
 
-    def _load_detail_from_bin(self, path: str, is_dir: bool) -> Dict[str, Any]:
-        data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
-        open_fn = gzip.open if path.endswith(".gz") else open
-        with open_fn(path, "rb") as fh:
-            header = fh.read(8)
-            if len(header) < 8 or header[:4] != b"CDB4":
-                return data
-            kind = header[5]
-            if is_dir and kind != 1:
-                return data
-            if not is_dir and kind != 0:
-                return data
-
-            if is_dir:
-                while True:
-                    chunk = fh.read(12)
-                    if not chunk:
-                        break
-                    if len(chunk) < 12:
-                        break
-                    path_id, used = struct.unpack("<Iq", chunk)
-                    data.setdefault("dirs", []).append({"gid": int(path_id), "used": int(used)})
-            else:
-                while True:
-                    base = fh.read(14)
-                    if not base:
-                        break
-                    if len(base) < 14:
-                        break
-                    path_id, size, ext_len = struct.unpack("<IQH", base)
-                    ext_raw = fh.read(ext_len)
-                    if len(ext_raw) < ext_len:
-                        break
-                    data.setdefault("files", []).append({
-                        "gid": int(path_id),
-                        "size": int(size),
-                        "ext": ext_raw.decode("utf-8", errors="ignore"),
-                    })
-        return data
-
-    def _load_detail_from_text(self, detail_dir: str, is_dir: bool, user: str = "") -> Dict[str, Any]:
-        data: Dict[str, Any] = {"dirs": []} if is_dir else {"files": []}
-
-        name_to_uid: Dict[str, int] = {}
-        exts_map: List[str] = []
-        path_map: List[str] = []
-        data_ndjson = os.path.join(detail_dir, "data.ndjson")
-
-        segment_map = []
-        if os.path.exists(data_ndjson):
-            with open(data_ndjson, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    row_type = str(obj.get("t", ""))
-                    if row_type == "u":
-                        uid = int(obj.get("i", -1))
-                        name = str(obj.get("n", ""))
-                        if uid >= 0 and name:
-                            name_to_uid[name] = uid
-                    elif row_type == "e":
-                        ext_id = int(obj.get("i", -1))
-                        ext = str(obj.get("x", ""))
-                        while len(exts_map) <= ext_id:
-                            exts_map.append("")
-                        if ext_id >= 0:
-                            exts_map[ext_id] = ext
-                    elif row_type == "n":
-                        seg_id = int(obj.get("i", -1))
-                        seg = str(obj.get("s", "") or "")
-                        while len(segment_map) <= seg_id:
-                            segment_map.append("")
-                        if seg_id >= 0:
-                            segment_map[seg_id] = seg
-                    elif row_type == "p":
-                        path_id = int(obj.get("i", -1))
-                        parent_id = int(obj.get("r", 0) or 0)
-                        path_text = str(obj.get("p", "") or "")
-                        suffix = str(obj.get("s", "") or "")
-                        seg_id = int(obj.get("n", -1))
-                        if 0 <= seg_id < len(segment_map):
-                            suffix = segment_map[seg_id] or suffix
-                        while len(path_map) <= path_id:
-                            path_map.append("")
-                        if path_id >= 0:
-                            if path_text:
-                                path_map[path_id] = path_text
-                            elif suffix:
-                                if parent_id > 0 and parent_id < len(path_map) and path_map[parent_id] and not suffix.startswith("/"):
-                                    path_map[path_id] = f"{path_map[parent_id]}/{suffix}"
-                                else:
-                                    path_map[path_id] = suffix if suffix else ""
-
-        target_uid = name_to_uid.get(user, -1)
-        if target_uid < 0:
-            return {}
-
-        scan_date = 0
-        scan_root = ""
-        manifest_path = os.path.join(detail_dir, "manifest.json")
-        if os.path.exists(manifest_path):
-            try:
-                with open(manifest_path, "r", encoding="utf-8") as fh:
-                    detail = json.load(fh)
-                scan_date = int(detail.get("created_at", 0) or 0)
-                scan_root = str(detail.get("scan", {}).get("root", "") or "")
-            except Exception:
-                pass
-
-        data["date"] = scan_date
-        data["user"] = user
-        data["directory"] = scan_root
-
-        dir_rows = []
-        file_rows = []
-
-        if os.path.exists(data_ndjson):
-            with open(data_ndjson, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    row_type = str(obj.get("t", ""))
-                    uid = int(obj.get("u", -1))
-                    if row_type == "ut" and uid == target_uid:
-                        data["total_files"] = int(obj.get("f", 0) or 0)
-                        data["total_dirs"] = int(obj.get("d", 0) or 0)
-                        data["total_used"] = int(obj.get("b", 0) or 0)
-                    elif row_type == "du" and uid == target_uid:
-                        dir_id = int(obj.get("p", -1))
-                        path = path_map[dir_id] if 0 <= dir_id < len(path_map) else ""
-                        if path:
-                            dir_rows.append({
-                                "path": path,
-                                "used": int(obj.get("b", 0) or 0),
-                            })
-                    elif row_type == "d" and uid == target_uid:
-                        path_id = int(obj.get("p", -1))
-                        ext_id = int(obj.get("e", -1))
-                        path = path_map[path_id] if 0 <= path_id < len(path_map) else ""
-                        if not path:
-                            continue
-                        file_rows.append({
-                            "path": path,
-                            "size": int(obj.get("s", 0) or 0),
-                            "ext": exts_map[ext_id] if 0 <= ext_id < len(exts_map) else "",
-                        })
-
-        if is_dir:
-            dir_rows.sort(key=lambda x: x.get("used", 0), reverse=True)
-            data["dirs"] = dir_rows
-            return data
-
-        file_rows.sort(key=lambda x: x.get("size", 0), reverse=True)
-        data["files"] = file_rows
-        return data
+    @staticmethod
+    def _meta_get(conn: sqlite3.Connection, key: str) -> str:
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        except sqlite3.DatabaseError:
+            return ""
+        return str(row[0]) if row and row[0] is not None else ""

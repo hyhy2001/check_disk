@@ -1,10 +1,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use serde_json::json;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,18 +9,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::db_writer::{
+    self, DEFAULT_TOP_K, DirOwnerRow, DirRow, DirUserSizeRow, FileRow, OwnerRow, TreemapInput,
+    UserRow, FILE_INSERT_CHUNK,
+};
 use crate::pipe_events::{
     for_each_dir_agg_in_file, for_each_scan_event_in_file, get_dir_agg_files, get_scan_event_files,
     read_permission_events,
 };
-use crate::pipe_io::{ensure_dir, recreate_dir, safe_user_dir, swap_dir_atomic};
-use crate::pipe_permission::write_permission_issues_json;
-use crate::pipe_treemap::write_treemap_json_outputs;
-use crate::pipe_types::{UserOutputMeta, FILE_PART_RECORDS};
+use crate::pipe_io::{ensure_dir, recreate_dir};
+use crate::pipe_permission::{write_permission_issues_db, write_permission_issues_json};
+use crate::pipe_treemap::{tm_basename, tm_parent, normalize_root};
+use crate::pipe_types::FILE_PART_RECORDS;
 
 const ROW_SPILL_THRESHOLD: usize = 200_000;
 
-fn cleanup_stale_build_dirs(parent: &Path, prefix: &str, active_path: &Path) {
+/// Remove old `.detail_users_build_*` / `.tree_map_data_build_*` from previous
+/// crashed runs (anything that does not match the active build directory).
+pub fn cleanup_stale_build_dirs(parent: &Path, prefix: &str, active_path: &Path) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
@@ -59,7 +62,7 @@ fn spill_rows_to_disk(
         if rows.is_empty() {
             continue;
         }
-        let safe = safe_user_dir(&username);
+        let safe = sanitize_filename(&username);
         let user_spills = row_spills.entry(username).or_default();
         for rows_chunk in rows.chunks(FILE_PART_RECORDS) {
             let id = seq.fetch_add(1, Ordering::Relaxed);
@@ -107,285 +110,174 @@ fn spill_rows_to_disk(
     bytes_written
 }
 
-fn path_hash(path: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn ensure_path_id(
-    path: &str,
-    global_path_to_id: &mut HashMap<u64, usize>,
-    global_parent_path_id: &mut Vec<u32>,
-    next_gid: &mut usize,
-    path_dict_writer: &mut BufWriter<fs::File>,
-    seek_offsets: &mut Vec<(u64, u32)>,
-    ndjson_offset: &mut u64,
-) -> Result<usize, String> {
-    if let Some(id) = global_path_to_id.get(&path_hash(path)) {
-        return Ok(*id);
-    }
-
-    let mut missing_paths: Vec<&str> = Vec::new();
-    let mut current = path;
-    loop {
-        if let Some(id) = global_path_to_id.get(&path_hash(current)) {
-            let mut parent_id = *id;
-            for item in missing_paths.iter().rev() {
-                let next_id = *next_gid;
-                let item_string = (*item).to_string();
-                let row = serde_json::to_vec(&json!({"gid": next_id as u32, "p": item_string}))
-                    .map_err(|e| e.to_string())?;
-                let row_len = (row.len() + 1) as u32;
-                seek_offsets.push((*ndjson_offset, row_len));
-                *ndjson_offset += row_len as u64;
-                path_dict_writer.write_all(&row).map_err(|e| e.to_string())?;
-                path_dict_writer.write_all(b"\n").map_err(|e| e.to_string())?;
-                global_parent_path_id.push(parent_id as u32);
-                global_path_to_id.insert(path_hash(&item_string), next_id);
-                *next_gid += 1;
-                parent_id = next_id;
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
             }
-            return Ok(parent_id);
-        }
-
-        missing_paths.push(current);
-        let trimmed = current.trim_end_matches('/');
-        current = match trimmed.rfind('/') {
-            Some(0) => "/",
-            Some(idx) => &trimmed[..idx],
-            None => "/",
-        };
-    }
-}
-
-struct UserFileArtifacts {
-    file_parts: Vec<serde_json::Value>,
-    ext_rows: Vec<serde_json::Value>,
-    total_files: usize,
-    files_sorted_by: String,
-}
-
-fn write_text_outputs(
-    detail_root: &Path,
-    _tree_root: &Path,
-    users_dict: &[String],
-    team_map: &HashMap<String, String>,
-    user_file_artifacts: &HashMap<u32, UserFileArtifacts>,
-    total_docs: u64,
-    total_size: u64,
-    dir_user_rows: &[(u32, u32, u64)],
-    uid_totals_map: &HashMap<u32, (u64, u64, u64)>,
-    timestamp: i64,
-    path_dict_writer: &mut BufWriter<fs::File>,
-    seek_offsets: &[(u64, u32)],
-) -> Result<(), String> {
-    fs::create_dir_all(detail_root).map_err(|e| e.to_string())?;
-    fs::create_dir_all(detail_root.join("users")).map_err(|e| e.to_string())?;
-
-
-    let mut user_dirs: Vec<Vec<(u64, u32)>> = vec![Vec::new(); users_dict.len()];
-    for (dir_path_id, uid, bytes) in dir_user_rows {
-        let u = *uid as usize;
-        let p = *dir_path_id as usize;
-        if u < user_dirs.len() && p < seek_offsets.len() {
-            user_dirs[u].push((*bytes, *dir_path_id));
-        }
-    }
-    for rows in &mut user_dirs {
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
-    }
-
-    let total_files_u64: u64 = total_docs;
-    let total_dirs_u64: u64 = uid_totals_map.values().map(|(_, _, d)| *d).sum();
-
-    for (uid_idx, username) in users_dict.iter().enumerate() {
-        let safe = safe_user_dir(username);
-        let user_dir = detail_root.join("users").join(&safe);
-        fs::create_dir_all(user_dir.join("dirs")).map_err(|e| e.to_string())?;
-        fs::create_dir_all(user_dir.join("files")).map_err(|e| e.to_string())?;
-
-        let uid_id = uid_idx as u32;
-        let dir_rows = &user_dirs[uid_idx];
-        let file_artifacts = user_file_artifacts.get(&uid_id);
-
-        let file_parts: Vec<serde_json::Value> = file_artifacts
-            .map(|a| a.file_parts.clone())
-            .unwrap_or_default();
-        let file_total = file_artifacts.map(|a| a.total_files).unwrap_or(0);
-        let file_sorted_by = file_artifacts
-            .map(|a| a.files_sorted_by.clone())
-            .unwrap_or_else(|| "size_desc".to_string());
-        let ext_rows = file_artifacts
-            .map(|a| a.ext_rows.clone())
-            .unwrap_or_default();
-
-        // dirs chunks
-        let dir_chunks = if dir_rows.is_empty() {
-            1
-        } else {
-            (dir_rows.len() + FILE_PART_RECORDS - 1) / FILE_PART_RECORDS
-        };
-        let mut dir_parts: Vec<serde_json::Value> = Vec::new();
-        for chunk_idx in 0..dir_chunks {
-            let start = chunk_idx * FILE_PART_RECORDS;
-            let end = ((chunk_idx + 1) * FILE_PART_RECORDS).min(dir_rows.len());
-            let chunk = if start < end { &dir_rows[start..end] } else { &[] };
-            let chunk_dir = user_dir.join("dirs").join(format!("chunk-{:05}", chunk_idx));
-            fs::create_dir_all(&chunk_dir).map_err(|e| e.to_string())?;
-            let part_name = "part-00000.ndjson";
-            let part_path = chunk_dir.join(part_name);
-            let mut w = BufWriter::with_capacity(512 * 1024, fs::File::create(&part_path).map_err(|e| e.to_string())?);
-            for (size, path_id) in chunk {
-                serde_json::to_writer(&mut w, &json!({"gid": path_id, "s": size}))
-                    .map_err(|e| e.to_string())?;
-                w.write_all(b"\n").map_err(|e| e.to_string())?;
-            }
-            w.flush().map_err(|e| e.to_string())?;
-            dir_parts.push(json!({
-                "path": format!("dirs/chunk-{:05}/{}", chunk_idx, part_name),
-                "records": chunk.len()
-            }));
-        }
-
-
-        let page_index = json!({
-            "dirs": {
-                "pages": dir_parts.len(),
-                "total_full": dir_rows.len()
-            },
-            "files": {
-                "pages": file_parts.len(),
-                "total_full": file_total,
-                "sorted": {
-                    "by": file_sorted_by
-                }
-            },
-            "page_size": FILE_PART_RECORDS
-        });
-        fs::write(
-            user_dir.join("page_index.json"),
-            serde_json::to_vec(&page_index).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-
-        fs::write(
-            user_dir.join("extensions.json"),
-            serde_json::to_vec(&ext_rows).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-
-        let uid_id = uid_idx as u32;
-        let (files_cnt, bytes_cnt, dirs_cnt) = uid_totals_map
-            .get(&uid_id)
-            .copied()
-            .unwrap_or((0, 0, 0));
-        let manifest = json!({
-            "schema": "check-disk-user",
-            "scan_date": timestamp,
-            "username": username,
-            "team_id": team_map.get(username).cloned().unwrap_or_default(),
-            "summary": {
-                "dirs": dirs_cnt,
-                "files": files_cnt,
-                "used": bytes_cnt
-            },
-            "dirs": {"parts": dir_parts},
-            "files": {"parts": file_parts},
-            "page_index": "page_index.json",
-            "extensions": "extensions.json"
-        });
-        fs::write(
-            user_dir.join("manifest.json"),
-            serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    let users_for_root: Vec<_> = users_dict
-        .iter()
-        .enumerate()
-        .map(|(idx, username)| {
-            let uid_key = idx as u32;
-            let (files, bytes, dirs) = uid_totals_map.get(&uid_key).copied().unwrap_or((0, 0, 0));
-            let safe = safe_user_dir(username);
-            json!({
-                "username": username,
-                "uid": uid_key,
-                "team_id": team_map.get(username).cloned().unwrap_or_default(),
-                "manifest": format!("users/{}/manifest.json", safe),
-                "files": files,
-                "dirs": dirs,
-                "used": bytes,
-                "permission_issues": 0
-            })
         })
-        .collect();
-
-    let data_detail = json!({
-        "schema": "check-disk-detail",
-        "scan": {
-            "root": "",
-            "timestamp": timestamp,
-            "total_dirs": total_dirs_u64,
-            "total_files": total_files_u64,
-            "total_size": total_size
-        },
-        "path_dict": "api/path_dict.ndjson",
-        "path_dict_seek": "api/path_dict.seek",
-        "path_dict_seek_record_size": 16,
-        "users": users_for_root
-    });
-    fs::write(
-        detail_root.join("data_detail.json"),
-        serde_json::to_vec(&data_detail).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let root_manifest = json!({
-        "schema": "check-disk-detail",
-        "created_at": timestamp,
-        "users": users_for_root
-    });
-    fs::write(
-        detail_root.join("manifest.json"),
-        serde_json::to_vec(&root_manifest).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    fs::create_dir_all(detail_root.join("api")).map_err(|e| e.to_string())?;
-
-    path_dict_writer.flush().map_err(|e| e.to_string())?;
-
-    let seek_path = detail_root.join("api/path_dict.seek");
-    let mut seek_writer = BufWriter::with_capacity(
-        512 * 1024,
-        fs::File::create(&seek_path).map_err(|e| e.to_string())?,
-    );
-    seek_writer.write_all(b"PDX1").map_err(|e| e.to_string())?;
-    seek_writer.write_all(&1u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    seek_writer
-        .write_all(&(seek_offsets.len() as u32).to_le_bytes())
-        .map_err(|e| e.to_string())?;
-    for (gid, (off, len)) in seek_offsets.iter().enumerate() {
-        seek_writer.write_all(&(gid as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        seek_writer.write_all(&off.to_le_bytes()).map_err(|e| e.to_string())?;
-        seek_writer.write_all(&len.to_le_bytes()).map_err(|e| e.to_string())?;
-    }
-    seek_writer.flush().map_err(|e| e.to_string())?;
-
-    Ok(())
+        .collect()
 }
-#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
+
+// ─── Path tree assembly ───────────────────────────────────────────────
+
+/// Walks the set of directory paths discovered during ingestion + every parent
+/// up to `root`. Assigns BFS-ordered `dir_id` (root = 0) and interns every
+/// path segment into `name_id`.
+struct PathTree {
+    /// dir path → dir_id
+    dir_id_of: HashMap<String, i64>,
+    /// dir path stored alongside parent_id for downstream metadata building.
+    dirs_in_order: Vec<DirRowDraft>,
+    /// segment string → name_id (extended later with file basenames)
+    name_id_of: HashMap<String, i64>,
+    /// names[i] is the segment string for name_id == i (extended later).
+    names: Vec<String>,
+}
+
+struct DirRowDraft {
+    id: i64,
+    parent_id: Option<i64>,
+    name_id: i64,
+    depth: i64,
+    // NOTE: `path: String` was removed. After PathTree::build, callers only
+    // touch (id, parent_id, name_id, depth) — never the resolved path —
+    // so carrying it for 15M dirs cost ~1.2 GB without benefit.
+    // If a future caller needs the path, derive it via `dir_id_of`
+    // (when still alive) or by walking parent_id up name_id segments.
+}
+
+impl PathTree {
+    fn build(root: &str, dir_paths: &HashSet<String>) -> Self {
+        let mut all_paths: HashSet<String> = HashSet::new();
+        all_paths.insert(root.to_string());
+        for dp in dir_paths {
+            let mut cur = dp.clone();
+            loop {
+                if !all_paths.insert(cur.clone()) {
+                    break;
+                }
+                if cur == root {
+                    break;
+                }
+                let parent = tm_parent(&cur).to_string();
+                if parent == cur {
+                    break;
+                }
+                cur = parent;
+            }
+        }
+
+        // BFS from root: ensures parent_id < id, gives varint locality.
+        let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        for p in &all_paths {
+            if p == root {
+                continue;
+            }
+            let parent = tm_parent(p).to_string();
+            by_parent.entry(parent).or_default().push(p.clone());
+        }
+        for v in by_parent.values_mut() {
+            v.sort();
+        }
+
+        let mut name_id_of: HashMap<String, i64> = HashMap::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut intern = |seg: String| -> i64 {
+            if let Some(id) = name_id_of.get(&seg) {
+                return *id;
+            }
+            let id = names.len() as i64;
+            names.push(seg.clone());
+            name_id_of.insert(seg, id);
+            id
+        };
+
+        let root_name = if root == "/" {
+            "/".to_string()
+        } else {
+            tm_basename(root)
+        };
+        let root_name_id = intern(root_name);
+
+        let mut dir_id_of: HashMap<String, i64> = HashMap::new();
+        let mut dirs_in_order: Vec<DirRowDraft> = Vec::new();
+
+        dir_id_of.insert(root.to_string(), 0);
+        dirs_in_order.push(DirRowDraft {
+            id: 0,
+            parent_id: None,
+            name_id: root_name_id,
+            depth: 0,
+        });
+
+        let mut queue: VecDeque<(String, i64, i64)> = VecDeque::new();
+        queue.push_back((root.to_string(), 0, 0));
+        let mut next_id: i64 = 1;
+        while let Some((parent_path, parent_id, depth)) = queue.pop_front() {
+            let Some(children) = by_parent.remove(&parent_path) else { continue };
+            for child in children {
+                let id = next_id;
+                next_id += 1;
+                let seg = tm_basename(&child);
+                let name_id = intern(seg);
+                dir_id_of.insert(child.clone(), id);
+                dirs_in_order.push(DirRowDraft {
+                    id,
+                    parent_id: Some(parent_id),
+                    name_id,
+                    depth: depth + 1,
+                });
+                queue.push_back((child, id, depth + 1));
+            }
+        }
+
+        // BFS done. by_parent's children Vecs were consumed by remove(),
+        // but the outer HashMap still holds 15M String keys plus its own
+        // overhead (~1.2 GB at 15M-dir scale). Explicit drop frees it
+        // immediately rather than waiting for end-of-function.
+        drop(by_parent);
+
+        Self {
+            dir_id_of,
+            dirs_in_order,
+            name_id_of,
+            names,
+        }
+    }
+}
+
+// ─── Aggregation containers ───────────────────────────────────────────
+
+#[derive(Default)]
+struct LocalAgg {
+    dir_sizes: HashMap<String, HashMap<u32, i64>>,
+    rows_by_user: HashMap<String, Vec<(u64, String, String)>>,
+    row_spills: HashMap<String, Vec<PathBuf>>,
+    row_count: usize,
+    spill_bytes_written: u64,
+}
+
+#[derive(Default)]
+struct UserTotals {
+    files: i64,
+    size: i64,
+    dirs: i64,
+}
+
+// ─── Main entry point ─────────────────────────────────────────────────
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_dbs_impl(
     py: Python<'_>,
     tmpdir: String,
     uids_map: HashMap<u32, String>,
     team_map: HashMap<String, String>,
-    pipeline_db_path: String,
-    treemap_json: String,
-    treemap_db: String,
+    detail_db_path: String,
+    treemap_db_path: String,
     treemap_root: String,
     max_level: usize,
     min_size_bytes: i64,
@@ -396,18 +288,17 @@ pub fn build_pipeline_dbs_impl(
 ) -> PyResult<u64> {
     py.allow_threads(move || -> PyResult<u64> {
         let t_all = Instant::now();
-        let t_perm_tsv: f64;
-        let t_dir_build: f64;
-        let t_output_jobs: f64;
-        let t_chunk_parallel: f64;
-        let t_finalize: f64;
-        let t_text_write: f64;
-        let t_perm_write: f64;
-        let t_swap_detail: f64;
-        let mut t_tree: f64 = 0.0;
-        let mut t_swap_tree: f64 = 0.0;
+        let mut t_perm_tsv = 0.0f64;
+        let mut t_ingest = 0.0f64;
+        let mut t_path_tree = 0.0f64;
+        let mut t_treemap_db = 0.0f64;
+        let mut t_files_db = 0.0f64;
+        let mut t_finalize_detail = 0.0f64;
+        let mut t_perm_write = 0.0f64;
 
-        let detail_root = Path::new(&pipeline_db_path)
+        // ─── Setup work dirs ───────────────────────────────────────
+        let detail_db_pb = PathBuf::from(&detail_db_path);
+        let detail_root = detail_db_pb
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("detail_users"));
@@ -416,129 +307,114 @@ pub fn build_pipeline_dbs_impl(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         ensure_dir(&detail_parent)?;
-        let detail_work_root = detail_parent.join(format!(
-            ".detail_users_build_{}",
-            std::process::id()
-        ));
+        ensure_dir(&detail_root)?;
+
+        let detail_work_root =
+            detail_parent.join(format!(".detail_users_build_{}", std::process::id()));
         cleanup_stale_build_dirs(&detail_parent, ".detail_users_build_", &detail_work_root);
         recreate_dir(&detail_work_root)?;
-        ensure_dir(&detail_work_root.join("users"))?;
-        ensure_dir(&detail_work_root.join("api"))?;
 
-        let tree_data_dir = PathBuf::from(&treemap_db);
-        let tree_parent = tree_data_dir
+        let treemap_db_pb = PathBuf::from(&treemap_db_path);
+        let treemap_root_dir = treemap_db_pb
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("tree_map_data"));
+        let treemap_parent = treemap_root_dir
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        ensure_dir(&tree_parent)?;
-        let tree_work_dir = tree_parent.join(format!(
-            ".tree_map_data_build_{}",
-            std::process::id()
-        ));
-        cleanup_stale_build_dirs(&tree_parent, ".tree_map_data_build_", &tree_work_dir);
-        recreate_dir(&tree_work_dir)?;
+        ensure_dir(&treemap_parent)?;
+        ensure_dir(&treemap_root_dir)?;
 
+        let treemap_work_dir =
+            treemap_parent.join(format!(".tree_map_data_build_{}", std::process::id()));
+        cleanup_stale_build_dirs(&treemap_parent, ".tree_map_data_build_", &treemap_work_dir);
+        recreate_dir(&treemap_work_dir)?;
+
+        let spool_root = detail_work_root.join(".rows_spill");
+        recreate_dir(&spool_root)?;
+
+        // ─── Phase 1 spill files ───────────────────────────────────
         let t0 = Instant::now();
         let mut perm_events = read_permission_events(&tmpdir).unwrap_or_default();
         t_perm_tsv = t0.elapsed().as_secs_f64();
 
-        let t1 = Instant::now();
-
-        struct LocalAgg {
-            dir_sizes: HashMap<String, HashMap<u32, i64>>,
-            rows_by_user: HashMap<String, Vec<(u64, String, String)>>,
-            row_spills: HashMap<String, Vec<PathBuf>>,
-            row_count: usize,
-            spill_bytes_written: u64,
-        }
-        let spool_root = detail_work_root.join(".rows_spill");
-        recreate_dir(&spool_root)?;
-        let spill_seq = Arc::new(AtomicU64::new(0));
-
         let dir_agg_paths = get_dir_agg_files(&tmpdir)?;
         let has_dir_agg = !dir_agg_paths.is_empty();
         let bin_paths = get_scan_event_files(&tmpdir)?;
-        println!("[Phase 2] Ingesting and mapping {} event streams...", bin_paths.len());
+        println!(
+            "[Phase 2] Ingesting and mapping {} event streams...",
+            bin_paths.len()
+        );
+
+        // ─── STAGE 1: Parallel ingest + aggregate ─────────────────
+        let t1 = Instant::now();
+        let spill_seq = Arc::new(AtomicU64::new(0));
 
         let merged_agg = bin_paths
             .into_par_iter()
-            .fold(
-                || LocalAgg {
-                    dir_sizes: HashMap::new(),
-                    rows_by_user: HashMap::new(),
-                    row_spills: HashMap::new(),
-                    row_count: 0,
-                    spill_bytes_written: 0,
-                },
-                |mut agg, path| {
-                    let spill_seq_ref = &spill_seq;
-                    let _ = for_each_scan_event_in_file(&path, |event| {
-                        let username = uids_map
-                            .get(&event.uid)
-                            .cloned()
-                            .unwrap_or_else(|| format!("uid-{}", event.uid));
-                        let safe_path = crate::sanitise_path(&event.path);
-                        let ext = crate::pipe_types::extension_for_path(&safe_path);
-                        agg.rows_by_user
-                            .entry(username.clone())
-                            .or_default()
-                            .push((event.size, safe_path.clone(), ext));
-                        agg.row_count += 1;
-                        if !has_dir_agg {
-                            if let Some(parent) = crate::pipe_types::parent_path(&safe_path) {
-                                let user_sizes = agg.dir_sizes.entry(parent).or_default();
-                                *user_sizes.entry(event.uid).or_insert(0) += event.size as i64;
-                            }
-                        }
-                    });
-                    if agg.row_count >= ROW_SPILL_THRESHOLD {
-                        agg.spill_bytes_written += spill_rows_to_disk(
-                            &spool_root,
-                            spill_seq_ref,
-                            &mut agg.rows_by_user,
-                            &mut agg.row_spills,
-                        );
-                        agg.row_count = 0;
-                    }
-                    agg
-                },
-            )
-            .reduce(
-                || LocalAgg {
-                    dir_sizes: HashMap::new(),
-                    rows_by_user: HashMap::new(),
-                    row_spills: HashMap::new(),
-                    row_count: 0,
-                    spill_bytes_written: 0,
-                },
-                |mut a, b| {
-                    for (user, mut rows) in b.rows_by_user {
-                        let row_len = rows.len();
-                        a.rows_by_user.entry(user).or_default().append(&mut rows);
-                        a.row_count += row_len;
-                    }
-                    for (user, mut spills) in b.row_spills {
-                        a.row_spills.entry(user).or_default().append(&mut spills);
-                    }
-                    for (dir, sizes_b) in b.dir_sizes {
-                        let sizes_a = a.dir_sizes.entry(dir).or_default();
-                        for (uid, size) in sizes_b {
-                            *sizes_a.entry(uid).or_insert(0) += size;
+            .fold(LocalAgg::default, |mut agg, path| {
+                let _ = for_each_scan_event_in_file(&path, |event| {
+                    let username = uids_map
+                        .get(&event.uid)
+                        .cloned()
+                        .unwrap_or_else(|| format!("uid-{}", event.uid));
+                    let safe_path = crate::sanitise_path(&event.path);
+                    let ext = crate::pipe_types::extension_for_path(&safe_path);
+                    agg.rows_by_user
+                        .entry(username)
+                        .or_default()
+                        .push((event.size, safe_path.clone(), ext));
+                    agg.row_count += 1;
+                    if !has_dir_agg {
+                        if let Some(parent) = crate::pipe_types::parent_path(&safe_path) {
+                            let user_sizes = agg.dir_sizes.entry(parent).or_default();
+                            *user_sizes.entry(event.uid).or_insert(0) += event.size as i64;
                         }
                     }
-                    a.spill_bytes_written += b.spill_bytes_written;
-                    if a.row_count >= ROW_SPILL_THRESHOLD {
-                        a.spill_bytes_written += spill_rows_to_disk(&spool_root, &spill_seq, &mut a.rows_by_user, &mut a.row_spills);
-                        a.row_count = 0;
+                });
+                if agg.row_count >= ROW_SPILL_THRESHOLD {
+                    agg.spill_bytes_written += spill_rows_to_disk(
+                        &spool_root,
+                        &spill_seq,
+                        &mut agg.rows_by_user,
+                        &mut agg.row_spills,
+                    );
+                    agg.row_count = 0;
+                }
+                agg
+            })
+            .reduce(LocalAgg::default, |mut a, b| {
+                for (user, mut rows) in b.rows_by_user {
+                    let row_len = rows.len();
+                    a.rows_by_user.entry(user).or_default().append(&mut rows);
+                    a.row_count += row_len;
+                }
+                for (user, mut spills) in b.row_spills {
+                    a.row_spills.entry(user).or_default().append(&mut spills);
+                }
+                for (dir, sizes_b) in b.dir_sizes {
+                    let sizes_a = a.dir_sizes.entry(dir).or_default();
+                    for (uid, size) in sizes_b {
+                        *sizes_a.entry(uid).or_insert(0) += size;
                     }
-                    a
-                },
-            );
+                }
+                a.spill_bytes_written += b.spill_bytes_written;
+                if a.row_count >= ROW_SPILL_THRESHOLD {
+                    a.spill_bytes_written += spill_rows_to_disk(
+                        &spool_root,
+                        &spill_seq,
+                        &mut a.rows_by_user,
+                        &mut a.row_spills,
+                    );
+                    a.row_count = 0;
+                }
+                a
+            });
 
         let mut total_spill_written = merged_agg.spill_bytes_written;
 
-
-        let dir_sizes_by_user = if has_dir_agg {
+        let mut dir_sizes_by_user: HashMap<String, HashMap<u32, i64>> = if has_dir_agg {
             println!(
                 "[Phase 2] Loading {} Phase 1 directory aggregate shards...",
                 dir_agg_paths.len()
@@ -567,302 +443,613 @@ pub fn build_pipeline_dbs_impl(
             merged_agg.dir_sizes
         };
 
-        let dir_sizes: Vec<(String, Vec<(u32, i64)>)> = dir_sizes_by_user
-            .into_iter()
-            .map(|(dir, user_map)| (dir, user_map.into_iter().collect()))
-            .collect();
         let mut rows_by_user = merged_agg.rows_by_user;
         let mut row_spills = merged_agg.row_spills;
-        total_spill_written += spill_rows_to_disk(&spool_root, &spill_seq, &mut rows_by_user, &mut row_spills);
+        total_spill_written += spill_rows_to_disk(
+            &spool_root,
+            &spill_seq,
+            &mut rows_by_user,
+            &mut row_spills,
+        );
         rows_by_user.clear();
-        let mut total_spill_read = 0u64;
+        t_ingest = t1.elapsed().as_secs_f64();
 
-        let mut dir_owner_map: HashMap<String, String> = HashMap::new();
-        let mut users: HashMap<String, UserOutputMeta> = HashMap::new();
+        // ─── STAGE 2: Path tree + dir aggregate ────────────────────
+        let t2 = Instant::now();
+        let root = normalize_root(&treemap_root);
 
-        println!("[Phase 2] Grouping directory stats for {} paths...", dir_sizes.len());
+        let dir_paths_set: HashSet<String> =
+            dir_sizes_by_user.keys().cloned().collect();
+        println!(
+            "[Phase 2] Building path tree for {} directories...",
+            dir_paths_set.len()
+        );
+        let mut path_tree = PathTree::build(&root, &dir_paths_set);
+        // Free the path-keyed set now — path_tree owns the canonical layout
+        // and lookups go through dir_id_of from here on.
+        drop(dir_paths_set);
 
-        for (dpath, user_sizes) in dir_sizes.iter() {
-            let mut d_max_size = 0_i64;
-            let mut d_max_user = String::new();
-            for (owner_uid, size) in user_sizes {
+        // username → uid (POSIX preferred; for unknown users keep negative slot.)
+        let mut username_to_uid: HashMap<String, i64> = HashMap::new();
+        let mut uid_to_username: HashMap<i64, String> = HashMap::new();
+        for (uid, name) in &uids_map {
+            let id = *uid as i64;
+            username_to_uid.insert(name.clone(), id);
+            uid_to_username.insert(id, name.clone());
+        }
+        // Reserve synthetic uid for users referenced only via "uid-N" placeholder.
+        let mut next_synthetic_uid: i64 = 1_000_000_000;
+        let mut intern_user = |username: &str,
+                               username_to_uid: &mut HashMap<String, i64>,
+                               uid_to_username: &mut HashMap<i64, String>|
+         -> i64 {
+            if let Some(uid) = username_to_uid.get(username) {
+                return *uid;
+            }
+            let synth = next_synthetic_uid;
+            next_synthetic_uid += 1;
+            username_to_uid.insert(username.to_string(), synth);
+            uid_to_username.insert(synth, username.to_string());
+            synth
+        };
+
+        // Per-dir aggregates: total_size + per-owner weight breakdown.
+        // We do NOT materialize a separate `dir_owner_rows: Vec` — the same
+        // (dir_id, uid, size) tuples can be derived on-the-fly from
+        // `owner_weights_by_dir` when emitting treemap.db. Skipping the Vec
+        // saves ~1 GB RAM at 75M-file scale.
+        //
+        // dir_ids are dense 0..N (BFS-assigned), so per-dir scalar maps go
+        // into Vec instead of HashMap — saves the 24-32 B/entry HashMap
+        // overhead. Roughly 1.4 GB → 480 MB at 75M scale.
+        let n_dirs = path_tree.dirs_in_order.len();
+        let mut total_size_by_dir: Vec<i64> = vec![0; n_dirs];
+        let mut owner_weights_by_dir: HashMap<i64, HashMap<i64, i64>> = HashMap::new();
+        let mut user_dir_count: HashMap<i64, i64> = HashMap::new();
+        let mut user_total_size_from_dirs: HashMap<i64, i64> = HashMap::new();
+
+        // Drain dir_sizes_by_user into dir_id-keyed form. The String keys are
+        // dropped here (~7 MB demo / ~1.2 GB worst case) — owner aggregates
+        // and downstream lookups go through dir_id only.
+        let dir_sizes_drained: Vec<(i64, HashMap<u32, i64>)> = dir_sizes_by_user
+            .drain()
+            .filter_map(|(dir_path, uid_sizes)| {
+                path_tree.dir_id_of.get(&dir_path).map(|id| (*id, uid_sizes))
+            })
+            .collect();
+        drop(dir_sizes_by_user);
+
+        for (dir_id, uid_sizes) in &dir_sizes_drained {
+            let mut total: i64 = 0;
+            let weights = owner_weights_by_dir.entry(*dir_id).or_default();
+            for (raw_uid, size) in uid_sizes {
                 if *size <= 0 {
                     continue;
                 }
-                let owner = uids_map
-                    .get(owner_uid)
+                let username = uids_map
+                    .get(raw_uid)
                     .cloned()
-                    .unwrap_or_else(|| format!("uid-{}", owner_uid));
-                if *size > d_max_size {
-                    d_max_size = *size;
-                    d_max_user = owner.clone();
+                    .unwrap_or_else(|| format!("uid-{}", raw_uid));
+                let uid = intern_user(&username, &mut username_to_uid, &mut uid_to_username);
+                total += *size;
+                *weights.entry(uid).or_insert(0) += *size;
+                *user_dir_count.entry(uid).or_insert(0) += 1;
+                *user_total_size_from_dirs.entry(uid).or_insert(0) += *size;
+            }
+            if (*dir_id as usize) < total_size_by_dir.len() {
+                total_size_by_dir[*dir_id as usize] = total;
+            }
+        }
+        drop(dir_sizes_drained);
+
+        // Aggregate subtree sizes bottom-up so dirs.total_size includes children.
+        // BFS reverse order (deepest first) is enough.
+        // dir_ids are dense 0..N — Vec wins over HashMap (24-byte/entry
+        // overhead). At 15M dirs, 4 × Vec<i64> = 480 MB vs HashMap's 1.4 GB.
+        let mut dirs_by_depth: Vec<&DirRowDraft> = path_tree.dirs_in_order.iter().collect();
+        dirs_by_depth.sort_by(|a, b| b.depth.cmp(&a.depth));
+
+        let mut subtree_size: Vec<i64> = vec![0; n_dirs];
+        let mut subtree_files: Vec<i64> = vec![0; n_dirs];
+        let mut direct_dir_count: Vec<i64> = vec![0; n_dirs];
+        let mut direct_file_count: Vec<i64> = vec![0; n_dirs];
+
+        for d in &path_tree.dirs_in_order {
+            if let Some(parent) = d.parent_id {
+                if (parent as usize) < direct_dir_count.len() {
+                    direct_dir_count[parent as usize] += 1;
                 }
-                let entry = users.entry(owner.clone()).or_insert_with(|| UserOutputMeta {
-                    team_id: team_map.get(owner.as_str()).cloned().unwrap_or_default(),
-                    ..Default::default()
-                });
-                entry.total_dirs += 1;
-                entry.total_used += *size;
-            }
-            if !d_max_user.is_empty() {
-                dir_owner_map.insert(dpath.clone(), d_max_user);
             }
         }
 
-        for username in row_spills.keys() {
-            users
-                .entry(username.clone())
-                .or_insert_with(|| UserOutputMeta {
-                    team_id: team_map.get(username).cloned().unwrap_or_default(),
-                    ..Default::default()
-                });
+        // Initial subtree size = direct size from total_size_by_dir.
+        for d in &path_tree.dirs_in_order {
+            let idx = d.id as usize;
+            if idx < subtree_size.len() && idx < total_size_by_dir.len() {
+                subtree_size[idx] = total_size_by_dir[idx];
+            }
         }
-        t_dir_build = t1.elapsed().as_secs_f64();
 
-        let t2 = Instant::now();
-        println!(
-            "[Phase 2] Building file chunks per user ({} users)...",
-            row_spills.len()
-        );
-        t_output_jobs = t2.elapsed().as_secs_f64();
+        for d in dirs_by_depth {
+            let idx = d.id as usize;
+            if idx >= subtree_size.len() {
+                continue;
+            }
+            let size = subtree_size[idx];
+            let files = subtree_files[idx];
+            if let Some(parent) = d.parent_id {
+                let pidx = parent as usize;
+                if pidx < subtree_size.len() {
+                    subtree_size[pidx] += size;
+                    subtree_files[pidx] += files;
+                }
+            }
+        }
 
-        let t3 = Instant::now();
-        let detail_workers = max_workers.max(1);
-        let mut user_keys: Vec<String> = users.keys().cloned().collect();
-        user_keys.sort();
-        let total_users = user_keys.len().max(1);
+        // ─── STAGE 3a/3b combined — single pass over spill files ──
+        // Optimization: previously we did Pass 0 (intern names + ext, aggregate
+        // per-user/per-dir totals) and Pass 1 (insert files). That re-read the
+        // entire spill payload twice. Now we do everything in ONE pass:
+        //
+        //   • Open detail.db, set up DDL.
+        //   • Stream each spill row → intern basename into path_tree.names,
+        //     intern ext, aggregate user_dir_size/totals, push
+        //     FileRow into a chunk buffer (flushed every FILE_INSERT_CHUNK
+        //     rows), maintain top-K heap per user.
+        //   • Once spill stream is done, build treemap.db (path_tree.names is
+        //     now complete with both dir segments and file basenames).
+        //   • Insert top_files, dict tables, finalize.
+        //
+        // detail.db.files references tm.names.id by integer — the FK isn't
+        // enforced and consumers ATTACH treemap.db at query time, so writing
+        // treemap.db AFTER detail.db.files is fine: both DBs are atomic-renamed
+        // at the very end of build_pipeline_dbs_impl.
+        let t_pipeline = Instant::now();
 
-        let mut global_path_to_id: HashMap<u64, usize> = HashMap::new();
-        let mut global_parent_path_id: Vec<u32> = vec![0u32];
-        global_path_to_id.insert(path_hash("/"), 0usize);
-        let path_dict_path = detail_work_root.join("api/path_dict.ndjson");
-        let path_dict_file = fs::File::create(&path_dict_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("create {}: {}", path_dict_path.display(), e)))?;
-        let mut path_dict_writer = BufWriter::with_capacity(2 * 1024 * 1024, path_dict_file);
-        let root_row = serde_json::to_vec(&json!({"gid": 0u32, "p": "/"}))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        path_dict_writer
-            .write_all(&root_row)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        path_dict_writer
-            .write_all(b"\n")
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut seek_offsets: Vec<(u64, u32)> = Vec::new();
-        seek_offsets.push((0u64, (root_row.len() + 1) as u32));
-        let mut path_dict_ndjson_offset: u64 = (root_row.len() + 1) as u64;
-        let mut next_gid: usize = 1;
+        let mut detail_handle = db_writer::detail_open(&detail_db_pb, &detail_work_root, debug)?;
 
-        let mut user_to_uid: HashMap<String, u32> = HashMap::new();
-        let mut users_dict: Vec<String> = Vec::new();
-        let mut user_file_artifacts: HashMap<u32, UserFileArtifacts> = HashMap::new();
-        let mut total_docs: u64 = 0;
-        let mut total_size: u64 = 0;
-        let mut user_timings: Vec<(String, f64, usize, usize)> = Vec::new();
-        let mut user_results: Vec<crate::pipe_types::UserBuildResult> = Vec::with_capacity(user_keys.len());
+        let mut ext_id_of_lookup: HashMap<String, i64> = HashMap::new();
+        let mut next_ext_id: i64 = 0;
 
-        let mut done_users = 0usize;
-        for username in user_keys {
-            let user_t0 = if debug { Some(Instant::now()) } else { None };
-            let user = users.remove(&username).unwrap_or_default();
-            let spills = row_spills.remove(&username).unwrap_or_default();
-            for path in &spills {
-                if let Ok(meta) = fs::metadata(path) {
+        // File basenames live in detail.db, separately from tm.names (which
+        // holds DIR segments only). Splitting keeps treemap.db lean for the
+        // treemap UI consumer.
+        let mut file_name_id_of: HashMap<String, i64> = HashMap::new();
+        let mut file_names: Vec<String> = Vec::new();
+
+        let mut user_totals: HashMap<i64, UserTotals> = HashMap::new();
+        let mut user_dir_size: HashMap<(i64, i64), (i64, i64)> = HashMap::new();
+        let mut total_docs: i64 = 0;
+        let mut total_size: i64 = 0;
+        let mut total_spill_read: u64 = 0;
+
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut next_file_id: i64 = 1;
+        let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
+
+        let mut sorted_users: Vec<String> = row_spills.keys().cloned().collect();
+        sorted_users.sort();
+
+        // Pre-size top_heaps with the exact user count so we don't pay the
+        // 7 grow-and-rehash cycles HashMap does from default capacity.
+        let mut top_heaps: HashMap<i64, BinaryHeap<Reverse<(i64, i64)>>> =
+            HashMap::with_capacity(sorted_users.len());
+
+        let user_spill_paths: HashMap<String, Vec<PathBuf>> = row_spills
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for username in &sorted_users {
+            let uid = intern_user(username, &mut username_to_uid, &mut uid_to_username);
+            let totals = user_totals.entry(uid).or_default();
+            let Some(spills) = user_spill_paths.get(username) else { continue };
+            for spill_path in spills {
+                if let Ok(meta) = fs::metadata(spill_path) {
                     total_spill_read += meta.len();
                 }
-            }
-
-            let uid = if let Some(found) = user_to_uid.get(&username) {
-                *found
-            } else {
-                let id = users_dict.len() as u32;
-                users_dict.push(username.clone());
-                user_to_uid.insert(username.clone(), id);
-                id
-            };
-
-            let user_dir = detail_work_root.join("users").join(safe_user_dir(&username));
-            fs::create_dir_all(user_dir.join("files")).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let mut ext_map: HashMap<String, (u64, u64)> = HashMap::new();
-            let mut file_parts: Vec<serde_json::Value> = Vec::new();
-            let mut sorted_file_rows: Vec<(u32, u64, String)> = Vec::new();
-            let mut part_index: usize = 0;
-            let mut total_user_files: usize = 0;
-
-            for spill_path in &spills {
-                let file = fs::File::open(spill_path)
-                    .map_err(|e| PyRuntimeError::new_err(format!("open spill {}: {}", spill_path.display(), e)))?;
-                let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+                let mut reader = match fs::File::open(spill_path) {
+                    Ok(f) => BufReader::with_capacity(8 * 1024 * 1024, f),
+                    Err(_) => continue,
+                };
                 let mut head = [0u8; 12];
                 let mut ext_len_buf = [0u8; 2];
                 let mut path_bytes: Vec<u8> = Vec::new();
                 let mut ext_bytes: Vec<u8> = Vec::new();
-
                 loop {
                     match reader.read_exact(&mut head) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                         Err(e) => {
                             return Err(PyRuntimeError::new_err(format!(
-                                "read spill header {}: {}",
+                                "read spill head {}: {}",
                                 spill_path.display(),
                                 e
                             )));
                         }
                     }
-
                     let size = u64::from_le_bytes(head[0..8].try_into().unwrap_or([0u8; 8]));
-                    let path_len = u32::from_le_bytes(head[8..12].try_into().unwrap_or([0u8; 4])) as usize;
+                    let path_len =
+                        u32::from_le_bytes(head[8..12].try_into().unwrap_or([0u8; 4])) as usize;
                     path_bytes.clear();
                     path_bytes.resize(path_len, 0);
-                    reader
-                        .read_exact(&mut path_bytes)
-                        .map_err(|e| PyRuntimeError::new_err(format!("read spill path {}: {}", spill_path.display(), e)))?;
-                    reader
-                        .read_exact(&mut ext_len_buf)
-                        .map_err(|e| PyRuntimeError::new_err(format!("read spill ext len {}: {}", spill_path.display(), e)))?;
+                    reader.read_exact(&mut path_bytes).map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "read spill path {}: {}",
+                            spill_path.display(),
+                            e
+                        ))
+                    })?;
+                    reader.read_exact(&mut ext_len_buf).map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "read spill ext len {}: {}",
+                            spill_path.display(),
+                            e
+                        ))
+                    })?;
                     let ext_len = u16::from_le_bytes(ext_len_buf) as usize;
                     ext_bytes.clear();
                     ext_bytes.resize(ext_len, 0);
-                    reader
-                        .read_exact(&mut ext_bytes)
-                        .map_err(|e| PyRuntimeError::new_err(format!("read spill ext {}: {}", spill_path.display(), e)))?;
-
+                    reader.read_exact(&mut ext_bytes).map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "read spill ext {}: {}",
+                            spill_path.display(),
+                            e
+                        ))
+                    })?;
                     let safe_path = String::from_utf8_lossy(&path_bytes).to_string();
                     let ext = String::from_utf8_lossy(&ext_bytes).to_string();
+                    let basename = tm_basename(&safe_path);
 
-                    let path_id = ensure_path_id(
-                        &safe_path,
-                        &mut global_path_to_id,
-                        &mut global_parent_path_id,
-                        &mut next_gid,
-                        &mut path_dict_writer,
-                        &mut seek_offsets,
-                        &mut path_dict_ndjson_offset,
-                    )
-                    .map_err(PyRuntimeError::new_err)? as u32;
+                    // Intern basename into detail.db's local file_names table.
+                    let name_id = match file_name_id_of.get(&basename) {
+                        Some(id) => *id,
+                        None => {
+                            let id = file_names.len() as i64;
+                            file_names.push(basename.clone());
+                            file_name_id_of.insert(basename, id);
+                            id
+                        }
+                    };
 
-                    sorted_file_rows.push((path_id, size, ext.clone()));
+                    // Intern ext.
+                    let ext_id = match ext_id_of_lookup.get(&ext) {
+                        Some(id) => *id,
+                        None => {
+                            let id = next_ext_id;
+                            next_ext_id += 1;
+                            ext_id_of_lookup.insert(ext.clone(), id);
+                            id
+                        }
+                    };
 
-                    let entry = ext_map.entry(ext).or_insert((0, 0));
-                    entry.0 += 1;
-                    entry.1 += size;
-                    total_docs += 1;
-                    total_size += size;
-                    total_user_files += 1;
-                }
-            }
+                    let parent = crate::pipe_types::parent_path(&safe_path)
+                        .unwrap_or_else(|| root.clone());
+                    let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0);
+                    let dus = user_dir_size.entry((uid, dir_id)).or_insert((0, 0));
+                    dus.0 += size as i64;
+                    dus.1 += 1;
 
-            // Sort all file rows by size DESC for this user
-            sorted_file_rows.sort_by(|a, b| b.1.cmp(&a.1));
-
-            // Write sorted chunks
-            let mut part_writer: Option<BufWriter<fs::File>> = None;
-            let mut part_records: usize = 0;
-            for (path_id, size, ext) in &sorted_file_rows {
-                if part_writer.is_none() {
-                    let chunk_dir = user_dir.join("files").join(format!("chunk-{:05}", part_index));
-                    fs::create_dir_all(&chunk_dir)
-                        .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", chunk_dir.display(), e)))?;
-                    let part_path = chunk_dir.join("part-00000_files.ndjson");
-                    let file = fs::File::create(&part_path)
-                        .map_err(|e| PyRuntimeError::new_err(format!("create {}: {}", part_path.display(), e)))?;
-                    part_writer = Some(BufWriter::with_capacity(512 * 1024, file));
-                    part_records = 0;
-                }
-
-                if let Some(writer) = part_writer.as_mut() {
-                    serde_json::to_writer(&mut *writer, &json!({"gid": path_id, "s": size, "x": ext}))
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    writer.write_all(b"\n").map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                }
-
-                part_records += 1;
-                if part_records >= FILE_PART_RECORDS {
-                    if let Some(mut writer) = part_writer.take() {
-                        writer.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    if (dir_id as usize) < direct_file_count.len() {
+                        direct_file_count[dir_id as usize] += 1;
                     }
-                    file_parts.push(json!({
-                        "path": format!("files/chunk-{:05}/part-00000_files.ndjson", part_index),
-                        "records": part_records
-                    }));
-                    part_index += 1;
-                    part_records = 0;
+
+                    totals.files += 1;
+                    totals.size += size as i64;
+                    total_docs += 1;
+                    total_size += size as i64;
+
+                    // Maintain top-K heap.
+                    let file_id = next_file_id;
+                    next_file_id += 1;
+                    let h = top_heaps.entry(uid).or_default();
+                    let size_i = size as i64;
+                    if h.len() < DEFAULT_TOP_K {
+                        h.push(Reverse((size_i, file_id)));
+                    } else if let Some(&Reverse((min_size, _))) = h.peek() {
+                        if size_i > min_size {
+                            h.pop();
+                            h.push(Reverse((size_i, file_id)));
+                        }
+                    }
+
+                    chunk.push(FileRow {
+                        dir_id,
+                        name_id,
+                        ext_id,
+                        uid,
+                        size: size_i,
+                    });
+                    if chunk.len() >= FILE_INSERT_CHUNK {
+                        db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
+                        chunk.clear();
+                    }
                 }
-            }
-
-            if let Some(mut writer) = part_writer.take() {
-                writer.flush().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                file_parts.push(json!({
-                    "path": format!("files/chunk-{:05}/part-00000_files.ndjson", part_index),
-                    "records": part_records
-                }));
-            }
-
-            let mut ext_rows: Vec<serde_json::Value> = ext_map
-                .into_iter()
-                .map(|(ext, (count, size))| json!({"ext": ext, "count": count, "size": size}))
-                .collect();
-            ext_rows.sort_by(|a, b| {
-                b.get("size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-                    .cmp(&a.get("size").and_then(|v| v.as_u64()).unwrap_or(0))
-            });
-            user_file_artifacts.insert(
-                uid,
-                UserFileArtifacts {
-                    file_parts,
-                    ext_rows,
-                    total_files: total_user_files,
-                    files_sorted_by: "size_desc".to_string(),
-                },
-            );
-
-            let team_id = if user.team_id.is_empty() {
-                team_map.get(&username).cloned().unwrap_or_default()
-            } else {
-                user.team_id
-            };
-            user_results.push(crate::pipe_types::UserBuildResult {
-                username: username.clone(),
-                team_id,
-                total_dirs: user.total_dirs,
-                total_files: total_user_files as i64,
-                total_used: user.total_used,
-            });
-
-            for path in &spills {
-                let _ = fs::remove_file(path);
-            }
-
-            done_users += 1;
-            if done_users % 10 == 0 || done_users == total_users {
-                let pct = (done_users as f64 / total_users as f64) * 100.0;
-                let rss_mb = crate::pipe_types::get_rss_mb();
-                println!(
-                    "[Phase 2] Detail reports: {}/{} users ({:.1}%) | RSS: {:.1} MB",
-                    done_users, total_users, pct, rss_mb
-                );
-            }
-
-            if debug {
-                let user_time_s = user_t0.map(|t0| t0.elapsed().as_secs_f64()).unwrap_or(0.0);
-                let part_count = user_file_artifacts
-                    .get(&uid)
-                    .map(|a| a.file_parts.len())
-                    .unwrap_or(0);
-                user_timings.push((username, user_time_s, spills.len(), part_count));
+                let _ = fs::remove_file(spill_path);
             }
         }
-        t_chunk_parallel = t3.elapsed().as_secs_f64();
+        if !chunk.is_empty() {
+            db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
+            chunk.clear();
+        }
+        t_files_db = t_pipeline.elapsed().as_secs_f64();
 
-        let t4 = Instant::now();
-        user_results.sort_by(|a, b| a.username.cmp(&b.username));
-        let total_files_processed: i64 = user_results.iter().map(|u| u.total_files).sum();
+        // Streaming pass is done — drop two big lookup tables that are no
+        // longer needed. Verified: `file_name_id_of` is only used inside the
+        // stream loop (the dedup'd basenames live in `file_names: Vec`,
+        // which is consumed later by detail_insert_names). `dir_id_of` is
+        // only used in the stream loop to map parent_path → dir_id; the
+        // remaining stages key everything by dir_id directly.
+        // Saves ~1.5 GB (basename map) + ~1.5 GB (dir_id_of) at 75M-file
+        // / 15M-dir scale.
+        drop(file_name_id_of);
+        path_tree.dir_id_of = HashMap::new();
 
-        let mut errcode_map: HashMap<String, u16> = HashMap::new();
-        let mut perm_records: Vec<(u32, u32, u16, u8)> = Vec::new();
+        // Recompute subtree_files bottom-up now that direct_file_count is final.
+        for d in &path_tree.dirs_in_order {
+            let idx = d.id as usize;
+            if idx < subtree_files.len() && idx < direct_file_count.len() {
+                subtree_files[idx] += direct_file_count[idx];
+            }
+        }
+        // Scope `dirs_by_depth_rev` to drop the temporary Vec<&DirRowDraft>
+        // (~120 MB at 15M dirs) immediately after the bottom-up walk
+        // finishes — without this it would live to end of function.
+        {
+            let mut dirs_by_depth_rev: Vec<&DirRowDraft> = path_tree.dirs_in_order.iter().collect();
+            dirs_by_depth_rev.sort_by(|a, b| b.depth.cmp(&a.depth));
+            for d in &dirs_by_depth_rev {
+                let idx = d.id as usize;
+                if idx >= subtree_files.len() {
+                    continue;
+                }
+                let f = subtree_files[idx];
+                if let Some(parent) = d.parent_id {
+                    let pidx = parent as usize;
+                    if pidx < subtree_files.len() {
+                        subtree_files[pidx] += f;
+                    }
+                }
+            }
+        }
+
+        // ─── STAGE 3a (after streaming): build treemap.db ──────────
+        // Spawn the treemap build on a background thread so it runs in
+        // parallel with detail.db's remaining dict + aggregate inserts and
+        // (more importantly) the detail.db CREATE INDEX + VACUUM finalize.
+        // Both DBs are atomically renamed into place at the very end of this
+        // function, so concurrent build is safe — neither file references the
+        // other at write time.
+        let t3a = Instant::now();
+        let treemap_thread: Option<std::thread::JoinHandle<PyResult<()>>> = if build_treemap {
+            let mut all_uids: HashSet<i64> = uid_to_username.keys().copied().collect();
+            for d in &path_tree.dirs_in_order {
+                if let Some(weights) = owner_weights_by_dir.get(&d.id) {
+                    for uid in weights.keys() {
+                        all_uids.insert(*uid);
+                    }
+                }
+            }
+            let mut owners: Vec<OwnerRow> = all_uids
+                .into_iter()
+                .filter_map(|uid| {
+                    uid_to_username
+                        .get(&uid)
+                        .cloned()
+                        .map(|username| OwnerRow { uid, username })
+                })
+                .collect();
+            owners.sort_by_key(|o| o.uid);
+
+            let owner_uid_fallback = owners.first().map(|o| o.uid).unwrap_or(0);
+            // Helper: read a Vec slot indexed by dir_id, with bounds check.
+            let vec_at = |v: &Vec<i64>, id: i64| -> i64 {
+                let idx = id as usize;
+                if idx < v.len() { v[idx] } else { 0 }
+            };
+            // Filter dirs by max_level + min_size_bytes.
+            let mut included: HashSet<i64> = HashSet::new();
+            for d in &path_tree.dirs_in_order {
+                if d.depth as usize > max_level {
+                    continue;
+                }
+                let size = vec_at(&subtree_size, d.id);
+                if d.id != 0 && size < min_size_bytes {
+                    continue;
+                }
+                included.insert(d.id);
+            }
+            // Always include root.
+            included.insert(0);
+
+            let dir_rows: Vec<DirRow> = path_tree
+                .dirs_in_order
+                .iter()
+                .filter(|d| included.contains(&d.id))
+                .map(|d| {
+                    let total = vec_at(&subtree_size, d.id);
+                    let files = vec_at(&subtree_files, d.id);
+                    let _ = files;
+                    let dir_count = vec_at(&direct_dir_count, d.id);
+                    let file_count = vec_at(&direct_file_count, d.id);
+                    let owner_uid = owner_weights_by_dir
+                        .get(&d.id)
+                        .and_then(|w| w.iter().max_by_key(|(_, v)| **v).map(|(k, _)| *k))
+                        .unwrap_or(owner_uid_fallback);
+                    let has_files = if file_count > 0 || vec_at(&total_size_by_dir, d.id) > 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    DirRow {
+                        id: d.id,
+                        parent_id: d.parent_id,
+                        name_id: d.name_id,
+                        total_size: total,
+                        file_count,
+                        dir_count,
+                        owner_uid,
+                        has_files,
+                    }
+                })
+                .collect();
+
+            // Derive dir_owner rows directly from the in-memory weight map
+            // (no separate Vec held in RAM during the whole pipeline).
+            let mut dir_owner_filtered: Vec<DirOwnerRow> = Vec::new();
+            for (&dir_id, weights) in owner_weights_by_dir.iter() {
+                if !included.contains(&dir_id) {
+                    continue;
+                }
+                for (&uid, &size) in weights.iter() {
+                    if size > 0 {
+                        dir_owner_filtered.push(DirOwnerRow { dir_id, uid, size });
+                    }
+                }
+            }
+            dir_owner_filtered.sort_by(|a, b| a.dir_id.cmp(&b.dir_id).then(a.uid.cmp(&b.uid)));
+
+            let treemap_total_size = vec_at(&subtree_size, 0);
+            let meta = vec![
+                ("scan_root".to_string(), root.clone()),
+                ("scan_timestamp".to_string(), timestamp.to_string()),
+                ("max_level".to_string(), max_level.to_string()),
+                ("total_size".to_string(), treemap_total_size.to_string()),
+                (
+                    "total_dirs".to_string(),
+                    path_tree.dirs_in_order.len().to_string(),
+                ),
+                ("schema_version".to_string(), "1".to_string()),
+            ];
+
+            let input = TreemapInput {
+                names: std::mem::take(&mut path_tree.names),
+                owners,
+                dirs: dir_rows,
+                dir_owner: dir_owner_filtered,
+                meta,
+            };
+            // path_tree.names was moved into `input` above (no clone). After
+            // this point the main thread doesn't read it again, and the
+            // background treemap thread owns the only copy.
+
+            let treemap_db_pb_clone = treemap_db_pb.clone();
+            let treemap_work_dir_clone = treemap_work_dir.clone();
+            Some(std::thread::spawn(move || -> PyResult<()> {
+                db_writer::build_treemap_db(
+                    &treemap_db_pb_clone,
+                    &treemap_work_dir_clone,
+                    input,
+                    debug,
+                )
+            }))
+        } else {
+            None
+        };
+
+        // ─── Insert dictionary + aggregate tables into detail.db ───
+        // exts: order by id ascending. (names live in tm.names, not detail.db.)
+        let mut ext_strings: Vec<String> = vec![String::new(); next_ext_id as usize];
+        for (ext, id) in &ext_id_of_lookup {
+            if (*id as usize) < ext_strings.len() {
+                ext_strings[*id as usize] = ext.clone();
+            }
+        }
+        db_writer::detail_insert_exts(&mut detail_handle, &ext_strings)?;
+
+        // File basenames (detail.db's local names table; tm.names holds dir
+        // segments only).
+        db_writer::detail_insert_names(&mut detail_handle, &file_names)?;
+
+        // users
+        let mut user_rows: Vec<UserRow> = Vec::with_capacity(user_totals.len());
+        for (uid, totals) in &user_totals {
+            let username = uid_to_username
+                .get(uid)
+                .cloned()
+                .unwrap_or_else(|| format!("uid-{}", uid));
+            let team_id = team_map.get(&username).cloned().unwrap_or_default();
+            let dirs_count = user_dir_count.get(uid).copied().unwrap_or(totals.dirs);
+            user_rows.push(UserRow {
+                uid: *uid,
+                username,
+                team_id,
+                total_files: totals.files,
+                total_dirs: dirs_count,
+                total_size: totals.size,
+                permission_issues: 0,
+                is_target: 0,
+            });
+        }
+        user_rows.sort_by_key(|u| u.uid);
+        db_writer::detail_insert_users(&mut detail_handle, &user_rows)?;
+
+        // dir_user_size
+        let dus_rows: Vec<DirUserSizeRow> = user_dir_size
+            .iter()
+            .map(|(&(uid, dir_id), &(size, files))| DirUserSizeRow {
+                uid,
+                dir_id,
+                size,
+                files,
+            })
+            .collect();
+        db_writer::detail_insert_dir_user_size(&mut detail_handle, &dus_rows)?;
+
+        // top_files
+        let mut top_entries: Vec<(i64, Vec<(i64, i64)>)> = Vec::with_capacity(top_heaps.len());
+        for (uid, heap) in top_heaps {
+            let mut sorted: Vec<(i64, i64)> =
+                heap.into_iter().map(|Reverse((sz, id))| (sz, id)).collect();
+            sorted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            top_entries.push((uid, sorted));
+        }
+        top_entries.sort_by_key(|(uid, _)| *uid);
+        db_writer::detail_insert_top_files(&mut detail_handle, &top_entries)?;
+
+        // detail.db meta
+        let detail_meta = vec![
+            ("scan_root".to_string(), root.clone()),
+            ("scan_timestamp".to_string(), timestamp.to_string()),
+            ("total_files".to_string(), total_docs.to_string()),
+            (
+                "total_dirs".to_string(),
+                path_tree.dirs_in_order.len().to_string(),
+            ),
+            ("total_size".to_string(), total_size.to_string()),
+            ("schema_version".to_string(), "1".to_string()),
+            (
+                "treemap_db".to_string(),
+                treemap_db_pb
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("treemap.db")
+                    .to_string(),
+            ),
+        ];
+        db_writer::detail_set_meta(&mut detail_handle, &detail_meta)?;
+
+        // ─── STAGE 5: index + finalize detail.db ───────────────────
+        let t5 = Instant::now();
+        let files_inserted = db_writer::detail_finalize(detail_handle)?;
+        t_finalize_detail = t5.elapsed().as_secs_f64();
+
+        // Join the parallel treemap-build thread spawned at Stage 3a.
+        if let Some(handle) = treemap_thread {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(PyRuntimeError::new_err(
+                        "treemap build thread panicked".to_string(),
+                    ));
+                }
+            }
+        }
+        t_treemap_db = t3a.elapsed().as_secs_f64();
+
+        // ─── Permission issues ─────────────────────────────────────
+        let t_perm = Instant::now();
         perm_events.sort_by(|a, b| {
             a.uid
                 .cmp(&b.uid)
@@ -870,212 +1057,72 @@ pub fn build_pipeline_dbs_impl(
                 .then_with(|| a.errcode.cmp(&b.errcode))
                 .then_with(|| a.kind.cmp(&b.kind))
         });
-        for event in &perm_events {
-            let username = uids_map
-                .get(&event.uid)
-                .cloned()
-                .unwrap_or_else(|| format!("uid-{}", event.uid));
-            let uid_id = if let Some(id) = user_to_uid.get(&username) {
-                *id
-            } else {
-                let id = users_dict.len() as u32;
-                users_dict.push(username.clone());
-                user_to_uid.insert(username.clone(), id);
-                id
-            };
-            let safe_path = crate::sanitise_path(&event.path);
-            let path_id = ensure_path_id(
-                &safe_path,
-                &mut global_path_to_id,
-                &mut global_parent_path_id,
-                &mut next_gid,
-                &mut path_dict_writer,
-                &mut seek_offsets,
-                &mut path_dict_ndjson_offset,
-            )
-            .map_err(PyRuntimeError::new_err)? as u32;
-            let errcode_id = if let Some(id) = errcode_map.get(&event.errcode) {
-                *id
-            } else {
-                let id = errcode_map.len() as u16;
-                errcode_map.insert(event.errcode.clone(), id);
-                id
-            };
-            let kind = match event.kind.as_str() {
-                "dir" => 1u8,
-                "symlink" => 2u8,
-                _ => 0u8,
-            };
-            perm_records.push((uid_id, path_id, errcode_id, kind));
-        }
+        let perm_out_dir = detail_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        write_permission_issues_json(&perm_events, &uids_map, &perm_out_dir, &root, timestamp)?;
+        // Also emit a SQLite index alongside the JSON. The dashboard prefers
+        // the DB (LIMIT/OFFSET + WHERE filtering, no full scan); the JSON
+        // stays as a portable fallback for older dashboard versions.
+        write_permission_issues_db(&perm_events, &uids_map, &perm_out_dir, &root, timestamp)?;
+        t_perm_write = t_perm.elapsed().as_secs_f64();
 
-        let mut uid_totals_map: HashMap<u32, (u64, u64, u64)> = HashMap::new();
-        for result in &user_results {
-            if let Some(uid_id) = user_to_uid.get(&result.username) {
-                uid_totals_map.insert(
-                    *uid_id,
-                    (
-                        result.total_files.max(0) as u64,
-                        result.total_used.max(0) as u64,
-                        result.total_dirs.max(0) as u64,
-                    ),
-                );
-            }
-        }
-        let mut dir_user_rows: Vec<(u32, u32, u64)> = Vec::new();
-        for (dir_path, users_sizes) in dir_sizes.iter() {
-            let dir_id = ensure_path_id(
-                dir_path,
-                &mut global_path_to_id,
-                &mut global_parent_path_id,
-                &mut next_gid,
-                &mut path_dict_writer,
-                &mut seek_offsets,
-                &mut path_dict_ndjson_offset,
-            )
-            .map_err(PyRuntimeError::new_err)? as u32;
-            for (owner_uid, bytes) in users_sizes {
-                if *bytes <= 0 {
-                    continue;
-                }
-                let username = uids_map
-                    .get(owner_uid)
-                    .cloned()
-                    .unwrap_or_else(|| format!("uid-{}", owner_uid));
-                if let Some(uid_id) = user_to_uid.get(&username) {
-                    dir_user_rows.push((dir_id, *uid_id, *bytes as u64));
-                }
-            }
-        }
-        dir_user_rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        // Path lookup maps are no longer needed after ID assignment.
-        drop(global_path_to_id);
-        drop(global_parent_path_id);
-        let rss_after_drop = crate::pipe_types::get_rss_mb();
-        println!("[Phase 2] Post-index RSS: {:.1} MB", rss_after_drop);
-
-        t_finalize = t4.elapsed().as_secs_f64();
-
-        let t5 = Instant::now();
-        write_text_outputs(
-            &detail_work_root,
-            &tree_work_dir,
-            &users_dict,
-            &team_map,
-            &user_file_artifacts,
-            total_docs,
-            total_size,
-            &dir_user_rows,
-            &uid_totals_map,
-            timestamp,
-            &mut path_dict_writer,
-            &seek_offsets,
-        )
-        .map_err(PyRuntimeError::new_err)?;
-        drop(path_dict_writer);
-        drop(seek_offsets);
-        let rss_after_text = crate::pipe_types::get_rss_mb();
-        println!("[Phase 2] Post-text RSS: {:.1} MB", rss_after_text);
-        t_text_write = t5.elapsed().as_secs_f64();
-
-        let t7 = Instant::now();
-        let perm_out_dir = detail_work_root.parent().unwrap_or(Path::new(".")).to_path_buf();
-        write_permission_issues_json(&perm_events, &uids_map, &perm_out_dir, &treemap_root, timestamp)?;
-        t_perm_write = t7.elapsed().as_secs_f64();
-
-        let t8 = Instant::now();
+        // ─── Cleanup work dirs ─────────────────────────────────────
         let _ = fs::remove_dir_all(&spool_root);
-        swap_dir_atomic(&detail_work_root, &detail_root)?;
-        t_swap_detail = t8.elapsed().as_secs_f64();
-
-        if build_treemap {
-            println!("[Phase 2] Detail text done. Starting deferred TreeMap JSON build...");
-            let t9 = Instant::now();
-            let dir_sizes_for_treemap: HashMap<String, Vec<(String, i64)>> = dir_sizes
-                .into_iter()
-                .map(|(dir, entries)| {
-                    let mapped = entries
-                        .into_iter()
-                        .map(|(owner_uid, size)| {
-                            (
-                                uids_map
-                                    .get(&owner_uid)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("uid-{}", owner_uid)),
-                                size,
-                            )
-                        })
-                        .collect();
-                    (dir, mapped)
-                })
-                .collect();
-            write_treemap_json_outputs(
-                &treemap_root,
-                dir_sizes_for_treemap,
-                dir_owner_map,
-                &treemap_json,
-                &tree_work_dir,
-                max_level.max(1),
-                min_size_bytes,
-            )?;
-            t_tree = t9.elapsed().as_secs_f64();
-            println!("[Phase 2] TreeMap build completed in {:.2}s", t_tree);
-            let t10 = Instant::now();
-            swap_dir_atomic(&tree_work_dir, &tree_data_dir)?;
-            t_swap_tree = t10.elapsed().as_secs_f64();
-        } else {
-            drop(dir_sizes);
-            let _ = fs::remove_dir_all(&tree_work_dir);
-        }
+        let _ = fs::remove_dir_all(&detail_work_root);
+        let _ = fs::remove_dir_all(&treemap_work_dir);
+        cleanup_legacy_artifacts(&detail_root, &treemap_root_dir);
 
         if debug {
             let rss_mb = crate::pipe_types::get_rss_mb();
             println!(
-                "JSON/NDJSON outputs built in {:.2}s with {} detail workers. Total files: {}, perms: {}",
+                "SQLite outputs built in {:.2}s. Total files: {}, perms: {}",
                 t_all.elapsed().as_secs_f64(),
-                detail_workers,
-                total_files_processed,
+                files_inserted,
                 perm_events.len()
             );
             println!("[Phase 2 Profile]");
             println!("  Perm TSV read:      {:.4}s", t_perm_tsv);
-            println!("  Dir grouping:       {:.4}s", t_dir_build);
-            println!("  Output jobs build:  {:.4}s", t_output_jobs);
+            println!("  Ingest+aggregate:   {:.4}s", t_ingest);
             println!("  Spill written:      {:.2} MB", total_spill_written as f64 / (1024.0 * 1024.0));
             println!("  Spill reread:       {:.2} MB", total_spill_read as f64 / (1024.0 * 1024.0));
-            if total_spill_written > 0 {
-                println!(
-                    "  Spill reread x:     {:.2}x",
-                    total_spill_read as f64 / total_spill_written as f64
-                );
-            }
-            println!("  Chunk parallel:     {:.4}s", t_chunk_parallel);
-            println!("  Finalize+manifest:  {:.4}s", t_finalize);
-            println!("  Text write:          {:.4}s", t_text_write);
+            println!("  Path tree assembly: {:.4}s", t_path_tree);
+            println!("  treemap.db build:   {:.4}s", t_treemap_db);
+            println!("  detail files build: {:.4}s", t_files_db);
+            println!("  detail finalize:    {:.4}s", t_finalize_detail);
             println!("  Perm JSON write:    {:.4}s", t_perm_write);
-            println!("  Swap detail dir:    {:.4}s", t_swap_detail);
-            println!("  TreeMap build:      {:.4}s", t_tree);
-            println!("  Swap treemap dir:   {:.4}s", t_swap_tree);
-            if !user_timings.is_empty() {
-                let total_users_t = user_timings.len() as f64;
-                let total_user_time: f64 = user_timings.iter().map(|(_, t, _, _)| *t).sum();
-                let avg_user_time = total_user_time / total_users_t;
-                println!("  Detail/user avg:    {:.4}s", avg_user_time);
-                user_timings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                for (idx, (username, elapsed, spill_count, _)) in user_timings.iter().take(5).enumerate() {
-                    println!(
-                        "  Detail/user top{}:   {} = {:.4}s ({} spill files)",
-                        idx + 1,
-                        username,
-                        elapsed,
-                        spill_count
-                    );
-                }
-            }
             println!("  Peak RSS:           {:.1} MB", rss_mb);
         }
-        Ok(total_files_processed as u64)
+        Ok(files_inserted as u64)
     })
 }
 
+/// Remove legacy NDJSON / shard outputs from previous runs that now have a
+/// fresh `data_detail.db` / `treemap.db`. Best-effort.
+fn cleanup_legacy_artifacts(detail_dir: &Path, treemap_dir: &Path) {
+    let detail_legacy = [
+        "data_detail.json",
+        "manifest.json",
+        "users",
+        "api",
+    ];
+    for name in detail_legacy {
+        let p = detail_dir.join(name);
+        if p.is_dir() {
+            let _ = fs::remove_dir_all(&p);
+        } else if p.is_file() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    let treemap_legacy = ["shards", "api", "manifest.json"];
+    for name in treemap_legacy {
+        let p = treemap_dir.join(name);
+        if p.is_dir() {
+            let _ = fs::remove_dir_all(&p);
+        } else if p.is_file() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}

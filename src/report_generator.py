@@ -10,6 +10,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from .constants import (
+    DEFAULT_REPORT_FILENAME,
+    DETAIL_USERS_DB_FILENAME,
+    DETAIL_USERS_DIRNAME,
+    TREE_MAP_DATA_DIRNAME,
+    TREE_MAP_DB_FILENAME,
+)
 from .disk_scanner import ScanResult
 from .utils import save_json_report
 
@@ -32,7 +39,7 @@ class ReportGenerator:
             config: Configuration dictionary
         """
         self.config = config
-        self.output_file = config.get("output_file", "disk_usage_report.json")
+        self.output_file = config.get("output_file", DEFAULT_REPORT_FILENAME)
         self.debug = bool(config.get("debug", False))
 
     # ------------------------------------------------------------------ #
@@ -60,13 +67,11 @@ class ReportGenerator:
 
     def cleanup_stale_detail_reports(self, keep_paths: List[str]) -> None:
         """
-        Remove stale files in detail_users/ that were not regenerated in this run.
-
-        This keeps sync incremental-friendly (we don't wipe all files up front),
-        while still preventing orphan reports from users that no longer exist.
+        Remove stale legacy NDJSON / manifest files in detail_users/ that the
+        new SQLite pipeline no longer regenerates.
         """
         dir_part = os.path.dirname(self.output_file)
-        detail_dir = os.path.join(dir_part, "detail_users") if dir_part else "detail_users"
+        detail_dir = os.path.join(dir_part, DETAIL_USERS_DIRNAME) if dir_part else DETAIL_USERS_DIRNAME
         if not os.path.isdir(detail_dir):
             return
 
@@ -74,22 +79,27 @@ class ReportGenerator:
 
         removed = 0
         for name in os.listdir(detail_dir):
-            if not (
-                name.endswith(".json")
-                or name.endswith(".ndjson")
-            ):
+            full = os.path.join(detail_dir, name)
+            full_abs = os.path.abspath(full)
+            if full_abs in keep_abs:
                 continue
-            fp = os.path.abspath(os.path.join(detail_dir, name))
-            if fp in keep_abs:
+            if os.path.isdir(full):
+                if name in ("users", "api"):
+                    try:
+                        shutil.rmtree(full)
+                        removed += 1
+                    except OSError:
+                        pass
                 continue
-            try:
-                os.remove(fp)
-                removed += 1
-            except OSError:
-                pass
+            if name.endswith(".json") or name.endswith(".ndjson"):
+                try:
+                    os.remove(full)
+                    removed += 1
+                except OSError:
+                    pass
 
         if removed > 0:
-            print(f"Cleaned up {removed} stale detail file(s) in {detail_dir}.")
+            print(f"Cleaned up {removed} stale detail artifact(s) in {detail_dir}.")
 
     # ------------------------------------------------------------------ #
     # Legacy helpers                                                       #
@@ -243,16 +253,17 @@ class ReportGenerator:
         level: int = 3,
         max_workers: Optional[int] = None,
     ) -> str:
-        """Return the TreeMap report path built by the Rust pipeline."""
+        """Return the TreeMap database path built by the Rust pipeline."""
         self.config["tree_map_level"] = int(level)
         if self.debug and max_workers is not None and scan_result.detail_tmpdir:
             print(f"[Phase 3] TreeMap already built by Rust pipeline ({max_workers}w)")
-        output_path = self._get_output_filename("tree_map_report")
-        if os.path.exists(output_path):
-            return output_path
+        output_dir = os.path.dirname(self.output_file) or "."
+        treemap_db = os.path.join(output_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
+        if os.path.exists(treemap_db):
+            return treemap_db
         raise RuntimeError(
-            "TreeMap generation is now part of Phase 2 JSON/NDJSON output build. "
-            "Call generate_detail_reports() before generate_tree_map()."
+            "TreeMap generation is part of Phase 2 SQLite output build. "
+            "Call generate_detail_reports() with build_treemap=True before generate_tree_map()."
         )
 
     @staticmethod
@@ -275,7 +286,7 @@ class ReportGenerator:
         max_workers: int = 1,
         build_treemap: bool = False,
     ) -> List[str]:
-        """Generate JSON/NDJSON detail data and TreeMap outputs via Rust."""
+        """Build the per-user detail SQLite DB (and optionally treemap.db)."""
         if not scan_result.detail_tmpdir:
             raise RuntimeError(
                 "Phase 2 requires Rust streaming outputs (detail_tmpdir). "
@@ -284,34 +295,40 @@ class ReportGenerator:
         if not HAS_RUST_PIPELINE:
             raise RuntimeError(
                 "Rust pipeline core is required. "
-                "Please build/install fast_scanner with build_pipeline."
+                "Please rebuild fast_scanner via src/rust_scanner/build.sh."
             )
 
         output_dir = os.path.dirname(self.output_file) or "."
-        detail_dir = os.path.join(output_dir, "detail_users")
+        detail_dir = os.path.join(output_dir, DETAIL_USERS_DIRNAME)
+        treemap_dir = os.path.join(output_dir, TREE_MAP_DATA_DIRNAME)
         os.makedirs(detail_dir, exist_ok=True)
+        os.makedirs(treemap_dir, exist_ok=True)
 
-        detail_manifest_path = os.path.join(detail_dir, "manifest.json")
-        tree_json_path = self._get_output_filename("tree_map_report")
-        tree_data_path = os.path.join(output_dir, "tree_map_data")
-        if not build_treemap:
-            if os.path.isfile(tree_json_path):
-                os.remove(tree_json_path)
-            if os.path.isdir(tree_data_path):
-                shutil.rmtree(tree_data_path)
-        # Avoid expensive pre-clean for huge runs. Rust Phase 2 pipeline already
-        # recreates/overwrites its working output directories atomically.
-        stale_targets = [detail_manifest_path]
-        if build_treemap:
-            stale_targets.append(tree_json_path)
-        for stale_path in stale_targets:
-            if os.path.isfile(stale_path):
-                os.remove(stale_path)
+        detail_db_path = os.path.join(detail_dir, DETAIL_USERS_DB_FILENAME)
+        treemap_db_path = os.path.join(treemap_dir, TREE_MAP_DB_FILENAME)
+
+        # Remove stale tree_map_report.json from previous NDJSON pipeline runs.
+        legacy_tree_json = self._get_output_filename("tree_map_report")
+        if os.path.isfile(legacy_tree_json):
+            try:
+                os.remove(legacy_tree_json)
+            except OSError:
+                pass
+
+        if not build_treemap and os.path.isfile(treemap_db_path):
+            try:
+                os.remove(treemap_db_path)
+            except OSError:
+                pass
+
         phase2_start = time.time()
         phase2_mem_start = self._get_rss_mb() if self.debug else 0.0
         if self.debug:
             print(f"[Phase 2] RAM at start: {phase2_mem_start:.1f} MB")
-            print(f"Phase 2: Building JSON/NDJSON detail outputs via Rust [streaming, {max(1, int(max_workers))}w]...")
+            print(
+                f"Phase 2: Building SQLite outputs via Rust "
+                f"[{max(1, int(max_workers))}w]..."
+            )
 
         team_map = {
             str(user.get("name", "")): str(user.get("team_id", ""))
@@ -325,9 +342,8 @@ class ReportGenerator:
             scan_result.detail_tmpdir,
             scan_result.detail_uid_username,
             team_map,
-            detail_manifest_path,
-            tree_json_path,
-            tree_data_path,
+            detail_db_path,
+            treemap_db_path,
             self.config.get("directory", "/"),
             int(max(1, tree_map_level)),
             0,
@@ -343,15 +359,10 @@ class ReportGenerator:
 
         def _run_build_pipeline() -> None:
             try:
-                try:
-                    total_files_holder["value"] = int(
-                        _fast_scanner.build_pipeline(*build_args, bool(self.debug))
-                    )
-                except TypeError as exc:
-                    if "positional arguments" not in str(exc):
-                        raise
-                    total_files_holder["value"] = int(_fast_scanner.build_pipeline(*build_args))
-            except Exception as exc:  # pragma: no cover - exception relay path
+                total_files_holder["value"] = int(
+                    _fast_scanner.build_pipeline(*build_args, bool(self.debug))
+                )
+            except Exception as exc:  # pragma: no cover
                 build_error_holder["error"] = exc
 
         build_thread = threading.Thread(target=_run_build_pipeline, daemon=True)
@@ -365,26 +376,10 @@ class ReportGenerator:
             raise build_error_holder["error"]
         total_files = total_files_holder["value"]
 
-        root_manifest_path = detail_manifest_path
-
-        created = [
-            root_manifest_path,
-            os.path.join(detail_dir, "data_detail.json"),
-        ]
+        created: List[str] = [detail_db_path]
         if build_treemap:
-            created.extend([tree_json_path, os.path.join(tree_data_path, "manifest.json")])
+            created.append(treemap_db_path)
         self.cleanup_stale_detail_reports(created)
-
-        detail_users_count = 0
-        try:
-            import json
-            detail_summary_path = os.path.join(detail_dir, "data_detail.json")
-            with open(detail_summary_path, "r", encoding="utf-8") as fh:
-                detail_summary = json.load(fh)
-            users_index = detail_summary.get("users", []) if isinstance(detail_summary, dict) else []
-            detail_users_count = len(users_index) if isinstance(users_index, list) else 0
-        except Exception:
-            detail_users_count = 0
 
         # Cleanup temporary Rust scan segments after Phase 2 completes.
         try:
@@ -394,30 +389,49 @@ class ReportGenerator:
                     print(f"  [Phase 2] Cleaned temp scan segments: {scan_result.detail_tmpdir}")
         except OSError as exc:
             if self.debug:
-                print(f"  [Phase 2] Warning: failed to remove temp scan segments {scan_result.detail_tmpdir}: {exc}")
+                print(
+                    f"  [Phase 2] Warning: failed to remove temp scan segments "
+                    f"{scan_result.detail_tmpdir}: {exc}"
+                )
 
         phase2_elapsed = time.time() - phase2_start
+        detail_users_count = self._count_users_in_db(detail_db_path)
         if self.debug:
             phase2_mem_end = self._get_rss_mb()
-            print(f"  [Phase 2] Detail manifest ready: {root_manifest_path}")
-            print(f"  [Phase 2] Users processed: {detail_users_count:,}")
-            print(f"  [Phase 2] User details ready: {os.path.join(detail_dir, 'users')}")
+            print(f"  [Phase 2] Detail DB:    {detail_db_path}")
+            print(f"  [Phase 2] Users:        {detail_users_count:,}")
             if build_treemap:
-                print(f"  [Phase 3] TreeMap outputs ready: {tree_json_path}, {tree_data_path}")
+                print(f"  [Phase 2] TreeMap DB:   {treemap_db_path}")
             print(
                 f"[Phase 2] RAM end: {phase2_mem_end:.1f} MB "
-                f"(delta: {phase2_mem_end - phase2_mem_start:+.1f} MB, elapsed: {phase2_elapsed:.2f}s, "
-                f"files: {int(total_files):,}, users: {detail_users_count:,})"
+                f"(delta: {phase2_mem_end - phase2_mem_start:+.1f} MB, "
+                f"elapsed: {phase2_elapsed:.2f}s, files: {int(total_files):,}, "
+                f"users: {detail_users_count:,})"
             )
         else:
-            print(f"Reports generated in {phase2_elapsed:.2f}s ({int(total_files):,} files, {detail_users_count:,} users):")
-            print(f"  Detail manifest: {root_manifest_path}")
-            print(f"  Users processed: {detail_users_count:,}")
-            print(f"  User details: {os.path.join(detail_dir, 'users')}")
+            print(
+                f"Reports generated in {phase2_elapsed:.2f}s "
+                f"({int(total_files):,} files, {detail_users_count:,} users):"
+            )
+            print(f"  Detail DB:  {detail_db_path}")
             if build_treemap:
-                print(f"  TreeMap JSON: {tree_json_path}")
-                print(f"  TreeMap data: {tree_data_path}")
+                print(f"  TreeMap DB: {treemap_db_path}")
         return sorted(created)
+
+    @staticmethod
+    def _count_users_in_db(db_path: str) -> int:
+        if not os.path.isfile(db_path):
+            return 0
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+            finally:
+                conn.close()
+        except Exception:
+            return 0
 
     def generate_detail_reports_with_level(
         self,

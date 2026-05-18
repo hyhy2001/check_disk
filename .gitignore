@@ -51,3 +51,5 @@ test_zone/
 output_txt/
 disk_checker_config.json
 docs/
+src/rust_scanner/target/
+_demo_out/

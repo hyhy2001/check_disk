@@ -21,9 +21,10 @@ class ConfigDisplay(BaseFormatter):
 
     def display_config_summary(self, config: Dict[str, Any]) -> None:
         """Display a summary of the configuration."""
+        from ..constants import DEFAULT_REPORT_FILENAME
         print("\nConfiguration Summary")
         print(f"Directory: {config.get('directory', 'Not set')}")
-        print(f"Output File: {config.get('output_file', 'disk_usage_report.json')}")
+        print(f"Output File: {config.get('output_file', DEFAULT_REPORT_FILENAME)}")
 
         # Count teams and users
         team_count = len(config.get("teams", []))

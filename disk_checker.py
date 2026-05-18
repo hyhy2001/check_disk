@@ -15,8 +15,17 @@ import traceback
 
 from src.cli_interface import CLIInterface
 from src.config_manager import ConfigManager
+from src.constants import (
+    DEFAULT_REPORT_FILENAME,
+    DETAIL_USERS_DB_FILENAME,
+    DETAIL_USERS_DIRNAME,
+    SIBLING_REPORT_FILENAMES,
+    TREE_MAP_DATA_DIRNAME,
+    TREE_MAP_DB_FILENAME,
+)
 from src.disk_scanner import DiskScanner
 from src.report_generator import ReportGenerator
+from src.scan_status import ScanStatusHeartbeat, update_status
 from src.sync_manager import AsyncSyncPipeline
 
 
@@ -62,146 +71,6 @@ def _resolve_output_path(
         print(f"Output file set to: {path}")
 
     return path, prefix_str, date_str
-
-
-def _write_scan_status(out_dir: str, stage: str, running: bool, message: str = "", error: str = "", started_at: float = 0, phase_started_at: float = 0, tree_map_enabled: bool = False, sync_enabled: bool = False):
-    try:
-        import json
-        import os
-        import socket
-        import time
-        now = int(time.time())
-        started = int(started_at) if started_at else now
-        phase_started = int(phase_started_at) if phase_started_at else started
-        status_path = os.path.join(out_dir, 'scan_status.json')
-        tmp_path = status_path + '.tmp'
-        payload = {
-            "running": running,
-            "stage": stage,
-            "started_at": started,
-            "phase_started_at": phase_started,
-            "phase_elapsed_sec": max(0, now - phase_started),
-            "total_elapsed_sec": max(0, now - started),
-            "updated_at": now,
-            "finished_at": now if not running else 0,
-            "pid": os.getpid(),
-            "host": socket.gethostname(),
-            "message": message,
-            "error": error,
-            "tree_map_enabled": tree_map_enabled,
-            "sync_enabled": sync_enabled,
-        }
-        with open(tmp_path, 'w') as f:
-            json.dump(payload, f)
-        os.replace(tmp_path, status_path)
-        return status_path
-    except Exception:
-        pass
-    return None
-
-def _update_status(pipeline, out_dir: str, stage: str, running: bool, message: str = "", error: str = "", started_at: float = 0, phase_started_at: float = 0, tree_map_enabled: bool = False, sync_enabled: bool = False):
-    """Write status JSON and (if pipeline is configured) immediately enqueue it for sync."""
-    p = _write_scan_status(
-        out_dir,
-        stage,
-        running,
-        message,
-        error,
-        started_at,
-        phase_started_at,
-        tree_map_enabled,
-        sync_enabled,
-    )
-    if p and pipeline:
-        try:
-            pipeline.enqueue_file(p)
-        except Exception:
-            pass
-
-
-class _ScanStatusHeartbeat:
-    """Background thread that touches scan_status.json so updated_at moves
-    while long phases are running. Caller controls the active phase via
-    set_phase(). Calling stop() halts the thread."""
-
-    def __init__(
-        self,
-        out_dir: str,
-        started_at: float,
-        sync_pipeline=None,
-        interval: float = 5.0,
-        sync_interval: float = 30.0,
-    ):
-        import threading
-        import time
-        self.out_dir = out_dir
-        self.started_at = started_at
-        self.sync_pipeline = sync_pipeline
-        self.tree_map_enabled = False
-        self.sync_enabled = sync_pipeline is not None
-        self.interval = interval
-        self.sync_interval = max(interval, sync_interval)
-        self._last_sync = time.monotonic()
-        self._stop_evt = threading.Event()
-        self._lock = threading.Lock()
-        self._stage = "scan"
-        self._message = ""
-        self._phase_started_at = started_at
-        self._thread = threading.Thread(target=self._run, name="scan-status-heartbeat", daemon=True)
-
-    def set_phase(self, stage: str, message: str = ""):
-        import time
-        with self._lock:
-            self._stage = stage
-            self._message = message
-            self._phase_started_at = time.time()
-        # Write immediately so the new phase shows up without waiting for next tick
-        _update_status(
-            self.sync_pipeline,
-            self.out_dir,
-            stage,
-            True,
-            message,
-            started_at=self.started_at,
-            phase_started_at=self._phase_started_at,
-            tree_map_enabled=self.tree_map_enabled,
-            sync_enabled=self.sync_enabled,
-        )
-
-    def _run(self):
-        import time
-        while not self._stop_evt.wait(self.interval):
-            with self._lock:
-                stage = self._stage
-                message = self._message
-                phase_started_at = self._phase_started_at
-            status_path = _write_scan_status(
-                self.out_dir,
-                stage,
-                True,
-                message,
-                started_at=self.started_at,
-                phase_started_at=phase_started_at,
-                tree_map_enabled=self.tree_map_enabled,
-                sync_enabled=self.sync_enabled,
-            )
-            now = time.monotonic()
-            if status_path and self.sync_pipeline and now - self._last_sync >= self.sync_interval:
-                try:
-                    self.sync_pipeline.enqueue_file(status_path)
-                    self._last_sync = now
-                except Exception:
-                    pass
-
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._stop_evt.set()
-        try:
-            self._thread.join(timeout=2)
-        except Exception:
-            pass
 
 
 def main():
@@ -291,7 +160,7 @@ def main():
 
         # Resolve the final output path (and carry prefix/date for sibling reports)
         output_file, output_prefix, output_date = _resolve_output_path(
-            base=config.get('output_file', 'disk_usage_report.json'),
+            base=config.get('output_file', DEFAULT_REPORT_FILENAME),
             output_dir=args.output_dir,
             output_override=args.output,
             prefix=args.prefix,
@@ -333,7 +202,7 @@ def main():
 
             # Initialize async sync pipeline early (if --sync flag is provided)
             if getattr(args, 'sync', False):
-                out_dir = os.path.dirname(config.get('output_file', 'disk_usage_report.json'))
+                out_dir = os.path.dirname(config.get('output_file', DEFAULT_REPORT_FILENAME))
                 if not out_dir:
                     out_dir = "."
                 sync_pipeline = AsyncSyncPipeline(
@@ -344,11 +213,11 @@ def main():
                     password=getattr(args, 'sync_pass', None),
                 )
 
-            main_report_path = config.get('output_file', 'disk_usage_report.json')
+            main_report_path = config.get('output_file', DEFAULT_REPORT_FILENAME)
             out_dir = os.path.dirname(main_report_path) if main_report_path else '.'
 
             # Initialize status heartbeat (touch every 5s so updated_at refreshes)
-            heartbeat = _ScanStatusHeartbeat(out_dir, run_started_at, sync_pipeline, interval=5.0)
+            heartbeat = ScanStatusHeartbeat(out_dir, run_started_at, sync_pipeline)
             heartbeat.tree_map_enabled = tree_map_enabled
             heartbeat.set_phase("scan", "Scanning filesystem")
             heartbeat.start()
@@ -377,11 +246,8 @@ def main():
             # Enqueue main + sibling reports AFTER they are written to disk
             if sync_pipeline and main_report_path:
                 sync_pipeline.enqueue_file(main_report_path)
-                for rel_name in ['inode_usage_report.json', 'permission_issues.json']:
-                    if prefix:
-                        fname = f"{prefix}_{rel_name}"
-                    else:
-                        fname = rel_name
+                for rel_name in SIBLING_REPORT_FILENAMES:
+                    fname = f"{prefix}_{rel_name}" if prefix else rel_name
                     full_path = os.path.join(out_dir, fname)
                     if os.path.exists(full_path):
                         sync_pipeline.enqueue_file(full_path)
@@ -397,20 +263,11 @@ def main():
                 max_workers=scanner.max_workers,
                 build_treemap=bool(getattr(args, 'tree_map', False)),
             )
-            # Batch-sync the detail_users/ directory (single rsync, much faster)
+            # Sync the detail/treemap SQLite DB files (single rsync per file).
             if sync_pipeline and created:
-                detail_dirs_seen = set()
-                standalone_files = []
                 for fpath in created:
-                    parent = os.path.dirname(os.path.abspath(fpath))
-                    if os.path.basename(parent) == "detail_users":
-                        detail_dirs_seen.add(parent)
-                    else:
-                        standalone_files.append(fpath)
-                for ddir in detail_dirs_seen:
-                    sync_pipeline.enqueue_directory(ddir)
-                for fpath in standalone_files:
-                    sync_pipeline.enqueue_file(fpath)
+                    if os.path.isfile(fpath):
+                        sync_pipeline.enqueue_file(fpath)
             # Keep incremental-sync benefits by avoiding pre-run wipe.
             # Remove only stale detail files after new reports are generated.
             if not config.get('target_users_only', False):
@@ -425,13 +282,8 @@ def main():
                     level=level,
                     max_workers=scanner.max_workers,
                 )
-                if sync_pipeline and tree_map_path:
+                if sync_pipeline and tree_map_path and os.path.isfile(tree_map_path):
                     sync_pipeline.enqueue_file(tree_map_path)
-                    tree_map_data = os.path.join(
-                        os.path.dirname(tree_map_path), "tree_map_data"
-                    )
-                    if os.path.isdir(tree_map_data):
-                        sync_pipeline.enqueue_directory(tree_map_data)
 
             if sync_pipeline:
                 heartbeat.set_phase("sync", "Syncing reports to remote server")
@@ -440,16 +292,19 @@ def main():
                 print("[SYNC] Async pipeline done")
 
             heartbeat.stop()
-            _update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
+            update_status(sync_pipeline, out_dir, "done", False, "Scan completed successfully", started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
             if sync_pipeline:
                 sync_pipeline.wait()
                 sync_pipeline.close()
             print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
             if main_report_path:
                 print(f"Summary report: {main_report_path}")
-            detail_manifest = os.path.join(out_dir, "detail_users", "data_detail.json")
-            if os.path.exists(detail_manifest):
-                print(f"Detail manifest: {detail_manifest}")
+            detail_db = os.path.join(out_dir, DETAIL_USERS_DIRNAME, DETAIL_USERS_DB_FILENAME)
+            if os.path.exists(detail_db):
+                print(f"Detail DB:      {detail_db}")
+            treemap_db = os.path.join(out_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
+            if os.path.exists(treemap_db):
+                print(f"TreeMap DB:     {treemap_db}")
             total_elapsed = time.time() - run_started_at
             print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 
@@ -460,13 +315,13 @@ def main():
         except KeyboardInterrupt:
             if heartbeat:
                 heartbeat.stop()
-            _update_status(sync_pipeline, out_dir, "error", False, "Scan interrupted by user", started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
+            update_status(sync_pipeline, out_dir, "error", False, "Scan interrupted by user", started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
             print("\nScan interrupted by user.")
             sys.exit(1)
         except Exception as e:
             if heartbeat:
                 heartbeat.stop()
-            _update_status(sync_pipeline, out_dir, "error", False, f"Scan failed: {e}", str(e), started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
+            update_status(sync_pipeline, out_dir, "error", False, f"Scan failed: {e}", str(e), started_at=run_started_at, phase_started_at=run_started_at, tree_map_enabled=tree_map_enabled, sync_enabled=bool(sync_pipeline))
             err_text = str(e)
             if "No space left on device" in err_text or "ENOSPC" in err_text:
                 print(f"\nTemporary storage is full: {e}")

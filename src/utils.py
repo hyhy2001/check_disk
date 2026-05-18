@@ -133,21 +133,6 @@ def get_username_from_uid(uid: int, uid_cache: Dict[int, str] = None) -> str:
 
     return username
 
-def build_uid_cache() -> Dict[int, str]:
-    """
-    Build a cache of UID to username mappings.
-
-    Returns:
-        Dictionary mapping UIDs to usernames
-    """
-    uid_cache = {}
-    try:
-        for entry in pwd.getpwall():
-            uid_cache[entry.pw_uid] = entry.pw_name
-    except Exception:
-        pass
-    return uid_cache
-
 def get_general_system_info(directory: str) -> Dict[str, int]:
     """
     Get general system disk information, including inodes.

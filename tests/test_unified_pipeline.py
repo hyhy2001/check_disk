@@ -1,7 +1,6 @@
-import gzip
 import json
-import struct
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -12,11 +11,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import disk_checker  # noqa: E402
+import disk_checker  # noqa: E402,F401
 from scripts import export_user_reports  # noqa: E402
 from src.cli_interface import CLIInterface  # noqa: E402
 from src.disk_scanner import ScanResult  # noqa: E402
 from src.report_generator import ReportGenerator  # noqa: E402
+from src.scan_status import ScanStatusHeartbeat  # noqa: E402
 
 
 class _FakeSyncPipeline:
@@ -29,7 +29,7 @@ class _FakeSyncPipeline:
 
 def test_scan_status_heartbeat_syncs_periodically(tmp_path):
     pipeline = _FakeSyncPipeline()
-    heartbeat = disk_checker._ScanStatusHeartbeat(
+    heartbeat = ScanStatusHeartbeat(
         str(tmp_path),
         started_at=time.time(),
         sync_pipeline=pipeline,
@@ -103,163 +103,137 @@ def _build_unified_fixture(tmp_path):
     )
 
     created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=True)
-    detail_manifest = tmp_path / "detail_users" / "manifest.json"
-    detail_schema_manifest = tmp_path / "detail_users" / "manifest.json"
-    return (
-        cfg,
-        created,
-        detail_manifest,
-        detail_schema_manifest,
-        tmp_path / "tree_map_report.json",
-        tmp_path / "tree_map_data" / "manifest.json",
-    )
+    detail_db = tmp_path / "detail_users" / "data_detail.db"
+    treemap_db = tmp_path / "tree_map_data" / "treemap.db"
+    return cfg, created, detail_db, treemap_db
 
 
-def test_unified_json_outputs_multi_user_ext_and_paths(tmp_path):
-    _, _, detail_manifest, _, _, tree_manifest = _build_unified_fixture(tmp_path)
-
-    detail_root = detail_manifest.parent
-
-    detail_summary = json.loads((detail_root / "data_detail.json").read_text(encoding="utf-8"))
-    assert detail_summary["schema"] == "check-disk-detail"
-    users_summary = {u["username"]: u for u in detail_summary["users"]}
-    assert users_summary["alice"]["files"] == 3
-    assert users_summary["alice"]["used"] == 6656
-    assert users_summary["bob"]["files"] == 2
-    assert users_summary["bob"]["used"] == 9216
-
-    alice_user_dir = detail_root / "users" / "alice"
-    alice_manifest = json.loads((alice_user_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert alice_manifest["schema"] == "check-disk-user"
-    assert alice_manifest["summary"]["files"] == 3
-    assert alice_manifest["summary"]["used"] == 6656
-
-    path_dict = {}
-    with open(detail_root / "api" / "path_dict.ndjson", "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            path_dict[row["gid"]] = row["p"]
-
-    alice_file_parts = alice_manifest["files"]["parts"]
-    assert len(alice_file_parts) >= 1
-    alice_files = []
-    for part in alice_file_parts:
-        chunk_path = alice_user_dir / part["path"]
-        with open(chunk_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                alice_files.append({
-                    "path": path_dict.get(row["gid"], ""),
-                    "size": row["s"],
-                    "ext": row["x"],
-                })
-    assert [f["size"] for f in alice_files] == [4096, 2048, 512]
-    assert [f["size"] for f in alice_files if f["ext"] == "log"] == [2048]
-    assert any(f["path"].endswith("alpha.txt") for f in alice_files)
-
-    bob_user_dir = detail_root / "users" / "bob"
-    bob_manifest = json.loads((bob_user_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert bob_manifest["summary"]["files"] == 2
-    bob_dir_parts = bob_manifest["dirs"]["parts"]
-    bob_dirs = []
-    for part in bob_dir_parts:
-        chunk_path = bob_user_dir / part["path"]
-        with open(chunk_path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                bob_dirs.append(row["s"])
-    assert sorted(bob_dirs) == [1024, 8192]
-
-    tree = json.loads(tree_manifest.read_text(encoding="utf-8"))
-    assert tree["schema"] == "check-disk-detail-treemap"
-    files_meta = tree.get("files", {})
-    assert "api/shards_manifest.json" in files_meta
-    assert "shards" in files_meta
-
-    assert not (detail_root / "index_seed").exists()
-    assert not (detail_root / "index").exists()
+def _open_detail(detail_db, treemap_db=None):
+    conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
+    if treemap_db and os.path.isfile(treemap_db):
+        conn.execute(f"ATTACH DATABASE 'file:{treemap_db}?mode=ro' AS tm")
+    return conn
 
 
-def test_unified_text_manifest_includes_expected_records(tmp_path):
-    _, _, detail_manifest, _, _, tree_manifest = _build_unified_fixture(tmp_path)
+def test_unified_db_outputs_multi_user_ext_and_paths(tmp_path):
+    _, _, detail_db, treemap_db = _build_unified_fixture(tmp_path)
+    assert detail_db.exists()
+    assert treemap_db.exists()
 
-    detail_meta = json.loads(detail_manifest.read_text(encoding="utf-8"))
-    assert detail_meta["schema"] == "check-disk-detail"
-    assert isinstance(detail_meta.get("users"), list)
-    assert len(detail_meta["users"]) >= 2
+    conn = _open_detail(detail_db, treemap_db)
+    try:
+        # Per-user totals come from the `users` table.
+        users = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT username, total_files, total_size FROM users "
+                "WHERE username IN ('alice','bob')"
+            )
+        }
+        assert users["alice"] == (3, 6656)
+        assert users["bob"] == (2, 9216)
 
-    detail_summary = json.loads((detail_manifest.parent / "data_detail.json").read_text(encoding="utf-8"))
-    assert detail_summary["scan"]["total_files"] == 5
-    assert detail_summary["scan"]["total_size"] == (4096 + 2048 + 512 + 8192 + 1024)
+        # alice has 3 files: 4096 (txt) + 2048 (log) + 512 (bin)
+        rows = conn.execute(
+            "SELECT n.name, e.ext, f.size FROM files f "
+            "JOIN names n ON f.name_id=n.id JOIN exts e ON f.ext_id=e.id "
+            "WHERE f.uid=(SELECT uid FROM users WHERE username='alice') "
+            "ORDER BY f.size DESC"
+        ).fetchall()
+        assert [r[2] for r in rows] == [4096, 2048, 512]
+        assert [r for r in rows if r[1] == "log"] == [("shared.log", "log", 2048)]
+        assert any(r[0] == "alpha.txt" for r in rows)
 
-    tree_meta = json.loads(tree_manifest.read_text(encoding="utf-8"))
-    assert tree_meta["schema"] == "check-disk-detail-treemap"
-    files_meta = tree_meta.get("files", {})
-    assert files_meta["api/shards_manifest.json"]["records"] == 1
-    assert files_meta["shards"]["records"] >= 1
+        # bob's per-dir aggregate: dir_user_size has rows summing to bob's used
+        bob_dirs = conn.execute(
+            "SELECT size FROM dir_user_size dus "
+            "JOIN users u ON dus.uid=u.uid "
+            "WHERE u.username='bob' ORDER BY size DESC"
+        ).fetchall()
+        assert sorted([r[0] for r in bob_dirs]) == [1024, 8192]
+    finally:
+        conn.close()
 
 
-def test_unified_text_manifest_is_deterministic_for_same_input(tmp_path):
+def test_unified_db_meta_records_total(tmp_path):
+    _, _, detail_db, treemap_db = _build_unified_fixture(tmp_path)
+    conn = _open_detail(detail_db, treemap_db)
+    try:
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM meta")}
+        assert int(meta["total_files"]) == 5
+        assert int(meta["total_size"]) == 4096 + 2048 + 512 + 8192 + 1024
+        assert meta["schema_version"] == "1"
+    finally:
+        conn.close()
+
+    # treemap.db meta
+    conn = sqlite3.connect(f"file:{treemap_db}?mode=ro", uri=True)
+    try:
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM meta")}
+        assert meta["schema_version"] == "1"
+        assert int(meta["max_level"]) >= 1
+    finally:
+        conn.close()
+
+
+def test_unified_db_outputs_deterministic_for_same_input(tmp_path):
     run1 = tmp_path / "run1"
     run2 = tmp_path / "run2"
     run1.mkdir(parents=True, exist_ok=True)
     run2.mkdir(parents=True, exist_ok=True)
 
-    _, _, detail_manifest_1, _, _, tree_manifest_1 = _build_unified_fixture(run1)
-    _, _, detail_manifest_2, _, _, tree_manifest_2 = _build_unified_fixture(run2)
+    _, _, db1, _ = _build_unified_fixture(run1)
+    _, _, db2, _ = _build_unified_fixture(run2)
 
-    detail_1 = json.loads(detail_manifest_1.read_text(encoding="utf-8"))
-    detail_2 = json.loads(detail_manifest_2.read_text(encoding="utf-8"))
-    assert detail_1["schema"] == detail_2["schema"] == "check-disk-detail"
-    assert len(detail_1.get("users", [])) == len(detail_2.get("users", []))
+    def totals(db_path):
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            users = sorted(
+                conn.execute(
+                    "SELECT username, total_files, total_size FROM users ORDER BY username"
+                ).fetchall()
+            )
+            files_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            return users, files_count
+        finally:
+            conn.close()
 
-    summary_1 = json.loads((detail_manifest_1.parent / "data_detail.json").read_text(encoding="utf-8"))
-    summary_2 = json.loads((detail_manifest_2.parent / "data_detail.json").read_text(encoding="utf-8"))
-    assert summary_1["scan"]["total_files"] == summary_2["scan"]["total_files"] == 5
-    assert summary_1["scan"]["total_size"] == summary_2["scan"]["total_size"]
-
-    tree_1 = json.loads(tree_manifest_1.read_text(encoding="utf-8"))
-    tree_2 = json.loads(tree_manifest_2.read_text(encoding="utf-8"))
-    assert tree_1["schema"] == tree_2["schema"] == "check-disk-detail-treemap"
-    files_1 = tree_1.get("files", {})
-    files_2 = tree_2.get("files", {})
-    assert files_1["api/shards_manifest.json"]["records"] == files_2["api/shards_manifest.json"]["records"] == 1
-    assert files_1["shards"]["records"] == files_2["shards"]["records"]
+    assert totals(db1) == totals(db2)
 
 
-def test_detail_and_treemap_manifests_include_checksum_and_records(tmp_path):
-    test_unified_text_manifest_includes_expected_records(tmp_path)
+def test_db_application_id_and_user_version(tmp_path):
+    _, _, detail_db, treemap_db = _build_unified_fixture(tmp_path)
+
+    def stamp(path, want_app_id):
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+            if app_id < 0:
+                app_id += 1 << 32
+            assert app_id == want_app_id
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        finally:
+            conn.close()
+
+    stamp(detail_db, 0xC0DD15D1)
+    stamp(treemap_db, 0xC0DD15C0)
 
 
-def test_manifest_checksum_is_deterministic_for_same_input(tmp_path):
-    test_unified_text_manifest_is_deterministic_for_same_input(tmp_path)
-
-
-
-def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
+def test_build_pipeline_signature_accepts_db_paths(tmp_path):
+    """build_pipeline FFI accepts the new (detail_db, treemap_db) arg layout."""
     from src import fast_scanner
 
     args = (
-        str(tmp_path / "missing_tmpdir"),
-        {},
-        {},
-        str(tmp_path / "detail_users" / "manifest.json"),
-        str(tmp_path / "tree.json"),
-        str(tmp_path / "tree_map_data"),
-        str(tmp_path),
-        3,
-        0,
-        0,
-        1,
+        str(tmp_path / "missing_tmpdir"),  # tmpdir (won't exist → empty result)
+        {},                                # uids_map
+        {},                                # team_map
+        str(tmp_path / "detail_users" / "data_detail.db"),
+        str(tmp_path / "tree_map_data" / "treemap.db"),
+        str(tmp_path),                     # treemap_root
+        3,                                 # max_level
+        0,                                 # min_size_bytes
+        0,                                 # timestamp
+        1,                                 # max_workers
     )
     for call_args in (args, (*args, False), (*args, False, False)):
         try:
@@ -270,14 +244,20 @@ def test_build_pipeline_accepts_legacy_and_debug_signatures(tmp_path):
             pass
 
 
-def test_export_user_reports_detects_and_exports_detail_manifest(tmp_path):
-    _, _, _, _, _, _ = _build_unified_fixture(tmp_path)
+def test_export_user_reports_detects_and_exports_db(tmp_path):
+    _build_unified_fixture(tmp_path)
     out_dir = tmp_path / "exports"
     out_dir.mkdir()
 
     assert export_user_reports.find_users(str(tmp_path), "") == ["alice", "bob"]
-    expected_manifest = tmp_path / "detail_users" / "manifest.json"
-    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == (str(expected_manifest), "", "")
+
+    expected_detail = str(tmp_path / "detail_users" / "data_detail.db")
+    expected_treemap = str(tmp_path / "tree_map_data" / "treemap.db")
+    assert export_user_reports.build_paths(str(tmp_path), "", "alice") == (
+        expected_detail,
+        expected_treemap,
+        "",
+    )
 
     exported = export_user_reports.export_user(
         "alice",
@@ -287,11 +267,22 @@ def test_export_user_reports_detects_and_exports_detail_manifest(tmp_path):
         threading.Semaphore(1),
     )
     assert isinstance(exported, list)
-    assert all(isinstance(path, str) for path in exported)
+    # Rust exporter writes one file per kind (dir + file) per user.
+    assert len(exported) == 2
+    assert sorted(exported) == sorted([
+        str(out_dir / "usage_dir_alice.txt"),
+        str(out_dir / "usage_file_alice.txt"),
+    ])
+    for path in exported:
+        assert os.path.isfile(path)
+        body = open(path, encoding="utf-8").read()
+        assert "alice" in body
+    file_body = open(out_dir / "usage_file_alice.txt", encoding="utf-8").read()
+    assert "alpha.txt" in file_body
 
 
-def test_cli_check_users_uses_detail_manifest(tmp_path):
-    _, _, _, _, _, _ = _build_unified_fixture(tmp_path)
+def test_cli_check_users_uses_detail_db(tmp_path):
+    _build_unified_fixture(tmp_path)
 
     calls = []
     cli = CLIInterface()
@@ -306,7 +297,7 @@ def test_cli_check_users_uses_detail_manifest(tmp_path):
     users, dir_files, file_files, top = calls[0]
     assert users == ["alice", "missing"]
     assert top == 7
-    expected = str(tmp_path / "detail_users" / "manifest.json")
+    expected = str(tmp_path / "detail_users" / "data_detail.db")
     assert dir_files["alice"] == expected
     assert file_files["alice"] == expected
     assert dir_files["missing"] == expected
@@ -314,8 +305,8 @@ def test_cli_check_users_uses_detail_manifest(tmp_path):
 
 
 def test_unified_json_outputs_permission_issues(tmp_path):
-    _, _, detail_manifest, _, _, _ = _build_unified_fixture(tmp_path)
-    perm_path = detail_manifest.parent.parent / "permission_issues.json"
+    _, _, detail_db, _ = _build_unified_fixture(tmp_path)
+    perm_path = detail_db.parent.parent / "permission_issues.json"
     assert perm_path.exists()
 
     perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
@@ -338,35 +329,24 @@ def test_unified_json_outputs_permission_issues(tmp_path):
     assert unknown[0]["error"] == "EIO"
 
 
+# ── Negative tests ─────────────────────────────────────────────────────────────
 
-
-# ── Negative tests: corrupt / truncated / malformed inputs ─────────────────────
-
-def test_export_find_users_graceful_on_missing_manifest(tmp_path):
-    """find_users returns [] (not crash) when no manifest exists."""
+def test_export_find_users_graceful_on_missing_db(tmp_path):
+    """find_users returns [] when no detail.db exists."""
     assert export_user_reports.find_users(str(tmp_path), "") == []
 
 
-def test_export_find_users_graceful_on_malformed_manifest_json(tmp_path):
-    """find_users returns [] (not crash) when manifest JSON is malformed."""
+def test_export_find_users_graceful_on_corrupt_db(tmp_path):
+    """find_users returns [] when detail.db is not a valid SQLite file."""
     detail_dir = tmp_path / "detail_users"
     detail_dir.mkdir()
-    (detail_dir / "manifest.json").write_text("not valid json {{{", encoding="utf-8")
+    (detail_dir / "data_detail.db").write_bytes(b"not a sqlite file")
     assert export_user_reports.find_users(str(tmp_path), "") == []
 
 
-def test_export_build_paths_graceful_on_missing_manifest(tmp_path):
-    """build_paths returns ('', '', '') when no manifest exists."""
+def test_export_build_paths_graceful_on_missing_db(tmp_path):
+    """build_paths returns ('', '', '') when no detail.db exists."""
     assert export_user_reports.build_paths(str(tmp_path), "", "alice") == ("", "", "")
-
-
-def test_manifest_missing_users_field_returns_empty_list(tmp_path):
-    """_users_from_detail_manifest returns [] when manifest has no 'users' key."""
-    detail_dir = tmp_path / "detail_users"
-    detail_dir.mkdir()
-    (detail_dir / "manifest.json").write_text(json.dumps({"schema": "check-disk-detail"}), encoding="utf-8")
-    result = export_user_reports._users_from_detail_manifest(str(detail_dir / "manifest.json"))
-    assert result == []
 
 
 def test_unified_scan_truncated_scan_bin_reports_zero_files(tmp_path):
@@ -393,12 +373,19 @@ def test_unified_scan_truncated_scan_bin_reports_zero_files(tmp_path):
         detail_uid_username={1000: "alice"},
     )
     ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
-    detail = json.loads((tmp_path / "detail_users" / "manifest.json").read_text(encoding="utf-8"))
-    assert detail.get("users", []) == []
 
-    summary = json.loads((tmp_path / "detail_users" / "data_detail.json").read_text(encoding="utf-8"))
-    assert summary["scan"]["total_files"] == 0
-    assert summary["scan"]["total_size"] == 0
+    detail_db = tmp_path / "detail_users" / "data_detail.db"
+    assert detail_db.exists()
+    conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
+    try:
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM meta")}
+        assert int(meta["total_files"]) == 0
+        assert int(meta["total_size"]) == 0
+        # Truncated input has no decodable user rows.
+        files_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        assert files_count == 0
+    finally:
+        conn.close()
 
 
 def test_unified_corrupt_permission_tsv_reports_zero_permission_issues(tmp_path):
@@ -431,4 +418,4 @@ def test_unified_corrupt_permission_tsv_reports_zero_permission_issues(tmp_path)
     perm_path = tmp_path / "permission_issues.json"
     assert perm_path.exists()
     perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
-    assert isinstance(perm_data, dict)
+    assert "permission_issues" in perm_data

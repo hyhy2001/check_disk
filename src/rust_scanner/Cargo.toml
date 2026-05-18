@@ -19,5 +19,6 @@ flate2 = "1.0"
 rayon = "1.8"
 glob = "0.3"
 crc32fast = "1.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 unicode-normalization = "0.1"

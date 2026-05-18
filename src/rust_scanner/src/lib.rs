@@ -4,18 +4,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 
+mod db_writer;
 mod pipe_events;
 mod pipe_io;
 mod pipe_permission;
 mod pipe_treemap;
 mod pipe_types;
-mod pipeline_manifest;
 mod report_pipeline;
 mod scan_constants;
 mod scan_core;
 mod scan_state;
 mod scan_utils;
-use pipeline_manifest::build_pipeline_impl;
 
 /// Read RSS memory from /proc/self/status in MB (Linux only).
 // ProgressStats replaced by 3 AtomicU64 (no lock, exact counts)
@@ -295,52 +294,15 @@ fn scan_disk(
     )
 }
 
-#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
+#[pyfunction(signature = (tmpdir, uids_map, team_map, detail_db_path, treemap_db_path, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
 #[allow(clippy::too_many_arguments)]
 fn build_pipeline(
     py: Python<'_>,
     tmpdir: String,
     uids_map: HashMap<u32, String>,
     team_map: HashMap<String, String>,
-    pipeline_db_path: String,
-    treemap_json: String,
-    treemap_db: String,
-    treemap_root: String,
-    max_level: usize,
-    min_size_bytes: i64,
-    timestamp: i64,
-    max_workers: usize,
-    build_treemap: bool,
-    debug: bool,
-) -> PyResult<u64> {
-    build_pipeline_impl(
-        py,
-        tmpdir,
-        uids_map,
-        team_map,
-        pipeline_db_path,
-        treemap_json,
-        treemap_db,
-        treemap_root,
-        max_level,
-        min_size_bytes,
-        timestamp,
-        max_workers,
-        build_treemap,
-        debug,
-    )
-}
-
-#[pyfunction(signature = (tmpdir, uids_map, team_map, pipeline_db_path, treemap_json, treemap_db, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
-#[allow(clippy::too_many_arguments)]
-fn build_pipeline_dbs(
-    py: Python<'_>,
-    tmpdir: String,
-    uids_map: HashMap<u32, String>,
-    team_map: HashMap<String, String>,
-    pipeline_db_path: String,
-    treemap_json: String,
-    treemap_db: String,
+    detail_db_path: String,
+    treemap_db_path: String,
     treemap_root: String,
     max_level: usize,
     min_size_bytes: i64,
@@ -354,9 +316,8 @@ fn build_pipeline_dbs(
         tmpdir,
         uids_map,
         team_map,
-        pipeline_db_path,
-        treemap_json,
-        treemap_db,
+        detail_db_path,
+        treemap_db_path,
         treemap_root,
         max_level,
         min_size_bytes,
@@ -371,7 +332,6 @@ fn build_pipeline_dbs(
 fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_disk, m)?)?;
     m.add_function(wrap_pyfunction!(merge_write_user_report, m)?)?;
-    m.add_function(wrap_pyfunction!(build_pipeline_dbs, m)?)?;
     m.add_function(wrap_pyfunction!(build_pipeline, m)?)?;
     Ok(())
 }

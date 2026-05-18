@@ -65,6 +65,7 @@ def make_config(tmp_path, **overrides):
 # ── Unified Rust detail DB integration ─────────────────────────────────────────
 
 def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
+    import sqlite3
     import src.report_generator as report_generator_module
 
     if not report_generator_module.HAS_RUST_PIPELINE:
@@ -95,99 +96,143 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
     scan_result.detail_tmpdir = str(detail_tmpdir)
     scan_result.detail_uid_username = {1000: "alice"}
 
-    created = ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=True)
-
-    detail_manifest = tmp_path / "detail_users" / "manifest.json"
-    treemap_json = tmp_path / "tree_map_report.json"
-    treemap_manifest = tmp_path / "tree_map_data" / "manifest.json"
-
-    expected_created = sorted(
-        map(
-            str,
-            [
-                detail_manifest,
-                tmp_path / "detail_users" / "data_detail.json",
-                treemap_json,
-                treemap_manifest,
-            ],
-        )
+    created = ReportGenerator(cfg).generate_detail_reports(
+        scan_result, max_workers=1, build_treemap=True
     )
-    assert expected_created == created
 
-    detail_root = tmp_path / "detail_users"
-    assert detail_manifest.exists()
-    assert (detail_root / "data_detail.json").exists()
-    assert not (detail_root / "index").exists()
-    assert not (detail_root / "index_seed").exists()
+    detail_db = tmp_path / "detail_users" / "data_detail.db"
+    treemap_db = tmp_path / "tree_map_data" / "treemap.db"
 
-    tree_data = tmp_path / "tree_map_data"
-    assert (tree_data / "manifest.json").exists()
+    assert created == sorted(map(str, [detail_db, treemap_db]))
+    assert detail_db.exists()
+    assert treemap_db.exists()
 
-    tree_meta = json.loads(treemap_manifest.read_text(encoding="utf-8"))
-    assert tree_meta["schema"] == "check-disk-detail-treemap"
-    assert tree_meta["files"]["api/shards_manifest.json"]["records"] == 1
-    assert tree_meta["files"]["shards"]["records"] >= 1
+    # Legacy NDJSON layout MUST be cleaned up.
+    assert not (tmp_path / "detail_users" / "manifest.json").exists()
+    assert not (tmp_path / "detail_users" / "data_detail.json").exists()
+    assert not (tmp_path / "detail_users" / "users").exists()
+    assert not (tmp_path / "detail_users" / "api").exists()
+    assert not (tmp_path / "tree_map_report.json").exists()
+    assert not (tmp_path / "tree_map_data" / "shards").exists()
+    assert not (tmp_path / "tree_map_data" / "api").exists()
+    assert not (tmp_path / "tree_map_data" / "manifest.json").exists()
 
-    detail_meta = json.loads(detail_manifest.read_text(encoding="utf-8"))
-    assert detail_meta["schema"] == "check-disk-detail"
+    # ── detail.db schema + content ────────────────────────────────────────
+    conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert tables >= {
+            "meta",
+            "users",
+            "exts",
+            "names",
+            "files",
+            "top_files",
+            "dir_user_size",
+        }
+        # user_ext_stats was removed (no consumers in dashboard or scripts).
+        assert "user_ext_stats" not in tables
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert indexes >= {
+            "ix_files_uid_size",
+            "ix_files_uid_ext_size",
+            "ix_files_name_uid",
+            "ix_dus_uid_size",
+        }
+        # ix_files_dir_size was removed (no callers).
+        assert "ix_files_dir_size" not in indexes
+        # Old partial index replaced by full ix_files_uid_size.
+        assert "ix_files_uid_size_big" not in indexes
 
-    # per-user layout: alice has her own manifest
-    alice_user_manifest = tmp_path / "detail_users" / "users" / "alice" / "manifest.json"
-    assert alice_user_manifest.exists()
-    alice_meta = json.loads(alice_user_manifest.read_text(encoding="utf-8"))
-    assert alice_meta["schema"] == "check-disk-user"
-    assert alice_meta["summary"]["files"] >= 2
-    assert alice_meta["summary"]["dirs"] >= 1
-    assert alice_meta["summary"]["used"] == 6144
+        # Stamp + version
+        app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+        # Two's-complement: stored as signed; expected magic 0xC0DD15D1.
+        expected = 0xC0DD15D1
+        if app_id < 0:
+            app_id += 1 << 32
+        assert app_id == expected
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
 
-    # alice's files chunk
-    alice_files = tmp_path / "detail_users" / "users" / "alice" / "files" / "chunk-00000" / "part-00000_files.ndjson"
-    assert alice_files.exists()
-    alice_file_rows = []
-    with open(alice_files, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            alice_file_rows.append(json.loads(line))
-    assert len(alice_file_rows) == 2
-    assert all("gid" in row for row in alice_file_rows)
-    assert all("x" in row for row in alice_file_rows)
-    total_bytes = sum(row["s"] for row in alice_file_rows)
-    assert total_bytes == 6144
+        # users
+        row = conn.execute(
+            "SELECT total_files, total_size FROM users WHERE username='alice'"
+        ).fetchone()
+        assert row == (2, 6144)
 
-    path_dict = tmp_path / "detail_users" / "api" / "path_dict.ndjson"
-    assert path_dict.exists()
-    gid_to_path = {}
-    with open(path_dict, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            gid_to_path[row["gid"]] = row["p"]
+        # files: basenames live in detail.db.names (file basenames),
+        # NOT tm.names (which holds dir segments only).
+        files = conn.execute(
+            "SELECT n.name, e.ext, f.size "
+            "FROM files f JOIN names n ON f.name_id=n.id "
+            "JOIN exts e ON f.ext_id=e.id ORDER BY f.size DESC"
+        ).fetchall()
+        assert {(n, x, s) for (n, x, s) in files} == {
+            ("alpha.txt", "txt", 4096),
+            ("beta.log", "log", 2048),
+        }
 
-    resolved_paths = [gid_to_path.get(row["gid"], "") for row in alice_file_rows]
-    assert any(path.endswith("alpha.txt") for path in resolved_paths)
-    assert any(path.endswith("beta.log") for path in resolved_paths)
+        # top_files: rank=1 → 4096 bytes, rank=2 → 2048
+        top = conn.execute(
+            "SELECT rank, size FROM top_files WHERE uid="
+            "(SELECT uid FROM users WHERE username='alice') ORDER BY rank"
+        ).fetchall()
+        assert top == [(1, 4096), (2, 2048)]
 
-    # alice's dirs chunk
-    alice_dirs = tmp_path / "detail_users" / "users" / "alice" / "dirs" / "chunk-00000" / "part-00000.ndjson"
-    assert alice_dirs.exists()
+        # Full (uid, size DESC) index covers ORDER BY for any page.
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM files "
+            "WHERE uid=0 ORDER BY size DESC LIMIT 10"
+        ).fetchall()
+        assert any("ix_files_uid_size" in str(row) for row in plan)
+    finally:
+        conn.close()
 
-    detail = json.loads((detail_root / "manifest.json").read_text(encoding="utf-8"))
-    alice_user_entry = next(u for u in detail["users"] if u["username"] == "alice")
-    assert alice_user_entry["files"] == 2
-    assert alice_user_entry["dirs"] >= 1
-    assert alice_user_entry["used"] == 6144
+    # ── treemap.db schema + content ───────────────────────────────────────
+    conn = sqlite3.connect(f"file:{treemap_db}?mode=ro", uri=True)
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert tables >= {"meta", "names", "owners", "dirs", "dir_owner"}
 
-    assert treemap_json.exists()
-    assert treemap_manifest.exists()
+        app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+        expected = 0xC0DD15C0
+        if app_id < 0:
+            app_id += 1 << 32
+        assert app_id == expected
 
-    tree_manifest = json.loads(treemap_manifest.read_text(encoding="utf-8"))
-    assert tree_manifest["schema"] == "check-disk-detail-treemap"
-    assert tree_manifest["files"]["api/shards_manifest.json"]["records"] == 1
-    assert tree_manifest["files"]["shards"]["records"] >= 1
+        # Root dir present, has children
+        root_row = conn.execute(
+            "SELECT id, total_size FROM dirs WHERE parent_id IS NULL"
+        ).fetchone()
+        assert root_row is not None
+        root_id, root_total = root_row
+        assert root_total == 6144
+
+        # Path reconstruction reaches alpha.txt's parent
+        # (its dir is the scan tmp_path itself)
+        children = conn.execute(
+            "SELECT n.name, d.total_size FROM dirs d "
+            "JOIN names n ON d.name_id=n.id "
+            "WHERE d.parent_id=? ORDER BY d.total_size DESC",
+            (root_id,),
+        ).fetchall()
+        assert any(c[0] == "sub" for c in children)
+    finally:
+        conn.close()
 
 
 # ── ReportGenerator.__init__ ──────────────────────────────────────────────────
