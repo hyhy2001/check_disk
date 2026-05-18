@@ -216,42 +216,55 @@ fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResu
         let _ = fs::remove_file(&tmp_path);
     }
 
-    conn.execute_batch("ANALYZE;")
-        .map_err(|e| PyRuntimeError::new_err(format!("analyze: {}", e)))?;
+    // Run ANALYZE / VACUUM INTO inside a closure so we can clean up the
+    // partial tmp.db on any error path before propagating the failure.
+    // VACUUM INTO is the only step here that can leave a half-written file
+    // around (e.g. when /tmp or the destination disk runs out of space mid-
+    // write); a leaked tmp.db would otherwise sit on disk until the next run.
+    let result: PyResult<()> = (|| {
+        conn.execute_batch("ANALYZE;")
+            .map_err(|e| PyRuntimeError::new_err(format!("analyze: {}", e)))?;
 
-    // Decide between VACUUM INTO (defrag + write to tmp) and direct rename.
-    let build_size = fs::metadata(build_path).map(|m| m.len()).unwrap_or(0);
-    let skip_vacuum = build_size < VACUUM_SIZE_THRESHOLD_BYTES;
+        let build_size = fs::metadata(build_path).map(|m| m.len()).unwrap_or(0);
+        let skip_vacuum = build_size < VACUUM_SIZE_THRESHOLD_BYTES;
 
-    if !skip_vacuum {
-        let tmp_str = tmp_path.to_string_lossy().replace('\'', "''");
-        conn.execute(&format!("VACUUM INTO '{}'", tmp_str), [])
-            .map_err(|e| PyRuntimeError::new_err(format!("vacuum into: {}", e)))?;
-    }
-    drop(conn);
+        if !skip_vacuum {
+            let tmp_str = tmp_path.to_string_lossy().replace('\'', "''");
+            conn.execute(&format!("VACUUM INTO '{}'", tmp_str), [])
+                .map_err(|e| PyRuntimeError::new_err(format!("vacuum into: {}", e)))?;
+        }
+        drop(conn);
 
-    if final_path.exists() {
-        fs::remove_file(final_path).map_err(|e| {
-            PyRuntimeError::new_err(format!("rm old final {}: {}", final_path.display(), e))
+        if final_path.exists() {
+            fs::remove_file(final_path).map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "rm old final {}: {}",
+                    final_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let source = if skip_vacuum { build_path } else { &tmp_path };
+        fs::rename(source, final_path).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "rename {} -> {}: {}",
+                source.display(),
+                final_path.display(),
+                e
+            ))
         })?;
-    }
 
-    let source = if skip_vacuum { build_path } else { &tmp_path };
-    fs::rename(source, final_path).map_err(|e| {
-        PyRuntimeError::new_err(format!(
-            "rename {} -> {}: {}",
-            source.display(),
-            final_path.display(),
-            e
-        ))
-    })?;
+        if !skip_vacuum {
+            let _ = fs::remove_file(build_path);
+        }
+        Ok(())
+    })();
 
-    if skip_vacuum {
-        // Build file moved into final; nothing left to clean.
-    } else {
-        let _ = fs::remove_file(build_path);
+    if result.is_err() && tmp_path.exists() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    Ok(())
+    result
 }
 
 fn insert_meta(conn: &mut Connection, meta: &[(String, String)]) -> PyResult<()> {

@@ -20,7 +20,6 @@ from .utils import (
     get_terminal_size,
     get_username_from_uid,
     load_json_report,
-    parse_size,
     save_json_report,
 )
 
@@ -34,7 +33,6 @@ __all__ = [
     'ReportFormatter',
     'ScanHelper',
     'format_size',
-    'parse_size',
     'get_terminal_size',
     'get_username_from_uid',
     'get_general_system_info',

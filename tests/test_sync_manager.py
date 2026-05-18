@@ -510,6 +510,42 @@ class TestFallbackChain(SyncTestBase):
             pipeline.enqueue_file("/tmp/this_file_does_not_exist_xyz.json")
             pipeline.close()  # phải finish sạch sẽ
 
+    def test_unreachable_host_does_not_hang(self):
+        """Host không reachable → close() vẫn return trong thời gian hợp lý.
+
+        Dùng port reserved trên localhost (1) để TCP connect bị refused
+        ngay lập tức. ControlMaster setup sẽ fail, sync_file_to_remote sẽ
+        log error nhưng future không được phép treo wait() vô hạn.
+        """
+        local = tempfile.mkdtemp(prefix="sync_unreach_")
+        Path(local, "x.json").write_text("{}")
+        try:
+            with _patched_ssh(self.SSH_KEY):
+                pipeline = AsyncSyncPipeline(
+                    base_dir=local,
+                    user="root",
+                    host="127.0.0.1",
+                    dest_dir=self._remote_tmp,
+                )
+                # Force a control_socket value that points at a non-existent
+                # path so every subsequent ssh invocation falls back to a
+                # fresh connection — exercising the "host unreachable" code
+                # path without actually waiting for TCP timeouts.
+                pipeline._capability_cache["control_socket"] = "/tmp/no_such_socket"
+                pipeline.enqueue_file(os.path.join(local, "x.json"))
+                start = time.time()
+                pipeline.close()
+                elapsed = time.time() - start
+                # close() must complete; we allow up to 60s for an SSH
+                # connect attempt to fail and the worker to return.
+                self.assertLess(
+                    elapsed, 90.0,
+                    f"close() did not return promptly on unreachable host "
+                    f"(took {elapsed:.1f}s)"
+                )
+        finally:
+            shutil.rmtree(local, ignore_errors=True)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. _should_compress – pure unit tests (không cần SSH)

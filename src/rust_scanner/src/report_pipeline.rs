@@ -18,7 +18,7 @@ use crate::pipe_events::{
     read_permission_events,
 };
 use crate::pipe_io::{ensure_dir, recreate_dir};
-use crate::pipe_permission::{write_permission_issues_db, write_permission_issues_json};
+use crate::pipe_permission::write_permission_issues_db;
 use crate::pipe_treemap::{tm_basename, tm_parent, normalize_root};
 use crate::pipe_types::FILE_PART_RECORDS;
 
@@ -641,7 +641,13 @@ pub fn build_pipeline_dbs_impl(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        for username in &sorted_users {
+        let total_users = sorted_users.len();
+        println!(
+            "[Phase 2] Building user detail for {} users...",
+            total_users
+        );
+        let progress_step = (total_users / 10).max(1);
+        for (idx, username) in sorted_users.iter().enumerate() {
             let uid = intern_user(username, &mut username_to_uid, &mut uid_to_username);
             let totals = user_totals.entry(uid).or_default();
             let Some(spills) = user_spill_paths.get(username) else { continue };
@@ -767,6 +773,14 @@ pub fn build_pipeline_dbs_impl(
                     }
                 }
                 let _ = fs::remove_file(spill_path);
+            }
+            let done = idx + 1;
+            if done == total_users || done % progress_step == 0 {
+                let pct = (done as f64) * 100.0 / (total_users.max(1) as f64);
+                println!(
+                    "[Phase 2]   user detail: {}/{} ({:.0}%)",
+                    done, total_users, pct
+                );
             }
         }
         if !chunk.is_empty() {
@@ -936,6 +950,11 @@ pub fn build_pipeline_dbs_impl(
 
             let treemap_db_pb_clone = treemap_db_pb.clone();
             let treemap_work_dir_clone = treemap_work_dir.clone();
+            println!(
+                "[Phase 2] Building treemap ({} dirs, max_level {}) in background...",
+                input.dirs.len(),
+                max_level
+            );
             Some(std::thread::spawn(move || -> PyResult<()> {
                 db_writer::build_treemap_db(
                     &treemap_db_pb_clone,
@@ -1032,11 +1051,13 @@ pub fn build_pipeline_dbs_impl(
 
         // ─── STAGE 5: index + finalize detail.db ───────────────────
         let t5 = Instant::now();
+        println!("[Phase 2] Finalizing detail.db (index + vacuum)...");
         let files_inserted = db_writer::detail_finalize(detail_handle)?;
         t_finalize_detail = t5.elapsed().as_secs_f64();
 
         // Join the parallel treemap-build thread spawned at Stage 3a.
         if let Some(handle) = treemap_thread {
+            println!("[Phase 2] Waiting for treemap build to finish...");
             match handle.join() {
                 Ok(result) => result?,
                 Err(_) => {
@@ -1061,10 +1082,8 @@ pub fn build_pipeline_dbs_impl(
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        write_permission_issues_json(&perm_events, &uids_map, &perm_out_dir, &root, timestamp)?;
-        // Also emit a SQLite index alongside the JSON. The dashboard prefers
-        // the DB (LIMIT/OFFSET + WHERE filtering, no full scan); the JSON
-        // stays as a portable fallback for older dashboard versions.
+        // Indexed SQLite is the only artifact: the dashboard reads it via
+        // LIMIT/OFFSET + WHERE, and the JSON variant has been removed.
         write_permission_issues_db(&perm_events, &uids_map, &perm_out_dir, &root, timestamp)?;
         t_perm_write = t_perm.elapsed().as_secs_f64();
 

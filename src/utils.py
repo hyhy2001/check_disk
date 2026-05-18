@@ -62,44 +62,6 @@ def format_time_duration(seconds: float) -> str:
     else:
         return f"{seconds}s"
 
-def parse_size(size_str: str) -> int:
-    """
-    Parse a human-readable size string to bytes.
-
-    Args:
-        size_str: Size string (e.g., '1TB', '500GB')
-
-    Returns:
-        Size in bytes
-    """
-    if not size_str:
-        return 0
-
-    size_str = size_str.upper().strip()
-    multipliers = {
-        'B': 1,
-        'KB': 1024,
-        'MB': 1024**2,
-        'GB': 1024**3,
-        'TB': 1024**4,
-        'PB': 1024**5
-    }
-
-    # Handle numeric-only input as bytes
-    if size_str.isdigit():
-        return int(size_str)
-
-    # Extract number and unit
-    for unit, multiplier in multipliers.items():
-        if size_str.endswith(unit):
-            try:
-                number = float(size_str[:-len(unit)])
-                return int(number * multiplier)
-            except ValueError:
-                return 0
-
-    return 0
-
 def get_terminal_size() -> Tuple[int, int]:
     """
     Get the current terminal size.
@@ -162,23 +124,6 @@ def get_general_system_info(directory: str) -> Dict[str, int]:
         pass
 
     return info
-
-def get_actual_disk_usage(stat_result):
-    """
-    Calculate the actual disk space used by a file, accounting for sparse files.
-
-    Args:
-        stat_result: Result from os.stat()
-
-    Returns:
-        int: Actual size in bytes the file occupies on disk
-    """
-    # st_blocks gives 512-byte blocks
-    if hasattr(stat_result, 'st_blocks'):
-        return stat_result.st_blocks * 512
-    else:
-        return stat_result.st_size
-
 
 def create_usage_bar(percent: float, width: int = 20) -> str:
     """

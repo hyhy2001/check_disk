@@ -81,157 +81,40 @@ class DiskScanner:
         return self._scanner.scan()
 
     def _rust_scan(self) -> ScanResult:
-        """Execute the Rust core scanner"""
+        """Execute the Rust core scanner.
+
+        Orchestrates the Phase 1 pipeline by delegating to focused helpers:
+        resolve target uids, invoke the Rust extension, classify usage,
+        format permission issues, take a final filesystem snapshot, then
+        save state and render the console summary.
+        """
         print("\n[RUST] Initiating High-Performance Rust Core Engine")
 
         directory = self.config.get("directory", "/")
         skip_dirs = self.config.get("exclude_patterns", [])
-        target_users_only = self.config.get('target_users_only', False)
-        target_uids = None
-        if target_users_only and self.config.get('users'):
-            import pwd
-            target_uids = []
-            for u in self.config.get('users'):
-                try:
-                    target_uids.append(pwd.getpwnam(u['name']).pw_uid)
-                except KeyError:
-                    pass
+        target_uids = self._resolve_target_uids()
 
-        print("Calling fast_scanner.scan_disk()...")
-        start = time.time()
-        if not hasattr(fast_scanner, "scan_disk"):
-            raise RuntimeError("fast_scanner.scan_disk is required")
-        try:
-            result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers, self.debug)
-        except TypeError:
-            try:
-                result = fast_scanner.scan_disk(directory, skip_dirs, target_uids, self.max_workers)
-            except TypeError:
-                result = fast_scanner.scan_disk(directory, skip_dirs, target_uids)
-        duration = time.time() - start
+        result, duration = self._invoke_rust_scanner(directory, skip_dirs, target_uids)
+        self._print_phase1_summary(directory, result, duration)
 
-        from .utils import format_size
+        uid_cache = self._build_uid_cache(result)
+        team_list, user_list, other_list, user_inode_list, \
+            team_usage_results, user_usage_results, other_usage_results = \
+            self._classify_usage(result, uid_cache)
 
-        mem_usage = _get_rss_mb()
+        perm_by_user, perm_formatted = self._format_permission_issues(result, uid_cache)
 
-        total_files = result.get('total_files', 0)
-        total_dirs = result.get('total_dirs', 0)
-        total_size = result.get('total_size', 0)
-        avg_rate = total_files / duration if duration > 0 else 0
+        system_info = self._build_system_info(directory, result)
+        self._print_disk_snapshot(system_info)
 
-        print(f"\n{'='*60}")
-        print(f"SCAN COMPLETED in {format_time_duration(duration)}")
-        print(f"{'='*60}")
-        print(f"Directory scanned: {directory}")
-        print(f"Total directories: {total_dirs:,}")
-        print(f"Total files:      {total_files:,}")
-        print(f"Total size:       {format_size(total_size)}")
-        print(f"Scan rate:        {avg_rate:,.0f} files/sec")
-        print(f"Memory usage:     {mem_usage:.1f} MB")
-
-        # Build UID mapping
-
-        uid_cache = {}
-        for uid_str in result.get("uid_sizes", {}).keys():
-            uid = int(uid_str)
-            if uid not in uid_cache:
-                uid_cache[uid] = get_username_from_uid(uid)
-
-        user_usage_results = defaultdict(int)
-        user_inode_results = defaultdict(int)
-        team_usage_results = defaultdict(int)
-        other_usage_results = defaultdict(int)
-
-        valid_users = {u["name"]: u for u in self.config.get("users", [])}
-        valid_teams = {t["name"]: t for t in self.config.get("teams", [])}
-
-        uid_files_dict = result.get("uid_files", {})
-
-        for uid_str, size in result.get("uid_sizes", {}).items():
-            uid = int(uid_str)
-            username = uid_cache[uid]
-            file_count = uid_files_dict.get(uid_str, 0)
-
-            if username in valid_users:
-                user_usage_results[username] += size
-                user_inode_results[username] += file_count
-                team_id = valid_users[username].get("team_id")
-                team_name = next((t for t, v in valid_teams.items() if v.get("team_id") == team_id), "Other")
-                team_usage_results[team_name] += size
-            elif not self.config.get('target_users_only', False):
-                other_usage_results[username] += size
-                user_inode_results[username] += file_count
-
-        user_list = ScanHelper.create_user_list(user_usage_results)
-        team_list = ScanHelper.create_user_list(team_usage_results)
-        other_list = ScanHelper.create_user_list(other_usage_results)
-
-        user_inode_list = [{"name": name, "inodes": count} for name, count in user_inode_results.items()]
-        user_inode_list.sort(key=lambda x: x["inodes"], reverse=True)
-
-        other_total = sum(item["used"] for item in other_list)
-        team_list.append({"name": "Other", "used": other_total})
-
-
-        dir_sizes_map: Dict[str, Dict[str, int]] = {}
-
-
-        # Build permission_issues in the same nested format as Python legacy
-        rust_perm_flat = result.get("permission_issues", [])
-        perm_by_user: Dict[str, List] = {}
-        for item in rust_perm_flat:
-            path = item.get("path", "")
-            kind = item.get("type", "unknown")
-            err  = item.get("error", "")
-
-            uid_value = item.get("uid")
-            if uid_value is not None:
-                owner = uid_cache.get(uid_value, get_username_from_uid(uid_value, uid_cache))
-            else:
-                owner = "unknown"
-
-            if self.config.get('target_users_only', False) and owner not in valid_users:
-                continue
-            perm_by_user.setdefault(owner, []).append({"path": path, "type": kind, "error": err})
-
-        # New Rust path: Phase 1 may only return permission_issues_count to keep RAM bounded.
-        # Keep backward-compatible report shape by exposing empty lists plus count.
-        permission_issues_count = int(result.get("permission_issues_count", len(rust_perm_flat)))
-
-        perm_formatted = {
-            "users": [],
-            "unknown_items": perm_by_user.get("unknown", []),
-            "count": permission_issues_count,
-        }
-        for owner, issues in sorted(perm_by_user.items()):
-            if owner != "unknown":
-                perm_formatted["users"].append({
-                    "name": owner,
-                    "inaccessible_items": issues
-                })
-
-        # Re-use LegacyDiskScanner's table formatting for the console summary
-        # Use one final filesystem snapshot after scan for consistency
-        # between terminal output and report JSON.
-        system_info = get_general_system_info(directory)
-        system_info["inodes_scanned"] = result.get("total_inodes", 0)
-
-        print(f"{'='*60}")
-        print("Disk Information (final snapshot):")
-        total_capacity = float(system_info.get('total', 0) or 0)
-        used_space = float(system_info.get('used', 0) or 0)
-        used_percent = (used_space * 100.0 / total_capacity) if total_capacity > 0 else 0.0
-        print(f"  Total capacity: {format_size(total_capacity)}")
-        print(f"  Used space:     {format_size(used_space)} ({used_percent:.1f}%)")
-        print(f"  Available:      {format_size(system_info.get('available', 0))}")
-        print(f"{'='*60}")
-
-        self.general_system = system_info
-        self.team_usage_results = team_usage_results
-        self.user_usage_results = user_usage_results
-        self.other_usage_results = other_usage_results
-        self.user_inode_list = user_inode_list
-        self.permission_issues = perm_by_user
+        self._save_display_state(
+            system_info,
+            team_usage_results,
+            user_usage_results,
+            other_usage_results,
+            user_inode_list,
+            perm_by_user,
+        )
         if self.config.get('target_users_only', False):
             self._display_targeted_summary()
         else:
@@ -243,13 +126,202 @@ class DiskScanner:
             user_usage=user_list,
             other_usage=other_list,
             timestamp=int(time.time()),
-            top_dir=[],  # deprecated — derive from dir_sizes_map instead
+            top_dir=[],
             permission_issues=perm_formatted,
             user_inodes=user_inode_list,
             detail_tmpdir=result.get("detail_tmpdir", ""),
             detail_uid_username=uid_cache,
-            dir_sizes_map=dir_sizes_map,
+            dir_sizes_map={},
         )
+
+    def _resolve_target_uids(self) -> List[int]:
+        """Resolve --user filter to a list of POSIX uids, or None for all users."""
+        if not self.config.get('target_users_only', False):
+            return None
+        users = self.config.get('users') or []
+        if not users:
+            return None
+        import pwd
+        uids = []
+        for u in users:
+            try:
+                uids.append(pwd.getpwnam(u['name']).pw_uid)
+            except KeyError:
+                pass
+        return uids
+
+    def _invoke_rust_scanner(self, directory: str, skip_dirs: List[str], target_uids):
+        """Call into the Rust extension and return (result_dict, duration_seconds)."""
+        print("Calling fast_scanner.scan_disk()...")
+        start = time.time()
+        result = fast_scanner.scan_disk(
+            directory, skip_dirs, target_uids, self.max_workers, self.debug
+        )
+        return result, time.time() - start
+
+    def _print_phase1_summary(self, directory: str, result: Dict[str, Any], duration: float) -> None:
+        """Print throughput / memory summary right after the Rust scan returns."""
+        total_files = result.get('total_files', 0)
+        total_dirs = result.get('total_dirs', 0)
+        total_size = result.get('total_size', 0)
+        avg_rate = total_files / duration if duration > 0 else 0
+        mem_usage = _get_rss_mb()
+
+        print(f"\n{'='*60}")
+        print(f"SCAN COMPLETED in {format_time_duration(duration)}")
+        print(f"{'='*60}")
+        print(f"Directory scanned: {directory}")
+        print(f"Total directories: {total_dirs:,}")
+        print(f"Total files:      {total_files:,}")
+        print(f"Total size:       {format_size(total_size)}")
+        print(f"Scan rate:        {avg_rate:,.0f} files/sec")
+        print(f"Memory usage:     {mem_usage:.1f} MB")
+
+    def _build_uid_cache(self, result: Dict[str, Any]) -> Dict[int, str]:
+        """Resolve every uid seen in the scan to a username (with /etc/passwd lookup)."""
+        uid_cache: Dict[int, str] = {}
+        for uid_str in result.get("uid_sizes", {}).keys():
+            uid = int(uid_str)
+            if uid not in uid_cache:
+                uid_cache[uid] = get_username_from_uid(uid)
+        return uid_cache
+
+    def _classify_usage(self, result: Dict[str, Any], uid_cache: Dict[int, str]):
+        """Split per-uid usage into configured users / teams / "Other".
+
+        Returns a tuple of:
+            (team_list, user_list, other_list, user_inode_list,
+             team_usage_results, user_usage_results, other_usage_results)
+        """
+        user_usage_results = defaultdict(int)
+        user_inode_results = defaultdict(int)
+        team_usage_results = defaultdict(int)
+        other_usage_results = defaultdict(int)
+
+        valid_users = {u["name"]: u for u in self.config.get("users", [])}
+        valid_teams = {t["name"]: t for t in self.config.get("teams", [])}
+        target_users_only = self.config.get('target_users_only', False)
+        uid_files_dict = result.get("uid_files", {})
+
+        for uid_str, size in result.get("uid_sizes", {}).items():
+            uid = int(uid_str)
+            username = uid_cache[uid]
+            file_count = uid_files_dict.get(uid_str, 0)
+
+            if username in valid_users:
+                user_usage_results[username] += size
+                user_inode_results[username] += file_count
+                team_id = valid_users[username].get("team_id")
+                team_name = next(
+                    (t for t, v in valid_teams.items() if v.get("team_id") == team_id),
+                    "Other",
+                )
+                team_usage_results[team_name] += size
+            elif not target_users_only:
+                other_usage_results[username] += size
+                user_inode_results[username] += file_count
+
+        user_list = ScanHelper.create_user_list(user_usage_results)
+        team_list = ScanHelper.create_user_list(team_usage_results)
+        other_list = ScanHelper.create_user_list(other_usage_results)
+
+        user_inode_list = [
+            {"name": name, "inodes": count} for name, count in user_inode_results.items()
+        ]
+        user_inode_list.sort(key=lambda x: x["inodes"], reverse=True)
+
+        other_total = sum(item["used"] for item in other_list)
+        team_list.append({"name": "Other", "used": other_total})
+
+        return (
+            team_list,
+            user_list,
+            other_list,
+            user_inode_list,
+            team_usage_results,
+            user_usage_results,
+            other_usage_results,
+        )
+
+    def _format_permission_issues(self, result: Dict[str, Any], uid_cache: Dict[int, str]):
+        """Reshape the flat Rust permission_issues into the nested report format.
+
+        Returns (perm_by_user, perm_formatted).
+        """
+        rust_perm_flat = result.get("permission_issues", [])
+        valid_users = {u["name"]: u for u in self.config.get("users", [])}
+        target_users_only = self.config.get('target_users_only', False)
+
+        perm_by_user: Dict[str, List] = {}
+        for item in rust_perm_flat:
+            path = item.get("path", "")
+            kind = item.get("type", "unknown")
+            err = item.get("error", "")
+
+            uid_value = item.get("uid")
+            if uid_value is not None:
+                owner = uid_cache.get(uid_value, get_username_from_uid(uid_value, uid_cache))
+            else:
+                owner = "unknown"
+
+            if target_users_only and owner not in valid_users:
+                continue
+            perm_by_user.setdefault(owner, []).append(
+                {"path": path, "type": kind, "error": err}
+            )
+
+        # Phase 1 may only emit permission_issues_count to bound RAM; fall
+        # back to the actual list length when paths were emitted.
+        permission_issues_count = int(
+            result.get("permission_issues_count", len(rust_perm_flat))
+        )
+
+        perm_formatted = {
+            "users": [],
+            "unknown_items": perm_by_user.get("unknown", []),
+            "count": permission_issues_count,
+        }
+        for owner, issues in sorted(perm_by_user.items()):
+            if owner != "unknown":
+                perm_formatted["users"].append(
+                    {"name": owner, "inaccessible_items": issues}
+                )
+        return perm_by_user, perm_formatted
+
+    def _build_system_info(self, directory: str, result: Dict[str, Any]) -> Dict[str, int]:
+        """Take the post-scan filesystem snapshot used by both report and console."""
+        system_info = get_general_system_info(directory)
+        system_info["inodes_scanned"] = result.get("total_inodes", 0)
+        return system_info
+
+    def _print_disk_snapshot(self, system_info: Dict[str, int]) -> None:
+        """Print the final-snapshot disk capacity block."""
+        print(f"{'='*60}")
+        print("Disk Information (final snapshot):")
+        total_capacity = float(system_info.get('total', 0) or 0)
+        used_space = float(system_info.get('used', 0) or 0)
+        used_percent = (used_space * 100.0 / total_capacity) if total_capacity > 0 else 0.0
+        print(f"  Total capacity: {format_size(total_capacity)}")
+        print(f"  Used space:     {format_size(used_space)} ({used_percent:.1f}%)")
+        print(f"  Available:      {format_size(system_info.get('available', 0))}")
+        print(f"{'='*60}")
+
+    def _save_display_state(
+        self,
+        system_info: Dict[str, int],
+        team_usage_results,
+        user_usage_results,
+        other_usage_results,
+        user_inode_list,
+        permission_issues,
+    ) -> None:
+        """Stash data on the instance so display_*_summary methods can render."""
+        self.general_system = system_info
+        self.team_usage_results = team_usage_results
+        self.user_usage_results = user_usage_results
+        self.other_usage_results = other_usage_results
+        self.user_inode_list = user_inode_list
+        self.permission_issues = permission_issues
 
 
 

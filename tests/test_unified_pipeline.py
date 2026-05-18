@@ -304,29 +304,30 @@ def test_cli_check_users_uses_detail_db(tmp_path):
     assert file_files["missing"] == expected
 
 
-def test_unified_json_outputs_permission_issues(tmp_path):
+def test_unified_outputs_permission_issues_db(tmp_path):
+    """permission_issues.db must contain the expected events with owner mapping."""
+    import sqlite3
+
     _, _, detail_db, _ = _build_unified_fixture(tmp_path)
-    perm_path = detail_db.parent.parent / "permission_issues.json"
-    assert perm_path.exists()
+    perm_db = detail_db.parent.parent / "permission_issues.db"
+    assert perm_db.exists(), "permission_issues.db should be written by Phase 2"
 
-    perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
-    issues = perm_data["permission_issues"]
-    assert issues["count"] == 3
+    conn = sqlite3.connect(f"file:{perm_db}?mode=ro", uri=True)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0]
+        assert total == 3
 
-    users = sorted(issues["users"], key=lambda u: u["name"])
-    assert len(users) == 2
-    assert users[0]["name"] == "alice"
-    assert users[0]["inaccessible_items"][0]["type"] == "directory"
-    assert users[0]["inaccessible_items"][0]["error"] == "EACCES"
+        rows = conn.execute(
+            "SELECT user, item_type, error FROM issues ORDER BY user, path"
+        ).fetchall()
+    finally:
+        conn.close()
 
-    assert users[1]["name"] == "bob"
-    assert users[1]["inaccessible_items"][0]["type"] == "file"
-    assert users[1]["inaccessible_items"][0]["error"] == "ENOENT"
-
-    unknown = issues["unknown_items"]
-    assert len(unknown) == 1
-    assert unknown[0]["type"] == "directory"
-    assert unknown[0]["error"] == "EIO"
+    by_user = {r[0]: (r[1], r[2]) for r in rows}
+    assert by_user["alice"] == ("directory", "EACCES")
+    assert by_user["bob"] == ("file", "ENOENT")
+    assert "__unknown__" in by_user
+    assert by_user["__unknown__"] == ("directory", "EIO")
 
 
 # ── Negative tests ─────────────────────────────────────────────────────────────
@@ -415,7 +416,13 @@ def test_unified_corrupt_permission_tsv_reports_zero_permission_issues(tmp_path)
         detail_uid_username={1000: "alice"},
     )
     ReportGenerator(cfg).generate_detail_reports(scan_result, max_workers=1, build_treemap=False)
-    perm_path = tmp_path / "permission_issues.json"
-    assert perm_path.exists()
-    perm_data = json.loads(perm_path.read_text(encoding="utf-8"))
-    assert "permission_issues" in perm_data
+    # Permission DB exists but contains zero rows (malformed TSV is skipped).
+    import sqlite3
+    perm_db = tmp_path / "permission_issues.db"
+    assert perm_db.exists()
+    conn = sqlite3.connect(f"file:{perm_db}?mode=ro", uri=True)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 0

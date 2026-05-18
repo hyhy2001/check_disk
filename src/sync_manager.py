@@ -8,9 +8,13 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from typing import Dict
 
-SSH_TIMEOUT = 30
-RSYNC_TIMEOUT = 7200
-SCP_TIMEOUT = 7200
+SSH_TIMEOUT = 30  # short stage commands (mkdir, mv, rm, codec probe, ControlMaster setup)
+
+# Long-running tar+ssh streams have no Python-side timeout: dataset size
+# isn't bounded, so any wall-clock cap risks killing a perfectly healthy
+# transfer. Liveness is enforced by the SSH ControlMaster's
+# ServerAliveInterval=30 + ServerAliveCountMax=3 (see _get_control_socket):
+# a dead connection drops within ~90s regardless of how large the file is.
 
 _SYNC_PRINT_LOCK = Lock()
 
@@ -18,6 +22,35 @@ _SYNC_PRINT_LOCK = Lock()
 def _sync_log(message: str) -> None:
     with _SYNC_PRINT_LOCK:
         print(message)
+
+
+def _drain_tar_proc(tar_proc) -> None:
+    """Make sure a tar producer Popen never outlives the consumer.
+
+    Closes the stdout pipe (so any remaining write hits SIGPIPE), waits a
+    few seconds, then escalates to kill. Safe to call from any error path.
+    """
+    if tar_proc is None:
+        return
+    try:
+        if tar_proc.stdout is not None:
+            try:
+                tar_proc.stdout.close()
+            except Exception:
+                pass
+        try:
+            tar_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                tar_proc.kill()
+            except Exception:
+                pass
+            try:
+                tar_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    except Exception:
+        pass
 
 # ── SSH ControlMaster settings ──────────────────────────────────────────
 _CONTROL_DIR = None          # lazily created temp dir for sockets
@@ -194,6 +227,7 @@ class ReportSyncer:
         tar_create = ["tar", compress_flag, "-cf", "-", "-C", output_dir_clean, "."]
         ssh_extract = ssh_base + [remote_extract]
 
+        tar_proc = None
         try:
             tar_proc = subprocess.Popen(
                 tar_create,
@@ -207,10 +241,9 @@ class ReportSyncer:
                 stderr=subprocess.PIPE,
                 text=True,
                 env={**os.environ, **env},
-                timeout=RSYNC_TIMEOUT,
             )
-            tar_proc.stdout.close()
-            tar_proc.wait(timeout=30)
+            _drain_tar_proc(tar_proc)
+            tar_proc = None
 
             if ssh_proc.returncode == 0:
                 codec = "xz" if use_xz else "gzip"
@@ -226,6 +259,8 @@ class ReportSyncer:
         except Exception as e:
             _sync_log(f"[SYNC EXCEPTION] Archive stream failed: {str(e)}")
             return False
+        finally:
+            _drain_tar_proc(tar_proc)
 
     @staticmethod
     def sync_file_to_remote(
@@ -237,7 +272,11 @@ class ReportSyncer:
         password: str = None,
         _capability_cache: dict = None,
     ) -> bool:
-        """Sync a single file to the remote server, preserving relative directory structure."""
+        """Atomically sync a single file to the remote server.
+
+        Stream tar+gzip into a sibling staging file then ``mv -T`` into place
+        so a partial transfer never replaces the live file.
+        """
         if not file_path or not os.path.isfile(file_path):
             return False
 
@@ -256,9 +295,18 @@ class ReportSyncer:
         merged_env = {**os.environ, **env}
 
         rel_dir = os.path.dirname(rel_path)
+        basename = os.path.basename(rel_path)
         remote_dir = f"{dest_dir}/{rel_dir}" if rel_dir else dest_dir
+        staging_name = f".{basename}.__staging__.{os.getpid()}"
 
-        extract_cmd = ssh_base + [f"mkdir -p '{remote_dir}' && tar -xzf - -C '{remote_dir}'"]
+        q_remote_dir = shlex.quote(remote_dir)
+        q_basename = shlex.quote(basename)
+        q_staging = shlex.quote(staging_name)
+
+        extract_cmd = ssh_base + [
+            f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && tar -xzOf - {q_basename} > {q_staging} && mv -f {q_staging} {q_basename}')}"
+        ]
+        tar_proc = None
         try:
             tar_proc = subprocess.Popen(
                 ["tar", "-czf", "-", "-C", os.path.dirname(file_abs), os.path.basename(file_abs)],
@@ -272,10 +320,9 @@ class ReportSyncer:
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
-                timeout=SCP_TIMEOUT,
             )
-            tar_proc.stdout.close()
-            tar_proc.wait(timeout=30)
+            _drain_tar_proc(tar_proc)
+            tar_proc = None
 
             if ssh_proc.returncode == 0:
                 _sync_log(f"[SYNC] Synced file: {rel_path} (tar)")
@@ -283,6 +330,20 @@ class ReportSyncer:
             _sync_log(f"[SYNC ERROR] tar stream failed for {rel_path} (code {ssh_proc.returncode}).")
             if ssh_proc.stderr:
                 _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
+            # Best-effort cleanup of the staging file on the remote.
+            try:
+                cleanup_cmd = ssh_base + [
+                    f"bash --noprofile --norc -lc {shlex.quote(f'rm -f {q_remote_dir}/{q_staging}')}"
+                ]
+                subprocess.run(
+                    cleanup_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=merged_env,
+                    timeout=SSH_TIMEOUT,
+                )
+            except Exception:
+                pass
             return False
         except subprocess.TimeoutExpired:
             _sync_log(f"[SYNC ERROR] tar stream timed out for {rel_path}.")
@@ -290,6 +351,8 @@ class ReportSyncer:
         except Exception as e:
             _sync_log(f"[SYNC EXCEPTION] tar stream failed for {rel_path}: {str(e)}")
             return False
+        finally:
+            _drain_tar_proc(tar_proc)
 
     @staticmethod
     def sync_directory_to_remote(
@@ -344,6 +407,7 @@ class ReportSyncer:
                 _sync_log(f"[SYNC ERROR DETAILS][{stage_name}]:\n{details}")
             return False
 
+        tar_proc = None
         try:
             if not _run_stage("cleanup_staging", f"rm -rf {q_staging}"):
                 return False
@@ -362,10 +426,9 @@ class ReportSyncer:
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
-                timeout=RSYNC_TIMEOUT,
             )
-            tar_proc.stdout.close()
-            tar_proc.wait(timeout=30)
+            _drain_tar_proc(tar_proc)
+            tar_proc = None
 
             if ssh_proc.returncode != 0:
                 _sync_log(f"[SYNC ERROR] Stage failed [stream_extract] for {rel_path}/ (code {ssh_proc.returncode}).")
@@ -392,6 +455,8 @@ class ReportSyncer:
         except Exception as e:
             _sync_log(f"[SYNC EXCEPTION] Batch tar stream failed for {rel_path}/: {e}")
             return False
+        finally:
+            _drain_tar_proc(tar_proc)
 
 
 def _should_compress(file_path: str) -> bool:
@@ -517,6 +582,11 @@ class AsyncSyncPipeline:
     def wait(self):
         with self._lock:
             pending = list(self._futures)
+        # No per-future timeout: tar+ssh streams have no Python-side cap
+        # (datasets are unbounded), and a dead SSH connection is detected
+        # by ServerAliveInterval=30 / ServerAliveCountMax=3 within ~90s.
+        # If a worker really hangs forever, the user can Ctrl+C — which
+        # raises KeyboardInterrupt out of fut.result().
         for fut in pending:
             try:
                 fut.result()
@@ -525,4 +595,55 @@ class AsyncSyncPipeline:
 
     def close(self):
         self.wait()
-        self._executor.shutdown(wait=True)
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            # Python < 3.9 has no cancel_futures kwarg.
+            self._executor.shutdown(wait=True)
+
+    def cleanup_remote_staging(self) -> bool:
+        """Remove orphan staging artifacts on the remote.
+
+        Called from the abort path (Ctrl+C / unexpected exception) so a
+        half-written transfer doesn't leave ``.<file>.__staging__.<pid>``
+        files or ``<dir>.__staging__`` / ``<dir>.__old__`` directories
+        sitting in dest_dir. Best-effort: failures are logged, not raised.
+        """
+        if not self.user or not self.host or not self.dest_dir:
+            return False
+        control_socket = self._capability_cache.get("control_socket", "") if self._capability_cache else ""
+        ssh_base, env = _build_ssh_base(self.user, self.host, self.password, control_socket)
+        merged_env = {**os.environ, **env}
+        q_dest = shlex.quote(self.dest_dir)
+        # find handles odd filenames safely; -delete avoids spawning rm.
+        # The patterns mirror the staging names used by sync_file_to_remote
+        # (".<basename>.__staging__.<pid>") and sync_directory_to_remote
+        # ("<dir>.__staging__" + "<dir>.__old__").
+        cleanup_script = (
+            f"if [ -d {q_dest} ]; then "
+            f"find {q_dest} -depth -type f -name '.*.__staging__.*' -print -delete 2>/dev/null; "
+            f"find {q_dest} -depth -type d \\( -name '*.__staging__' -o -name '*.__old__' \\) -print -exec rm -rf {{}} + 2>/dev/null; "
+            f"fi; true"
+        )
+        cmd = ssh_base + [f"bash --noprofile --norc -lc {shlex.quote(cleanup_script)}"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=merged_env,
+                timeout=SSH_TIMEOUT,
+            )
+            if proc.stdout.strip():
+                _sync_log(
+                    "[SYNC] Remote staging cleanup removed:\n"
+                    + proc.stdout.strip()
+                )
+            return proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            _sync_log("[SYNC WARN] Remote staging cleanup timed out.")
+            return False
+        except Exception as e:
+            _sync_log(f"[SYNC WARN] Remote staging cleanup failed: {e}")
+            return False

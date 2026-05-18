@@ -96,6 +96,17 @@ pub(crate) fn run_scan_core(
     let visited_dirs_profile = visited_dirs.clone();
 
     let _walk_thread = thread::spawn(move || {
+        // Ensure `done` flips to true even if the parallel walk panics —
+        // otherwise the main progress loop spins forever waiting on a flag
+        // that will never be set. RAII guard runs on every exit path.
+        struct DoneGuard(Arc<AtomicBool>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _done_guard = DoneGuard(d_clone.clone());
+
         WalkBuilder::new(&dir_clone)
             .hidden(false)
             .ignore(false)
@@ -328,6 +339,8 @@ pub(crate) fn run_scan_core(
                 })
             });
 
+        // The DoneGuard above already flips `done` on drop; this explicit
+        // store is redundant but harmless and keeps the happy-path obvious.
         d_clone.store(true, Ordering::SeqCst);
     });
 

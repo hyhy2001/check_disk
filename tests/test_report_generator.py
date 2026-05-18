@@ -358,32 +358,10 @@ class TestGenerateReport:
 
 
 # ── Permission issues report ──────────────────────────────────────────────────
-
-class TestPermissionIssuesReport:
-    def test_permission_issues_file_created(self, tmp_path):
-        """generate_permission_issues_report() must write permission_issues.json."""
-        out_dir = tmp_path
-        scan = make_scan_result(tmp_path, permission_issues={
-            "users": [{"name": "alice", "inaccessible_items": [{"path": "/secret", "type": "dir", "error": "EACCES"}]}],
-            "unknown_items": [],
-        })
-        rg = ReportGenerator(make_config(tmp_path, output_file=str(out_dir / "disk_usage_report.json")))
-        # generate_report calls generate_permission_issues_report internally
-        rg.generate_report(scan)
-        perm_file = out_dir / "permission_issues.json"
-        assert perm_file.exists(), "permission_issues.json should be written"
-
-    def test_permission_issues_schema(self, tmp_path):
-        """permission_issues.json must have 'users' and 'unknown_items' keys."""
-        scan = make_scan_result(tmp_path, permission_issues={
-            "users": [],
-            "unknown_items": [{"path": "/lost+found", "type": "dir", "error": "?"}],
-        })
-        rg = ReportGenerator(make_config(tmp_path, output_file=str(tmp_path / "disk_usage_report.json")))
-        rg.generate_report(scan)
-        data = json.loads((tmp_path / "permission_issues.json").read_text())
-        assert "users" in data["permission_issues"] or "users" in data
-        assert "unknown_items" in data["permission_issues"] or "unknown_items" in data
+#
+# permission_issues.json is no longer written by Python — Rust Phase 2 emits
+# permission_issues.db directly. Tests asserting the JSON shape have been
+# removed; coverage of the DB output lives in tests/test_unified_pipeline.py.
 
 
 # ── Inode report ──────────────────────────────────────────────────────────────

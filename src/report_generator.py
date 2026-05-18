@@ -6,7 +6,6 @@ Handles generating and saving disk usage reports.
 
 import os
 import shutil
-import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -172,45 +171,13 @@ class ReportGenerator:
                 "other_usage": scan_result.other_usage
             }
 
-            # Permission issues JSON is generated natively by Rust Phase 2 via TSV stream.
-            # Fall back to Python generation only if the file is absent.
-            perm_path = self._get_output_filename("permission_issues")
-            if os.path.exists(perm_path):
-                print(f"Permission issues report saved to: {perm_path}")
-            elif hasattr(scan_result, 'permission_issues'):
-                self.generate_permission_issues_report(scan_result)
+            # permission_issues.db is built natively by Rust Phase 2.
+            # No JSON copy is generated — the dashboard reads the DB.
 
             if hasattr(scan_result, 'user_inodes'):
                 self.generate_inode_report(scan_result)
 
         save_json_report(report, self.output_file)
-        return report
-
-    # ------------------------------------------------------------------ #
-    # Permission issues report                                             #
-    # ------------------------------------------------------------------ #
-
-    def generate_permission_issues_report(self, scan_result: ScanResult) -> Dict[str, Any]:
-        """
-        Generate a report for permission issues.
-
-        Args:
-            scan_result: ScanResult object with disk usage data
-
-        Returns:
-            Dictionary containing the report data
-        """
-        report = {
-            "date": scan_result.timestamp,
-            "directory": self.config.get("directory", ""),
-            "general_system": scan_result.general_system,
-            "permission_issues": scan_result.permission_issues
-        }
-
-        output_path = self._get_output_filename("permission_issues")
-        save_json_report(report, output_path)
-        print(f"Permission issues report saved to: {output_path}")
-
         return report
 
     # ------------------------------------------------------------------ #
@@ -289,8 +256,7 @@ class ReportGenerator:
         """Build the per-user detail SQLite DB (and optionally treemap.db)."""
         if not scan_result.detail_tmpdir:
             raise RuntimeError(
-                "Phase 2 requires Rust streaming outputs (detail_tmpdir). "
-                "Python in-memory fallback has been removed."
+                "Phase 2 requires Rust streaming outputs (detail_tmpdir)."
             )
         if not HAS_RUST_PIPELINE:
             raise RuntimeError(
@@ -312,6 +278,14 @@ class ReportGenerator:
         if os.path.isfile(legacy_tree_json):
             try:
                 os.remove(legacy_tree_json)
+            except OSError:
+                pass
+
+        # Remove stale permission_issues.json from previous runs (now DB-only).
+        legacy_perm_json = self._get_output_filename("permission_issues")
+        if os.path.isfile(legacy_perm_json):
+            try:
+                os.remove(legacy_perm_json)
             except OSError:
                 pass
 
@@ -354,27 +328,7 @@ class ReportGenerator:
         if not hasattr(_fast_scanner, "build_pipeline"):
             raise RuntimeError("fast_scanner.build_pipeline is required")
         print("[Phase 2] Rust pipeline started (large datasets may take a while)...")
-        total_files_holder: Dict[str, int] = {"value": 0}
-        build_error_holder: Dict[str, Optional[Exception]] = {"error": None}
-
-        def _run_build_pipeline() -> None:
-            try:
-                total_files_holder["value"] = int(
-                    _fast_scanner.build_pipeline(*build_args, bool(self.debug))
-                )
-            except Exception as exc:  # pragma: no cover
-                build_error_holder["error"] = exc
-
-        build_thread = threading.Thread(target=_run_build_pipeline, daemon=True)
-        build_thread.start()
-        while build_thread.is_alive():
-            build_thread.join(timeout=10.0)
-            if build_thread.is_alive():
-                print("[Phase 2] Still processing...")
-
-        if build_error_holder["error"] is not None:
-            raise build_error_holder["error"]
-        total_files = total_files_holder["value"]
+        total_files = int(_fast_scanner.build_pipeline(*build_args, bool(self.debug)))
 
         created: List[str] = [detail_db_path]
         if build_treemap:
