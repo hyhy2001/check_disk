@@ -1,9 +1,10 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -76,7 +77,7 @@ fn spill_rows_to_disk(
                 Ok(f) => f,
                 Err(_) => continue,
             };
-            let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+            let mut writer = FrameEncoder::new(file);
             let mut write_ok = true;
             for (size, safe_path, ext) in rows_chunk {
                 let path_bytes = safe_path.as_bytes();
@@ -677,7 +678,7 @@ pub fn build_pipeline_dbs_impl(
                     total_spill_read += meta.len();
                 }
                 let mut reader = match fs::File::open(spill_path) {
-                    Ok(f) => BufReader::with_capacity(8 * 1024 * 1024, f),
+                    Ok(f) => FrameDecoder::new(f),
                     Err(_) => continue,
                 };
                 let mut head = [0u8; 12];
@@ -725,8 +726,14 @@ pub fn build_pipeline_dbs_impl(
                             e
                         ))
                     })?;
-                    let safe_path = String::from_utf8_lossy(&path_bytes).to_string();
-                    let ext = String::from_utf8_lossy(&ext_bytes).to_string();
+                    let safe_path = match std::str::from_utf8(&path_bytes) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => String::from_utf8_lossy(&path_bytes).into_owned(),
+                    };
+                    let ext = match std::str::from_utf8(&ext_bytes) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => String::from_utf8_lossy(&ext_bytes).into_owned(),
+                    };
                     let basename = tm_basename(&safe_path);
 
                     // Intern basename into detail.db's local file_names table.
@@ -874,6 +881,8 @@ pub fn build_pipeline_dbs_impl(
             let treemap_db_pb_clone = treemap_db_pb.clone();
             let treemap_work_dir_clone = treemap_work_dir.clone();
             Some(std::thread::spawn(move || -> PyResult<()> {
+                let _t_thread_start = std::time::Instant::now();
+                let t_owners = std::time::Instant::now();
                 // Precompute owner_uid per dir (= uid with max weight in that
                 // dir) in one linear scan over the sorted owner_weights. Avoids
                 // re-iterating a HashMap of HashMaps per included dir below.
@@ -928,6 +937,9 @@ pub fn build_pipeline_dbs_impl(
                     }
                 }
 
+                let t_owners_done = t_owners.elapsed();
+                let t_filter = std::time::Instant::now();
+
                 // Filter dirs by max_level + min_size_bytes.
                 let mut included: HashSet<i64> = HashSet::new();
                 for d in dirs_in_order_for_treemap.iter() {
@@ -942,6 +954,9 @@ pub fn build_pipeline_dbs_impl(
                 }
                 // Always include root.
                 included.insert(0);
+
+                let t_filter_done = t_filter.elapsed();
+                let t_dir_rows = std::time::Instant::now();
 
                 let dir_rows: Vec<DirRow> = dirs_in_order_for_treemap
                     .iter()
@@ -971,6 +986,9 @@ pub fn build_pipeline_dbs_impl(
                     })
                     .collect();
 
+                let t_dir_rows_done = t_dir_rows.elapsed();
+                let t_build_db = std::time::Instant::now();
+
                 drop(owner_weights_for_treemap);
 
                 let treemap_total_size = vec_at(&subtree_size_for_treemap, 0);
@@ -997,12 +1015,24 @@ pub fn build_pipeline_dbs_impl(
                     input.dirs.len(),
                     max_level
                 );
-                db_writer::build_treemap_db(
+                let result = db_writer::build_treemap_db(
                     &treemap_db_pb_clone,
                     &treemap_work_dir_clone,
                     input,
                     debug,
-                )
+                );
+                let t_build_db_done = t_build_db.elapsed();
+                if debug {
+                    eprintln!(
+                        "[treemap thread] owners={:.2}s filter={:.2}s dir_rows={:.2}s build_db={:.2}s total={:.2}s",
+                        t_owners_done.as_secs_f64(),
+                        t_filter_done.as_secs_f64(),
+                        t_dir_rows_done.as_secs_f64(),
+                        t_build_db_done.as_secs_f64(),
+                        _t_thread_start.elapsed().as_secs_f64(),
+                    );
+                }
+                result
             }))
         } else {
             None
