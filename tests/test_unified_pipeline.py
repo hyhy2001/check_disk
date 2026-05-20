@@ -287,7 +287,7 @@ def test_cli_check_users_uses_detail_db(tmp_path):
     calls = []
     cli = CLIInterface()
 
-    def capture(users, dir_files, file_files, top):
+    def capture(users, dir_files, file_files, top, **kwargs):
         calls.append((users, dir_files, file_files, top))
 
     cli.report_formatter.display_user_detail_reports = capture

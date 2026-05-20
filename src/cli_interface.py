@@ -71,6 +71,14 @@ class CLIInterface:
                                 help="Display detail reports for specific user(s) from generated JSON/NDJSON detail data.")
         report_group.add_argument("--top", type=int, default=30,
                                 help="Top N rows to display for both directory and file breakdown in --check-users (default: 30).")
+        report_group.add_argument("--type", dest="type",
+                                choices=["report", "inode", "permission", "files", "dirs", "tree-map"],
+                                default="report",
+                                help="Section type for --check-users: report (default), inode, permission, files, dirs, tree-map.")
+        report_group.add_argument("--path", metavar="PATH", default="",
+                                help="For --type tree-map: start tree from this path (default: scan root).")
+        report_group.add_argument("--limit", type=int, default=20,
+                                help="For --type tree-map: max child folders per level (default: 20).")
 
         # Report filtering options
         filter_group = parser.add_argument_group('Report Filtering Options')
@@ -232,6 +240,10 @@ class CLIInterface:
         prefix: str = "",
         output_dir: str = ".",
         top: int = 30,
+        type_filter: str = "report",
+        tree_path: str = "",
+        tree_level: int = 3,
+        tree_limit: int = 20,
     ) -> None:
         """Display per-user detail reports from the generated SQLite database."""
         if prefix:
@@ -243,9 +255,6 @@ class CLIInterface:
         dir_files: Dict[str, str] = {}
         file_files: Dict[str, str] = {}
 
-        # Always pass the (possibly missing) detail.db path. The formatter
-        # checks file existence and prints a single, actionable error per
-        # user — no need to log a warning here.
         for user in users:
             if os.path.exists(detail_db):
                 dir_files[user] = detail_db
@@ -255,5 +264,10 @@ class CLIInterface:
                 file_files[user] = None
 
         self.report_formatter.display_user_detail_reports(
-            users, dir_files, file_files, top
+            users, dir_files, file_files, top,
+            type_filter=type_filter,
+            output_dir=output_dir,
+            tree_path=tree_path,
+            tree_level=tree_level,
+            tree_limit=tree_limit,
         )

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..constants import (
     DETAIL_USERS_DB_FILENAME,
     DETAIL_USERS_DIRNAME,
+    PERMISSION_ISSUES_DB_FILENAME,
     TREE_MAP_DATA_DIRNAME,
     TREE_MAP_DB_FILENAME,
 )
@@ -272,13 +273,22 @@ class ReportFormatter(BaseFormatter):
         dir_files: Dict[str, Optional[str]],
         file_files: Dict[str, Optional[str]],
         top: int = 30,
+        *,
+        type_filter: str = "report",
+        output_dir: str = ".",
+        tree_path: str = "",
+        tree_level: int = 3,
+        tree_limit: int = 20,
     ) -> None:
         """Load and render detail reports for multiple users from SQLite.
 
-        `dir_files` / `file_files` historically mapped users to NDJSON paths.
-        With the SQLite pipeline both arguments are accepted but only the
-        first non-empty entry is used to derive the output directory: every
-        user reads from the same `data_detail.db`.
+        type_filter selects which section to render:
+          report     — dirs + files (default)
+          dirs       — directory breakdown only
+          files      — file breakdown only
+          inode      — directory breakdown sorted by file count
+          permission — permission issues from permission_issues.db
+          tree-map   — ASCII directory tree (requires treemap.db)
         """
         sample_path = next(
             (p for p in list(dir_files.values()) + list(file_files.values()) if p),
@@ -316,8 +326,27 @@ class ReportFormatter(BaseFormatter):
                     )
                     continue
 
-                dir_data = self._load_user_dirs(conn, user, top)
-                file_data = self._load_user_files(conn, user, top)
+                # Route by type_filter
+                if type_filter == "tree-map":
+                    if not self._has_treemap(conn):
+                        print(f"\n  Tree-map requires treemap.db (run scan with --tree-map).")
+                        continue
+                    self.display_user_tree(conn, user, tree_path, tree_level, tree_limit)
+                    continue
+
+                if type_filter == "permission":
+                    perm = self._load_user_permissions(output_dir, user, top)
+                    self._display_permission_section(user, perm)
+                    continue
+
+                if type_filter == "inode":
+                    inode = self._load_user_inodes(conn, user, top)
+                    self._display_inode_section(user, inode)
+                    continue
+
+                # report / dirs / files all use detail_user_report rendering
+                dir_data = self._load_user_dirs(conn, user, top) if type_filter in ("report", "dirs") else None
+                file_data = self._load_user_files(conn, user, top) if type_filter in ("report", "files") else None
                 if (
                     dir_data
                     and file_data
@@ -522,3 +551,285 @@ class ReportFormatter(BaseFormatter):
         except sqlite3.DatabaseError:
             return ""
         return str(row[0]) if row and row[0] is not None else ""
+
+    # ------------------------------------------------------------------ #
+    # New type-filter query methods                                        #
+    # ------------------------------------------------------------------ #
+
+    def _load_user_inodes(
+        self, conn: sqlite3.Connection, user: str, top: int
+    ) -> Optional[Dict[str, Any]]:
+        """Load per-directory file count (inode) breakdown for a user."""
+        row = conn.execute(
+            "SELECT uid, total_files, total_dirs FROM users WHERE username = ?",
+            (user,),
+        ).fetchone()
+        if not row:
+            return None
+        uid, total_files, total_dirs = row
+        scan_root = self._meta_get(conn, "scan_root")
+        scan_ts = int(self._meta_get(conn, "scan_timestamp") or 0)
+        has_tm = self._has_treemap(conn)
+
+        dirs: List[Dict[str, Any]] = []
+        cursor = conn.execute(
+            "SELECT dir_id, files, size FROM dir_user_size "
+            "WHERE uid = ? ORDER BY files DESC LIMIT ?",
+            (uid, top),
+        )
+        for dir_id, files, size in cursor:
+            path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
+            dirs.append({"path": path, "files": int(files), "size": int(size)})
+        return {
+            "date": scan_ts,
+            "user": user,
+            "directory": scan_root,
+            "total_files": int(total_files or 0),
+            "total_dirs": int(total_dirs or 0),
+            "dirs": dirs,
+        }
+
+    @staticmethod
+    def _load_user_permissions(
+        output_dir: str, user: str, top: int
+    ) -> Optional[Dict[str, Any]]:
+        """Load permission issues for a user from permission_issues.db."""
+        perm_db = os.path.join(output_dir, PERMISSION_ISSUES_DB_FILENAME)
+        if not os.path.isfile(perm_db):
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{perm_db}?mode=ro", uri=True)
+            try:
+                total_row = conn.execute(
+                    "SELECT COUNT(*) FROM issues WHERE user = ?", (user,)
+                ).fetchone()
+                total = int(total_row[0]) if total_row else 0
+                rows = conn.execute(
+                    "SELECT item_type, error, path FROM issues "
+                    "WHERE user = ? ORDER BY id LIMIT ?",
+                    (user, top),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return None
+        return {
+            "total": total,
+            "issues": [{"type": r[0], "error": r[1], "path": r[2]} for r in rows],
+        }
+
+    def _display_inode_section(
+        self, user: str, data: Optional[Dict[str, Any]]
+    ) -> None:
+        print("\n" + "=" * 60)
+        print(f"INODE REPORT - {user}")
+        print("=" * 60)
+        if not data:
+            print(f"  No inode data found for user '{user}'.")
+            return
+        print(f"Total files : {data['total_files']:,}")
+        print(f"Total dirs  : {data['total_dirs']:,}")
+        dirs = data.get("dirs", [])
+        if dirs:
+            headers = ["Directory", "Files", "Size"]
+            rows = [
+                [d["path"], f"{d['files']:,}", format_size(d["size"])]
+                for d in dirs
+            ]
+            title = f"Directory File Count (top {len(dirs):,} of {data['total_dirs']:,})"
+            print("\n" + self.table_formatter.format_table(headers, rows, title=title))
+        else:
+            print("  (no directory data)")
+
+    def _display_permission_section(
+        self, user: str, data: Optional[Dict[str, Any]]
+    ) -> None:
+        print("\n" + "=" * 60)
+        print(f"PERMISSION REPORT - {user}")
+        print("=" * 60)
+        if data is None:
+            print("  permission_issues.db not found. Run a scan first.")
+            return
+        total = data.get("total", 0)
+        issues = data.get("issues", [])
+        print(f"Total permission issues: {total:,}")
+        if issues:
+            headers = ["Type", "Error", "Path"]
+            rows = [[i["type"], i["error"], i["path"]] for i in issues]
+            title = f"Permission Issues (top {len(issues):,} of {total:,})"
+            print("\n" + self.table_formatter.format_table(headers, rows, title=title))
+        else:
+            print("  No permission issues found for this user.")
+
+    # ------------------------------------------------------------------ #
+    # Tree-map view (ASCII directory tree)                                #
+    # ------------------------------------------------------------------ #
+
+    def _find_dir_id_by_path(
+        self, conn: sqlite3.Connection, path: str
+    ) -> Optional[int]:
+        """Resolve a filesystem path to tm.dirs.id. Returns None if not found.
+
+        Empty path / "/" returns the scan root dir_id.
+        """
+        # Get scan root id
+        try:
+            row = conn.execute(
+                "SELECT id FROM tm.dirs WHERE parent_id IS NULL LIMIT 1"
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return None
+        if not row:
+            return None
+        root_id = row[0]
+
+        if not path or path == "/" or path.strip() == "":
+            return root_id
+
+        # Strip scan_root prefix if user passed an absolute path matching it
+        scan_root = (self._meta_get(conn, "scan_root") or "").rstrip("/")
+        normalized = path
+        if scan_root and normalized.startswith(scan_root):
+            normalized = normalized[len(scan_root):]
+
+        segments = [s for s in normalized.strip("/").split("/") if s]
+        if not segments:
+            return root_id
+
+        # Walk segments
+        current_id = root_id
+        for seg in segments:
+            row = conn.execute(
+                "SELECT d.id FROM tm.dirs d "
+                "JOIN tm.names n ON d.name_id = n.id "
+                "WHERE d.parent_id = ? AND n.name = ? LIMIT 1",
+                (current_id, seg),
+            ).fetchone()
+            if not row:
+                return None
+            current_id = row[0]
+        return current_id
+
+    def display_user_tree(
+        self,
+        conn: sqlite3.Connection,
+        user: str,
+        start_path: str = "",
+        max_depth: int = 3,
+        limit: int = 20,
+    ) -> None:
+        """Render an ASCII directory tree of the user's contribution under
+        start_path, capped at max_depth levels and limit children per level.
+        """
+        tw = max(40, int(getattr(self, "terminal_width", 80) or 80))
+
+        # Get user uid + totals
+        row = conn.execute(
+            "SELECT uid, total_size, total_files FROM users WHERE username = ?",
+            (user,),
+        ).fetchone()
+        if not row:
+            print(f"\n  User '{user}' not found.")
+            return
+        uid = row[0]
+
+        # Resolve start_path → dir_id
+        start_id = self._find_dir_id_by_path(conn, start_path)
+        if start_id is None:
+            label = start_path or "<scan root>"
+            print(f"\n  Path '{label}' not found in scan tree.")
+            return
+
+        # Build full path display
+        scan_root = self._meta_get(conn, "scan_root") or "/"
+        if start_id == 0 or not start_path:
+            start_path_str = scan_root
+        else:
+            start_path_str = self._build_path(conn, start_id) or scan_root
+
+        # Get user's contribution at start_id
+        root_user = conn.execute(
+            "SELECT size, files FROM dir_user_size WHERE uid = ? AND dir_id = ?",
+            (uid, start_id),
+        ).fetchone()
+
+        # Header
+        print("\n" + "=" * 60)
+        print(f"TREE-MAP - {user}")
+        print("=" * 60)
+        print(f"Root path: {start_path_str}")
+        if root_user:
+            print(
+                f"User '{user}': "
+                f"{format_size(int(root_user[0]))}, "
+                f"{int(root_user[1]):,} files"
+            )
+        else:
+            print(f"User '{user}': no files in this subtree")
+        print(f"Depth: {max_depth}  |  Limit: {limit} per level\n")
+
+        # Render
+        self._render_tree_node(conn, uid, start_id, "", 0, max_depth, limit, tw)
+
+    def _render_tree_node(
+        self,
+        conn: sqlite3.Connection,
+        uid: int,
+        dir_id: int,
+        prefix: str,
+        depth: int,
+        max_depth: int,
+        limit: int,
+        tw: int,
+    ) -> None:
+        if depth >= max_depth:
+            return
+
+        # Children where user has size > 0, ordered by user contribution.
+        # Fetch limit+1 to detect overflow.
+        children = conn.execute(
+            """
+            SELECT d.id, n.name, d.dir_count,
+                   COALESCE(dus.size, 0) AS user_size,
+                   COALESCE(dus.files, 0) AS user_files
+              FROM tm.dirs d
+              JOIN tm.names n ON d.name_id = n.id
+              LEFT JOIN dir_user_size dus
+                     ON dus.dir_id = d.id AND dus.uid = ?
+             WHERE d.parent_id = ?
+               AND COALESCE(dus.size, 0) > 0
+             ORDER BY COALESCE(dus.size, 0) DESC
+             LIMIT ?
+            """,
+            (uid, dir_id, limit + 1),
+        ).fetchall()
+
+        has_more = len(children) > limit
+        if has_more:
+            children = children[:limit]
+
+        n = len(children)
+        for i, (cid, name, dir_count, user_size, user_files) in enumerate(children):
+            is_last = (i == n - 1) and not has_more
+            connector = "\\-- " if is_last else "|-- "
+            child_prefix = prefix + ("    " if is_last else "|   ")
+
+            size_str = format_size(int(user_size))
+            info = f"  [{size_str}, {int(user_files):,} files]"
+
+            # Adapt name to terminal width
+            avail = tw - len(prefix) - len(connector) - len(info) - 1
+            if avail < 4:
+                avail = 4
+            display_name = name if len(name) <= avail else (name[: max(1, avail - 2)] + "..")
+
+            print(f"{prefix}{connector}{display_name}{info}")
+
+            if dir_count > 0 and depth + 1 < max_depth:
+                self._render_tree_node(
+                    conn, uid, cid, child_prefix,
+                    depth + 1, max_depth, limit, tw,
+                )
+
+        if has_more:
+            print(f"{prefix}\\-- ... ({limit}+ more, increase --limit to see)")
