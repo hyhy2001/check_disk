@@ -70,13 +70,6 @@ CREATE TABLE dirs (
   owner_uid   INTEGER NOT NULL,
   has_files   INTEGER NOT NULL
 );
-
-CREATE TABLE dir_owner (
-  dir_id INTEGER NOT NULL,
-  uid    INTEGER NOT NULL,
-  size   INTEGER NOT NULL,
-  PRIMARY KEY (dir_id, uid)
-) WITHOUT ROWID;
 ";
 
 const TREEMAP_INDEX_DDL: &str = "
@@ -176,6 +169,7 @@ fn apply_build_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
     conn.pragma_update(None, "cache_size", -1_048_576i64)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.pragma_update(None, "mmap_size", 8_589_934_592i64)?;
     Ok(())
 }
 
@@ -340,7 +334,7 @@ fn placeholder_group(cols: usize) -> String {
 /// Splits `rows` into chunks of [`PACK_ROWS`] and emits one statement per
 /// chunk inside a single transaction. This collapses N parameter-binding +
 /// plan-execution round trips into N/PACK_ROWS, giving 2-5× speedup for
-/// the hot insert paths (files, names, dirs, dir_user_size, dir_owner).
+/// the hot insert paths (files, names, dirs, dir_user_size).
 fn packed_insert<F>(
     conn: &mut Connection,
     table: &str,
@@ -446,12 +440,6 @@ pub struct DirRow {
     pub has_files: i64,
 }
 
-pub struct DirOwnerRow {
-    pub dir_id: i64,
-    pub uid: i64,
-    pub size: i64,
-}
-
 pub struct OwnerRow {
     pub uid: i64,
     pub username: String,
@@ -461,7 +449,6 @@ pub struct TreemapInput {
     pub names: Vec<String>,
     pub owners: Vec<OwnerRow>,
     pub dirs: Vec<DirRow>,
-    pub dir_owner: Vec<DirOwnerRow>,
     pub meta: Vec<(String, String)>,
 }
 
@@ -539,23 +526,6 @@ pub fn build_treemap_db(
         )?;
     }
 
-    // dir_owner: 3 cols × N rows
-    {
-        let dir_owner = &input.dir_owner;
-        packed_insert(
-            &mut conn,
-            "dir_owner",
-            "dir_id, uid, size",
-            3,
-            dir_owner.len(),
-            |i| {
-                let r = &dir_owner[i];
-                vec![Box::new(r.dir_id), Box::new(r.uid), Box::new(r.size)]
-            },
-            "dir_owner",
-        )?;
-    }
-
     insert_meta(&mut conn, &input.meta)?;
 
     conn.execute_batch(TREEMAP_INDEX_DDL)
@@ -565,11 +535,10 @@ pub fn build_treemap_db(
 
     if debug {
         println!(
-            "[Phase 2] treemap.db built (names={}, dirs={}, owners={}, dir_owner={})",
+            "[Phase 2] treemap.db built (names={}, dirs={}, owners={})",
             input.names.len(),
             input.dirs.len(),
-            input.owners.len(),
-            input.dir_owner.len()
+            input.owners.len()
         );
     }
 
@@ -860,6 +829,14 @@ pub fn detail_set_meta(handle: &mut DetailBuildHandle, meta: &[(String, String)]
 }
 
 pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
+    // Boost cache for index build phase — reduces I/O during sort passes.
+    // Safe at this point: most in-memory aggregation structures have been
+    // freed; estimated live RSS ~8-10 GB leaving headroom for +3 GB cache.
+    handle
+        .conn
+        .pragma_update(None, "cache_size", -4_194_304i64)  // 4 GB
+        .map_err(|e| PyRuntimeError::new_err(format!("cache_size boost: {}", e)))?;
+
     handle
         .conn
         .execute_batch(DETAIL_INDEX_DDL)

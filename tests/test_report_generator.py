@@ -206,7 +206,7 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        assert tables >= {"meta", "names", "owners", "dirs", "dir_owner"}
+        assert tables >= {"meta", "names", "owners", "dirs"}
 
         app_id = conn.execute("PRAGMA application_id").fetchone()[0]
         expected = 0xC0DD15C0

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::db_writer::{
-    self, DEFAULT_TOP_K, DirOwnerRow, DirRow, DirUserSizeRow, FileRow, OwnerRow, TreemapInput,
-    UserRow, FILE_INSERT_CHUNK,
+    self, DEFAULT_TOP_K, DirRow, DirUserSizeRow, FileRow, OwnerRow, TreemapInput, UserRow,
+    FILE_INSERT_CHUNK,
 };
 use crate::pipe_events::{
     for_each_dir_agg_in_file, for_each_scan_event_in_file, get_dir_agg_files, get_scan_event_files,
@@ -494,10 +494,8 @@ pub fn build_pipeline_dbs_impl(
         };
 
         // Per-dir aggregates: total_size + per-owner weight breakdown.
-        // We do NOT materialize a separate `dir_owner_rows: Vec` — the same
-        // (dir_id, uid, size) tuples can be derived on-the-fly from
-        // `owner_weights` when emitting treemap.db. Skipping the Vec
-        // saves ~1 GB RAM at 75M-file scale.
+        // owner_weights stays as a flat Vec<(dir_id, uid, size)> to keep
+        // memory bounded at large scales.
         //
         // dir_ids are dense 0..N (BFS-assigned), so per-dir scalar maps go
         // into Vec instead of HashMap — saves the 24-32 B/entry HashMap
@@ -508,8 +506,8 @@ pub fn build_pipeline_dbs_impl(
         //   metadata, before any data.
         // - Vec<(i64,i64,i64)> = 24 B/entry, vs ~120 B/entry for the nested
         //   form once we account for both HashMap headers per dir.
-        // - All three downstream use sites (max-owner-per-dir,
-        //   collect-all-uids, emit-dir_owner) are linear scans that don't
+        // - All downstream use sites (max-owner-per-dir, collect-all-uids)
+        //   are linear scans that don't
         //   need the random-access semantics the HashMap provided.
         let n_dirs = path_tree.dirs_in_order.len();
         let mut total_size_by_dir: Vec<i64> = vec![0; n_dirs];
@@ -858,153 +856,147 @@ pub fn build_pipeline_dbs_impl(
         // Both DBs are atomically renamed into place at the very end of this
         // function, so concurrent build is safe — neither file references the
         // other at write time.
+        let dirs_in_order_arc = Arc::new(std::mem::take(&mut path_tree.dirs_in_order));
+        let uid_to_username_arc = Arc::new(uid_to_username);
+
         let t3a = Instant::now();
         let treemap_thread: Option<std::thread::JoinHandle<PyResult<()>>> = if build_treemap {
-            // Precompute owner_uid per dir (= uid with max weight in that
-            // dir) in one linear scan over the sorted owner_weights. Avoids
-            // re-iterating a HashMap of HashMaps per included dir below.
-            // dir_ids are dense 0..n_dirs so a Vec is enough; entries with
-            // no weight stay at owner_uid_fallback after the loop.
-            let mut all_uids: HashSet<i64> = uid_to_username.keys().copied().collect();
-            for &(_, uid, _) in &owner_weights {
-                all_uids.insert(uid);
-            }
-            let mut owners: Vec<OwnerRow> = all_uids
-                .into_iter()
-                .filter_map(|uid| {
-                    uid_to_username
-                        .get(&uid)
-                        .cloned()
-                        .map(|username| OwnerRow { uid, username })
-                })
-                .collect();
-            owners.sort_by_key(|o| o.uid);
-
-            let owner_uid_fallback = owners.first().map(|o| o.uid).unwrap_or(0);
-            // Helper: read a Vec slot indexed by dir_id, with bounds check.
-            let vec_at = |v: &Vec<i64>, id: i64| -> i64 {
-                let idx = id as usize;
-                if idx < v.len() { v[idx] } else { 0 }
-            };
-
-            // Precompute owner_uid_by_dir from sorted owner_weights in a
-            // single linear scan: per (dir_id, uid) run, track max size and
-            // emit the winning uid into the dir's slot. Replaces 4M+ HashMap
-            // lookups + per-dir argmax scans done in the previous version.
-            let mut owner_uid_by_dir: Vec<i64> = vec![owner_uid_fallback; n_dirs];
-            {
-                let mut i = 0;
-                while i < owner_weights.len() {
-                    let dir_id = owner_weights[i].0;
-                    let mut best_uid = owner_weights[i].1;
-                    let mut best_size = owner_weights[i].2;
-                    let mut j = i + 1;
-                    while j < owner_weights.len() && owner_weights[j].0 == dir_id {
-                        if owner_weights[j].2 > best_size {
-                            best_size = owner_weights[j].2;
-                            best_uid = owner_weights[j].1;
-                        }
-                        j += 1;
-                    }
-                    if (dir_id as usize) < owner_uid_by_dir.len() {
-                        owner_uid_by_dir[dir_id as usize] = best_uid;
-                    }
-                    i = j;
-                }
-            }
-
-            // Filter dirs by max_level + min_size_bytes.
-            let mut included: HashSet<i64> = HashSet::new();
-            for d in &path_tree.dirs_in_order {
-                if d.depth as usize > max_level {
-                    continue;
-                }
-                let size = vec_at(&subtree_size, d.id);
-                if d.id != 0 && size < min_size_bytes {
-                    continue;
-                }
-                included.insert(d.id);
-            }
-            // Always include root.
-            included.insert(0);
-
-            let dir_rows: Vec<DirRow> = path_tree
-                .dirs_in_order
-                .iter()
-                .filter(|d| included.contains(&d.id))
-                .map(|d| {
-                    let total = vec_at(&subtree_size, d.id);
-                    let files = vec_at(&subtree_files, d.id);
-                    let _ = files;
-                    let dir_count = vec_at(&direct_dir_count, d.id);
-                    let file_count = vec_at(&direct_file_count, d.id);
-                    let owner_uid = vec_at(&owner_uid_by_dir, d.id);
-                    let has_files = if file_count > 0 || vec_at(&total_size_by_dir, d.id) > 0 {
-                        1
-                    } else {
-                        0
-                    };
-                    DirRow {
-                        id: d.id,
-                        parent_id: d.parent_id,
-                        name_id: d.name_id,
-                        total_size: total,
-                        file_count,
-                        dir_count,
-                        owner_uid,
-                        has_files,
-                    }
-                })
-                .collect();
-
-            // Derive dir_owner rows directly from owner_weights.
-            // owner_weights is already sorted by (dir_id, uid) so the output
-            // satisfies treemap.db's expected ordering with no extra sort.
-            let mut dir_owner_filtered: Vec<DirOwnerRow> =
-                Vec::with_capacity(owner_weights.len());
-            for &(dir_id, uid, size) in &owner_weights {
-                if size <= 0 || !included.contains(&dir_id) {
-                    continue;
-                }
-                dir_owner_filtered.push(DirOwnerRow { dir_id, uid, size });
-            }
-            // owner_weights is no longer needed after this point — drop it
-            // explicitly so we release ~hundreds of MB before the treemap
-            // build thread takes over and detail.db finalize starts.
-            drop(owner_weights);
-
-            let treemap_total_size = vec_at(&subtree_size, 0);
-            let meta = vec![
-                ("scan_root".to_string(), root.clone()),
-                ("scan_timestamp".to_string(), timestamp.to_string()),
-                ("max_level".to_string(), max_level.to_string()),
-                ("total_size".to_string(), treemap_total_size.to_string()),
-                (
-                    "total_dirs".to_string(),
-                    path_tree.dirs_in_order.len().to_string(),
-                ),
-                ("schema_version".to_string(), "1".to_string()),
-            ];
-
-            let input = TreemapInput {
-                names: std::mem::take(&mut path_tree.names),
-                owners,
-                dirs: dir_rows,
-                dir_owner: dir_owner_filtered,
-                meta,
-            };
-            // path_tree.names was moved into `input` above (no clone). After
-            // this point the main thread doesn't read it again, and the
-            // background treemap thread owns the only copy.
-
+            let dirs_in_order_for_treemap = Arc::clone(&dirs_in_order_arc);
+            let uid_to_username_for_treemap = Arc::clone(&uid_to_username_arc);
+            let mut owner_weights_for_treemap = std::mem::take(&mut owner_weights);
+            let subtree_size_for_treemap = std::mem::take(&mut subtree_size);
+            let subtree_files_for_treemap = std::mem::take(&mut subtree_files);
+            let direct_dir_count_for_treemap = std::mem::take(&mut direct_dir_count);
+            let direct_file_count_for_treemap = std::mem::take(&mut direct_file_count);
+            let total_size_by_dir_for_treemap = std::mem::take(&mut total_size_by_dir);
+            let names_for_treemap = std::mem::take(&mut path_tree.names);
+            let root_for_treemap = root.clone();
             let treemap_db_pb_clone = treemap_db_pb.clone();
             let treemap_work_dir_clone = treemap_work_dir.clone();
-            println!(
-                "[Phase 2] Building treemap ({} dirs, max_level {}) in background...",
-                input.dirs.len(),
-                max_level
-            );
             Some(std::thread::spawn(move || -> PyResult<()> {
+                // Precompute owner_uid per dir (= uid with max weight in that
+                // dir) in one linear scan over the sorted owner_weights. Avoids
+                // re-iterating a HashMap of HashMaps per included dir below.
+                // dir_ids are dense 0..n_dirs so a Vec is enough; entries with
+                // no weight stay at owner_uid_fallback after the loop.
+                let mut all_uids: HashSet<i64> = uid_to_username_for_treemap.keys().copied().collect();
+                for &(_, uid, _) in &owner_weights_for_treemap {
+                    all_uids.insert(uid);
+                }
+                let mut owners: Vec<OwnerRow> = all_uids
+                    .into_iter()
+                    .filter_map(|uid| {
+                        uid_to_username_for_treemap
+                            .get(&uid)
+                            .cloned()
+                            .map(|username| OwnerRow { uid, username })
+                    })
+                    .collect();
+                owners.sort_by_key(|o| o.uid);
+
+                let owner_uid_fallback = owners.first().map(|o| o.uid).unwrap_or(0);
+                let n_dirs_for_treemap = dirs_in_order_for_treemap.len();
+                // Helper: read a Vec slot indexed by dir_id, with bounds check.
+                let vec_at = |v: &Vec<i64>, id: i64| -> i64 {
+                    let idx = id as usize;
+                    if idx < v.len() { v[idx] } else { 0 }
+                };
+
+                // Precompute owner_uid_by_dir from sorted owner_weights in a
+                // single linear scan: per (dir_id, uid) run, track max size and
+                // emit the winning uid into the dir's slot. Replaces 4M+ HashMap
+                // lookups + per-dir argmax scans done in the previous version.
+                let mut owner_uid_by_dir: Vec<i64> = vec![owner_uid_fallback; n_dirs_for_treemap];
+                {
+                    let mut i = 0;
+                    while i < owner_weights_for_treemap.len() {
+                        let dir_id = owner_weights_for_treemap[i].0;
+                        let mut best_uid = owner_weights_for_treemap[i].1;
+                        let mut best_size = owner_weights_for_treemap[i].2;
+                        let mut j = i + 1;
+                        while j < owner_weights_for_treemap.len() && owner_weights_for_treemap[j].0 == dir_id {
+                            if owner_weights_for_treemap[j].2 > best_size {
+                                best_size = owner_weights_for_treemap[j].2;
+                                best_uid = owner_weights_for_treemap[j].1;
+                            }
+                            j += 1;
+                        }
+                        if (dir_id as usize) < owner_uid_by_dir.len() {
+                            owner_uid_by_dir[dir_id as usize] = best_uid;
+                        }
+                        i = j;
+                    }
+                }
+
+                // Filter dirs by max_level + min_size_bytes.
+                let mut included: HashSet<i64> = HashSet::new();
+                for d in dirs_in_order_for_treemap.iter() {
+                    if d.depth as usize > max_level {
+                        continue;
+                    }
+                    let size = vec_at(&subtree_size_for_treemap, d.id);
+                    if d.id != 0 && size < min_size_bytes {
+                        continue;
+                    }
+                    included.insert(d.id);
+                }
+                // Always include root.
+                included.insert(0);
+
+                let dir_rows: Vec<DirRow> = dirs_in_order_for_treemap
+                    .iter()
+                    .filter(|d| included.contains(&d.id))
+                    .map(|d| {
+                        let total = vec_at(&subtree_size_for_treemap, d.id);
+                        let files = vec_at(&subtree_files_for_treemap, d.id);
+                        let _ = files;
+                        let dir_count = vec_at(&direct_dir_count_for_treemap, d.id);
+                        let file_count = vec_at(&direct_file_count_for_treemap, d.id);
+                        let owner_uid = vec_at(&owner_uid_by_dir, d.id);
+                        let has_files = if file_count > 0 || vec_at(&total_size_by_dir_for_treemap, d.id) > 0 {
+                            1
+                        } else {
+                            0
+                        };
+                        DirRow {
+                            id: d.id,
+                            parent_id: d.parent_id,
+                            name_id: d.name_id,
+                            total_size: total,
+                            file_count,
+                            dir_count,
+                            owner_uid,
+                            has_files,
+                        }
+                    })
+                    .collect();
+
+                drop(owner_weights_for_treemap);
+
+                let treemap_total_size = vec_at(&subtree_size_for_treemap, 0);
+                let meta = vec![
+                    ("scan_root".to_string(), root_for_treemap),
+                    ("scan_timestamp".to_string(), timestamp.to_string()),
+                    ("max_level".to_string(), max_level.to_string()),
+                    ("total_size".to_string(), treemap_total_size.to_string()),
+                    (
+                        "total_dirs".to_string(),
+                        dirs_in_order_for_treemap.len().to_string(),
+                    ),
+                    ("schema_version".to_string(), "1".to_string()),
+                ];
+
+                let input = TreemapInput {
+                    names: names_for_treemap,
+                    owners,
+                    dirs: dir_rows,
+                    meta,
+                };
+                println!(
+                    "[Phase 2] Building treemap ({} dirs, max_level {}) in background...",
+                    input.dirs.len(),
+                    max_level
+                );
                 db_writer::build_treemap_db(
                     &treemap_db_pb_clone,
                     &treemap_work_dir_clone,
@@ -1033,7 +1025,7 @@ pub fn build_pipeline_dbs_impl(
         // users
         let mut user_rows: Vec<UserRow> = Vec::with_capacity(user_totals.len());
         for (uid, totals) in &user_totals {
-            let username = uid_to_username
+            let username = uid_to_username_arc
                 .get(uid)
                 .cloned()
                 .unwrap_or_else(|| format!("uid-{}", uid));
@@ -1083,7 +1075,7 @@ pub fn build_pipeline_dbs_impl(
             ("total_files".to_string(), total_docs.to_string()),
             (
                 "total_dirs".to_string(),
-                path_tree.dirs_in_order.len().to_string(),
+                dirs_in_order_arc.len().to_string(),
             ),
             ("total_size".to_string(), total_size.to_string()),
             ("schema_version".to_string(), "1".to_string()),
