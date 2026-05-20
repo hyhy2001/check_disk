@@ -13,6 +13,7 @@ pub fn recreate_dir(path: &Path) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", path.display(), e)))
 }
 
+#[allow(dead_code)]
 pub fn swap_dir_atomic(work_dir: &Path, final_dir: &Path) -> PyResult<()> {
     let parent = final_dir
         .parent()
@@ -68,6 +69,7 @@ pub fn ensure_dir(path: &Path) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("mkdir {}: {}", path.display(), e)))
 }
 
+#[allow(dead_code)]
 pub fn safe_user_dir(username: &str) -> String {
     username
         .chars()
@@ -81,6 +83,7 @@ pub fn safe_user_dir(username: &str) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn write_json_file(path: &Path, value: &serde_json::Value) -> PyResult<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;

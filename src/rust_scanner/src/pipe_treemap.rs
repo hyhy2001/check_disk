@@ -13,6 +13,7 @@ pub fn normalize_root(root_dir: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn tm_depth(path: &str, root: &str) -> usize {
     let rel = path.strip_prefix(root).unwrap_or(path).trim_matches('/');
     if rel.is_empty() {
@@ -22,6 +23,7 @@ pub fn tm_depth(path: &str, root: &str) -> usize {
     }
 }
 
+#[allow(dead_code)]
 pub fn tm_clamp(path: &str, root: &str, max_level: usize) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path).trim_matches('/');
     if rel.is_empty() || max_level == 0 {
@@ -55,6 +57,7 @@ pub fn tm_basename(path: &str) -> String {
     trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
 }
 
+#[allow(dead_code)]
 pub fn tm_pick_owner(weights: &HashMap<String, i64>) -> Option<String> {
     weights
         .iter()

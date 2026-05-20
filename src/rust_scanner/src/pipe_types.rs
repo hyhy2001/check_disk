@@ -9,6 +9,7 @@ pub const FILE_PART_RECORDS: usize = 100_000;
 
 /// Internal event structures
 
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct UserOutputMeta {
     pub team_id: String,

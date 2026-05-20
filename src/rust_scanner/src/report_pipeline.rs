@@ -2,9 +2,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -134,6 +134,7 @@ struct PathTree {
     /// dir path stored alongside parent_id for downstream metadata building.
     dirs_in_order: Vec<DirRowDraft>,
     /// segment string → name_id (extended later with file basenames)
+    #[allow(dead_code)]
     name_id_of: HashMap<String, i64>,
     /// names[i] is the segment string for name_id == i (extended later).
     names: Vec<String>,
@@ -283,18 +284,24 @@ pub fn build_pipeline_dbs_impl(
     max_level: usize,
     min_size_bytes: i64,
     timestamp: i64,
-    max_workers: usize,
+    _max_workers: usize,
     build_treemap: bool,
     debug: bool,
 ) -> PyResult<u64> {
     py.allow_threads(move || -> PyResult<u64> {
         let t_all = Instant::now();
+        #[allow(unused_assignments)]
         let mut t_perm_tsv = 0.0f64;
+        #[allow(unused_assignments)]
         let mut t_ingest = 0.0f64;
-        let mut t_path_tree = 0.0f64;
+        let t_path_tree = 0.0f64;
+        #[allow(unused_assignments)]
         let mut t_treemap_db = 0.0f64;
+        #[allow(unused_assignments)]
         let mut t_files_db = 0.0f64;
+        #[allow(unused_assignments)]
         let mut t_finalize_detail = 0.0f64;
+        #[allow(unused_assignments)]
         let mut t_perm_write = 0.0f64;
 
         // ─── Setup work dirs ───────────────────────────────────────
@@ -456,7 +463,7 @@ pub fn build_pipeline_dbs_impl(
         t_ingest = t1.elapsed().as_secs_f64();
 
         // ─── STAGE 2: Path tree + dir aggregate ────────────────────
-        let t2 = Instant::now();
+        let _t2 = Instant::now();
         let root = normalize_root(&treemap_root);
 
         let dir_paths_set: HashSet<String> =
@@ -870,7 +877,7 @@ pub fn build_pipeline_dbs_impl(
         let treemap_thread: Option<std::thread::JoinHandle<PyResult<()>>> = if build_treemap {
             let dirs_in_order_for_treemap = Arc::clone(&dirs_in_order_arc);
             let uid_to_username_for_treemap = Arc::clone(&uid_to_username_arc);
-            let mut owner_weights_for_treemap = std::mem::take(&mut owner_weights);
+            let owner_weights_for_treemap = std::mem::take(&mut owner_weights);
             let subtree_size_for_treemap = std::mem::take(&mut subtree_size);
             let subtree_files_for_treemap = std::mem::take(&mut subtree_files);
             let direct_dir_count_for_treemap = std::mem::take(&mut direct_dir_count);
