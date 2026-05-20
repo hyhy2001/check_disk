@@ -33,8 +33,14 @@ python3 disk_checker.py --run --tree-map
 ### 4. View reports
 
 ```bash
+# Summary report
 python3 disk_checker.py --show-report --files disk_usage_report.json
-python3 disk_checker.py --check-users alice bob --top 20
+
+# Per-user detail (dirs + files breakdown)
+python3 disk_checker.py --detail --user alice bob --top 20
+
+# Directory tree visualization
+python3 disk_checker.py --tree-show --user alice --level 3
 ```
 
 ### 5. Export per-user text reports
@@ -43,7 +49,6 @@ python3 disk_checker.py --check-users alice bob --top 20
 python3 scripts/export_user_reports.py \
   --input-dir . \
   --output-dir ./exports \
-  --users alice bob \
   --workers 4
 ```
 
@@ -51,32 +56,40 @@ python3 scripts/export_user_reports.py \
 
 ## Features
 
-### Native Rust scanner
-- `ignore::WalkBuilder` parallel traversal with hardlink + bind-mount + cross-device dedup.
+### Native Rust scanner (bounded-queue parallel walker)
+
+- Custom parallel walker with a bounded `crossbeam_channel` queue (cap 200K dirs) — RAM stays flat regardless of directory count.
+- Workers fall back to inline depth-first traversal when the queue is full (no blocking, no deadlock).
 - Skips critical pseudo mounts (`proc`, `sys`, `dev`, …) and snapshots automatically.
-- Streams events to bounded binary spill files in a per-scan temp dir — RAM stays flat regardless of file count.
+- Cross-device check prevents descending into bind mounts or NFS mounts.
+- Hard-link dedup (`DashSet<(ino, dev)>`) avoids double-counting cross-link bytes.
+- Streams events to bounded binary spill files (lz4-compressed) in a per-scan temp dir.
 - Panic-safe: a `DoneGuard` ensures the progress loop never spins forever even if the walker crashes.
 
 ### Rust SQLite report pipeline
+
 - Phase 2 reads spill files via Rayon, builds three SQLite databases:
   - `detail_users/data_detail.db` — per-user file/dir breakdown, indexed for `ORDER BY size DESC` pagination.
   - `tree_map_data/treemap.db` — shared path dictionary + directory tree, depth-filtered by `--level`.
-  - `permission_issues.db` — indexed access-error log alongside the JSON copy.
-- All databases built with `journal_mode=OFF` (no WAL/SHM sidecars) and atomically renamed into place via `VACUUM INTO` + `fs::rename`.
+  - `permission_issues.db` — indexed access-error log.
+- All databases built with `journal_mode=OFF` (no WAL/SHM sidecars) and atomically renamed into place via `fs::rename`.
 - Cross-DB queries via `ATTACH treemap.db` resolve directory paths from `detail.db` rows on demand.
+- Compatible with SQLite 3.7.x+ (no `WITHOUT ROWID` syntax).
 
 ### Atomic remote sync
+
 - Streams artifacts over SSH using `tar -czf | ssh tar -xzOf` (single files) or `tar -czf | ssh tar -xzf` (directories), multiplexed through SSH ControlMaster.
 - **Per-file atomicity**: each file lands in `.<name>.__staging__.<pid>` then `mv -f` into place.
 - **Per-directory atomicity**: each directory lands in `<dir>.__staging__/`, the live target rotates to `<dir>.__old__/`, then staging is promoted with `mv -T`.
-- No Python-side timeout on stream subprocesses — large datasets sync to completion. Liveness is enforced by SSH `ServerAliveInterval=30 / ServerAliveCountMax=3` (~90s to detect a dead connection).
 - Ctrl+C drains running subprocesses, sweeps leftover staging artifacts on the remote, and pushes a final `error / interrupted` heartbeat.
 
 ### Heartbeat + status
+
 - `scan_status.json` is updated atomically every 5s with `{ stage, phase_elapsed_sec, total_elapsed_sec, running, message, host, pid, ... }`.
 - When sync is enabled, the status file is enqueued every 30s (and on every phase change) so dashboards see live progress.
 
 ### Reporting + notifications
+
 - Compare historical summary reports by total usage or growth rate.
 - Microsoft Teams Workflow notification on completion.
 
@@ -87,6 +100,7 @@ python3 scripts/export_user_reports.py \
 - **Python**: 3.8+
 - **OS**: Linux x86_64
 - **glibc**: bundled `.so` artifacts target glibc 2.17+ (CentOS 7, RHEL 7+, Debian 9+, Ubuntu 14.04+)
+- **SQLite**: 3.7.x+ (for reading output databases)
 - **For sync (optional)**:
   - `ssh` client + key-based auth, or
   - `sshpass` if using `--sync-pass`
@@ -191,9 +205,108 @@ Both file and directory syncs use staging+rename for atomicity. Ctrl+C will:
 | `--show-report --files <a.json> <b.json> --compare-by growth` | Compare two reports by growth rate (default). |
 | `--show-report --files <a.json> <b.json> --compare-by usage` | Compare by total usage. |
 | `--show-report --files ... --user <u1> [u2 ...]` | Filter displayed users. |
-| `--check-users <u1> [u2 ...]` | Per-user directory + file breakdown from `data_detail.db`. |
-| `--check-users ... --top <N>` | Limit rows shown (default: `30`). |
-| `--check-users ... --output-dir <dir>` | Locate detail DB in a custom report directory. |
+
+### Per-user detail: `--detail`
+
+Display per-user breakdown from `data_detail.db`. Requires `--user` to specify user(s).
+
+```bash
+python3 disk_checker.py --detail --user alice --output-dir /reports
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--user <u1> [u2 ...]` | required | User(s) to display. |
+| `--type <choice>` | `report` | Section to display (see below). |
+| `--top <N>` | 30 | Max rows in each table. |
+| `--search <keyword>` | (none) | Filter results to entries whose path contains keyword (case-insensitive). Matching text is highlighted in bold yellow on TTY output. |
+| `--output-dir <dir>` | `.` | Directory containing `detail_users/data_detail.db`. |
+
+**`--type` choices:**
+
+| Type | Displays |
+|---|---|
+| `report` (default) | Directory breakdown + largest files |
+| `dirs` | Directory breakdown only (sorted by size) |
+| `files` | Largest files only |
+| `inode` | Directory breakdown sorted by file count |
+| `permission` | Permission errors from `permission_issues.db` |
+
+**Examples:**
+
+```bash
+# Default: dirs + files
+python3 disk_checker.py --detail --user alice --output-dir /reports
+
+# Only directory breakdown, filter by keyword
+python3 disk_checker.py --detail --user alice --output-dir /reports --type dirs --search "backup"
+
+# File count per directory
+python3 disk_checker.py --detail --user alice --output-dir /reports --type inode
+
+# Permission errors matching a path
+python3 disk_checker.py --detail --user alice --output-dir /reports --type permission --search "/home"
+
+# Multiple users
+python3 disk_checker.py --detail --user alice bob --output-dir /reports --type files --top 50
+```
+
+### Directory tree: `--tree-show`
+
+Render an ASCII directory tree from `tree_map_data/treemap.db`. Requires `--run --tree-map` to have been run first.
+
+```bash
+python3 disk_checker.py --tree-show --output-dir /reports
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--user <u1> [u2 ...]` | (none) | Filter by user(s). Without `--user`, shows total dir sizes. Multiple users render separate trees. |
+| `--path <PATH>` | scan root | Start tree from a specific path. |
+| `--level <N>` | 3 | Maximum tree depth. |
+| `--limit <N>` | 20 | Maximum child folders per level. |
+| `--search <keyword>` | (none) | Show only branches containing dirs matching keyword. Matching dir names are highlighted in bold yellow on TTY output. |
+| `--output-dir <dir>` | `.` | Directory containing `tree_map_data/treemap.db`. |
+
+**Examples:**
+
+```bash
+# Full tree (all users, total sizes)
+python3 disk_checker.py --tree-show --output-dir /reports --level 3 --limit 10
+
+# Tree for a specific user
+python3 disk_checker.py --tree-show --output-dir /reports --user alice --level 4
+
+# Multiple users (separate tree per user)
+python3 disk_checker.py --tree-show --output-dir /reports --user alice bob --level 3
+
+# Search for directories matching keyword
+python3 disk_checker.py --tree-show --output-dir /reports --search "backup" --level 5
+
+# Start from a specific path
+python3 disk_checker.py --tree-show --output-dir /reports --path /data/projects --level 2
+
+# User + search + custom path
+python3 disk_checker.py --tree-show --output-dir /reports --user alice --search "data" --path /home --level 3
+```
+
+**Sample output:**
+
+```
+============================================================
+TREE-SHOW - alice
+============================================================
+Root path: /data/shared
+User 'alice': 11.30 TB, 1,234,567 files
+Search: 'backup'
+Depth: 3  |  Limit: 10 per level
+
+|-- projects  [8.5 TB, 800,000 files]
+|   |-- ml_data  [6.0 TB, 600,000 files]
+|   \-- backup  [2.5 TB, 200,000 files]    ← highlighted in yellow on TTY
+\-- archive  [2.8 TB, 434,567 files]
+    \-- backup_2024  [2.8 TB, 434,567 files]    ← highlighted in yellow on TTY
+```
 
 ### Per-user text export
 
@@ -203,7 +316,6 @@ Both file and directory syncs use staging+rename for atomicity. Ctrl+C will:
 python3 scripts/export_user_reports.py \
   --input-dir /reports \
   --output-dir /reports/exports \
-  --users root www \
   --workers 4
 ```
 
@@ -251,9 +363,8 @@ Indexes: `ix_files_uid_size`, `ix_files_uid_ext_size`, `ix_files_name_uid`, `ix_
 | `names` | directory segment dictionary |
 | `dirs` | id, parent_id, name_id, total_size, file_count, dir_count, owner_uid, has_files |
 | `owners` | uid → username |
-| `dir_owner` | per-(dir_id, uid) attributed size |
 
-Indexes: `ix_dirs_parent_size` (covers `WHERE parent_id=? ORDER BY total_size DESC`).
+Index: `ix_dirs_parent_size` (covers `WHERE parent_id=? ORDER BY total_size DESC`).
 
 Frontend queries that need full paths `ATTACH treemap.db AS tm` and walk `tm.dirs.parent_id` recursively, joined with `tm.names`.
 
@@ -266,9 +377,10 @@ Frontend queries that need full paths `ATTACH treemap.db AS tm` and walk `tm.dir
 ```
         ┌─────────────────────────┐
         │  Phase 1: Rust scan     │  fast_scanner.scan_disk()
-        │  ignore::WalkBuilder    │  → /tmp/checkdisk_rust_*/scan_t*_b*.bin
-        │  ThreadLocalState +     │     (binary spill, ~3 buckets per worker)
-        │  spill BufWriters       │  → /tmp/.../perm_t*.tsv  diragg_t*.bin
+        │  Bounded-queue walker   │  → /tmp/checkdisk_rust_*/scan_t*_b*.bin
+        │  (200K dir cap, 64w)    │     (lz4-compressed binary spill)
+        │  ThreadLocalState +     │  → /tmp/.../perm_t*.tsv  diragg_t*.bin
+        │  spill BufWriters       │
         └────────────┬────────────┘
                      │
                      ▼
@@ -283,7 +395,7 @@ Frontend queries that need full paths `ATTACH treemap.db AS tm` and walk `tm.dir
         │  Rayon-parallel ingest  │  → spool .rows files
         │  Path tree assembly     │  → detail.db build dir
         │  Detail.db files insert │  → treemap.db (parallel thread)
-        │  ANALYZE + VACUUM INTO  │  → atomic rename to final paths
+        │  ANALYZE + rename       │  → atomic rename to final paths
         └────────────┬────────────┘
                      │
                      ▼
@@ -303,12 +415,12 @@ Frontend queries that need full paths `ATTACH treemap.db AS tm` and walk `tm.dir
 | Crate | Module | Purpose |
 |---|---|---|
 | `src/rust_scanner/` | `lib.rs` | PyO3 entry points: `scan_disk`, `build_pipeline` |
-| | `scan_core.rs` | Phase 1 parallel walker (panic-safe via `DoneGuard`) |
-| | `scan_state.rs` | Per-thread scan buffers + spill writers |
+| | `scan_core.rs` | Phase 1 bounded-queue parallel walker (panic-safe via `DoneGuard`) |
+| | `scan_state.rs` | Per-thread scan buffers + lz4-compressed spill writers |
 | | `scan_constants.rs` | Critical-skip names, flush thresholds, binary magic numbers |
 | | `scan_utils.rs` | Number / size / rate formatting + `/proc/self/status` RSS |
 | | `report_pipeline.rs` | Phase 2 ingest → path tree → detail.db + treemap.db |
-| | `db_writer.rs` | DDL, bulk insert, `ANALYZE`, `VACUUM INTO`, atomic rename |
+| | `db_writer.rs` | DDL, bulk insert, `ANALYZE`, atomic rename |
 | | `pipe_events.rs` | Binary spill format reader for scan + dir aggregates |
 | | `pipe_io.rs` | Path safety helpers (`ensure_dir`, `recreate_dir`, …) |
 | | `pipe_permission.rs` | Permission TSV → permission_issues.db |
@@ -320,14 +432,14 @@ Frontend queries that need full paths `ATTACH treemap.db AS tm` and walk `tm.dir
 
 | Module | Description |
 |---|---|
-| `disk_checker.py` | CLI dispatcher: `cmd_init`, `cmd_run`, `cmd_show_report`, … |
-| `src/cli_interface.py` | argparse setup + `--show-report` / `--check-users` rendering |
+| `disk_checker.py` | CLI dispatcher: `cmd_init`, `cmd_run`, `cmd_detail`, `cmd_tree_show`, … |
+| `src/cli_interface.py` | argparse setup + `--show-report` / `--detail` / `--tree-show` rendering |
 | `src/config_manager.py` | Config CRUD: teams, users, scan directory |
 | `src/disk_scanner.py` | Wraps `fast_scanner.scan_disk`, classifies usage, builds `ScanResult` |
 | `src/report_generator.py` | Writes JSON summaries, invokes `fast_scanner.build_pipeline` |
 | `src/sync_manager.py` | `AsyncSyncPipeline` + atomic tar-stream sync over SSH |
 | `src/scan_status.py` | Atomic `scan_status.json` writer + heartbeat thread |
-| `src/formatters/` | Terminal table rendering (summary, comparison, detail) |
+| `src/formatters/` | Terminal table rendering (summary, comparison, detail, tree) |
 | `src/msteams_notifier.py` | Adaptive Card webhook for MS Teams |
 | `src/utils.py` | Size formatting, UID resolution, JSON helpers |
 | `src/constants.py` | Filenames, directory names, heartbeat intervals |
@@ -346,7 +458,8 @@ Frontend queries that need full paths `ATTACH treemap.db AS tm` and walk `tm.dir
 
 | Source | Bound |
 |---|---|
-| Phase 1 per-worker event buffer | `SCAN_EVENT_FLUSH_BYTES_THRESHOLD` (binary spill) |
+| Phase 1 queue | `crossbeam_channel::bounded(200_000)` dirs |
+| Phase 1 per-worker event buffer | `SCAN_EVENT_FLUSH_BYTES_THRESHOLD` (lz4-compressed spill) |
 | Phase 2 row aggregation | `ROW_SPILL_THRESHOLD = 200_000` rows → `.rows` spill |
 | `users` HashMap | Sized to actual user count |
 | File basename dict (`names`) | Interned once; freed after stream |
@@ -361,8 +474,8 @@ Use `--debug` to print Phase 1 / Phase 2 profiles and peak RSS.
 | Tar producer hangs after ssh fails | `_drain_tar_proc` closes stdout, `wait(5s)`, then escalates to `kill` |
 | Future stuck forever | Streams have no Python timeout; SSH `ServerAliveInterval=30` × `CountMax=3` drops dead connections in ~90s |
 | `/tmp` orphan accumulation | `_cleanup_orphan_tmpdirs()` sweeps `checkdisk_rust_*` at the start of every run |
-| Ctrl+C mid-sync | `signal_handler` raises `KeyboardInterrupt` (not `sys.exit`) so `cmd_run`'s `except` block flushes status, drains the pipeline, and sweeps remote staging |
-| `VACUUM INTO` partial write | `finalize_db` deletes `<final>.tmp.db` on any error before propagating |
+| Ctrl+C mid-sync | `signal_handler` raises `KeyboardInterrupt` so `cmd_run`'s `except` block flushes status, drains the pipeline, and sweeps remote staging |
+| Partial DB write | `finalize_db` deletes `<final>.tmp.db` on any error before propagating |
 
 ### What survives an abort
 
@@ -399,13 +512,27 @@ Point `disk_usage/disks.json` entries at directories containing these files. The
 
 ## Performance Notes
 
-- Phase 1 streams events to spill files; main scan thread does no heap allocation per file beyond per-worker buffers.
-- Phase 2 reads spills via Rayon and aggregates per-(user, dir) sizes before inserting into SQLite — avoiding row-per-file `INSERT` overhead.
-- `journal_mode=OFF` + `synchronous=OFF` + `cache_size=-1_048_576` (1 GiB cache) + bulk transactions yield ~10× faster inserts than default SQLite.
-- `VACUUM INTO` is skipped for DBs <100 MB (the page-clustering gain doesn't justify the extra I/O).
+### Benchmarks (48.7M files, 7.67M dirs, 56.7 TB, 131 users, 64 workers)
+
+| Phase | Time | RAM peak |
+|---|---|---|
+| Phase 1 (scan) | ~460s | ~2.5 GB |
+| Phase 2 (SQLite build) | ~370s | ~13 GB |
+| **Total** | **~830s** | — |
+
+### Phase 1 optimizations
+
+- **Bounded-queue walker**: caps queue at 200K dirs → Phase 1 RAM from ~8.9 GB to ~2.5 GB (-72%).
+- **lz4 spill compression**: spill files compressed ~11× (9 GB → 800 MB).
+- **Inline DFS fallback**: when queue is full, workers process subtrees locally without blocking.
+
+### Phase 2 optimizations
+
+- `journal_mode=OFF` + `synchronous=OFF` + `cache_size=-1_048_576` (1 GiB) + bulk transactions.
+- `PAGE_SIZE=16384` reduces B-tree levels for large index builds.
+- UTF-8 fast path in spill reader skips redundant allocations for valid UTF-8 paths.
 - TreeMap is built on a parallel thread alongside `detail.db` finalize.
-- Hard-link dedup (`DashSet<(ino, dev)>`) avoids double-counting cross-link bytes.
-- Visited-dir dedup (`DashSet<(ino, dev)>`) prevents loops via bind mounts / symlinks.
+- `VACUUM INTO` is skipped for DBs outside the `[100 MB, 1 GB]` range.
 
 ### Progress output
 
@@ -422,16 +549,13 @@ Phase 2 prints discrete stage markers (no inline `\r`):
 [Phase 2] Loading 16 Phase 1 directory aggregate shards...
 [Phase 2] Building path tree for 152340 directories...
 [Phase 2] Building user detail for 87 users...
-[Phase 2]   user detail: 8/87 (9%)
 [Phase 2]   user detail: 87/87 (100%)
 [Phase 2] Building treemap (12480 dirs, max_level 3) in background...
 [Phase 2] Finalizing detail.db (index + vacuum)...
 [Phase 2] Waiting for treemap build to finish...
 ```
 
-User-detail progress fires at every 10% milestone plus the final 100% line, so output stays bounded regardless of user count.
-
-Typical performance depends on storage latency, inode count, directory fanout, and worker count. Use `--debug` to print Phase 1 / Phase 2 profiles + peak RSS.
+Use `--debug` to print Phase 1 / Phase 2 profiles + peak RSS.
 
 ---
 
@@ -444,7 +568,7 @@ After code changes:
 cargo check --manifest-path src/rust_scanner/Cargo.toml --message-format short
 cargo check --manifest-path src/rust_exporter/Cargo.toml --message-format short
 
-# Python tests (requires sshd on localhost for sync tests)
+# Python tests
 python3 -m pytest tests/ -q
 ```
 
