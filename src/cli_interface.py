@@ -67,14 +67,14 @@ class CLIInterface:
 
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
-        report_group.add_argument("--check-users", "--check-user", dest="check_users", metavar="USER", nargs="+",
-                                help="Display detail reports for specific user(s) from generated JSON/NDJSON detail data.")
+        report_group.add_argument("--detail", dest="detail", action="store_true",
+                                help="Display detail reports for user(s) from data_detail.db (use --user USER... to specify).")
         report_group.add_argument("--top", type=int, default=30,
-                                help="Top N rows to display for both directory and file breakdown in --check-users (default: 30).")
+                                help="Top N rows to display for both directory and file breakdown in --detail (default: 30).")
         report_group.add_argument("--type", dest="type",
                                 choices=["report", "inode", "permission", "files", "dirs"],
                                 default="report",
-                                help="Section type for --check-users: report (default), inode, permission, files, dirs.")
+                                help="Section type for --detail: report (default), inode, permission, files, dirs.")
         report_group.add_argument("--path", metavar="PATH", default="",
                                 help="For --tree-show: start tree from this path (default: scan root).")
         report_group.add_argument("--limit", type=int, default=20,

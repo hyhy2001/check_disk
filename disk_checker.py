@@ -132,14 +132,20 @@ def cmd_show_report(args, cli: CLIInterface) -> None:
     cli.display_report(args.files, args.user, args.compare_by)
 
 
-def cmd_check_users(args, cli: CLIInterface) -> None:
+def cmd_detail(args, cli: CLIInterface) -> None:
     output_dir = args.output_dir or "."
     prefix = args.prefix or ""
-    users = args.check_users
+    users = getattr(args, "user", None) or []
+    if isinstance(users, str):
+        users = users.split()
 
-    # Expand multi-word single-arg (e.g. --check-users "Binh Minh")
+    # Expand multi-word single-arg (e.g. --user "Binh Minh")
     if len(users) == 1 and " " in users[0]:
         users = users[0].split()
+
+    if not users:
+        print("Error: --detail requires --user USER [USER ...] to specify user(s).")
+        return
 
     top = max(1, int(getattr(args, "top", 30) or 30))
     type_filter = getattr(args, "type", "report") or "report"
@@ -478,8 +484,8 @@ def main():
         cmd_list(args, cli, config_manager)
     elif args.show_report:
         cmd_show_report(args, cli)
-    elif args.check_users:
-        cmd_check_users(args, cli)
+    elif getattr(args, "detail", False):
+        cmd_detail(args, cli)
     elif getattr(args, "tree_show", False):
         cmd_tree_show(args, cli)
     elif args.run:
