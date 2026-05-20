@@ -48,7 +48,6 @@ pub(crate) struct ThreadLocalState {
     pub(crate) prof_flush_bytes: Arc<AtomicU64>,
     pub(crate) prof_flush_count: Arc<AtomicU64>,
     pub(crate) prof_hardlink_checks: Arc<AtomicU64>,
-    pub(crate) prof_visited_dir_checks: Arc<AtomicU64>,
     pub(crate) prof_max_event_buf_records: Arc<AtomicU64>,
     pub(crate) prof_max_event_buf_bytes: Arc<AtomicU64>,
     pub(crate) perm_writer: Option<BufWriter<fs::File>>,
@@ -58,6 +57,7 @@ pub(crate) struct ThreadLocalState {
 impl ThreadLocalState {
     const PROGRESS_FLUSH_THRESHOLD: u64 = 4096;
     pub(crate) const EVENT_BUCKETS: usize = 3;
+    const DIR_SIZES_FLUSH_THRESHOLD: usize = 50_000;
 
     fn bucket_for_uid(uid: u32) -> usize {
         (uid as usize) % Self::EVENT_BUCKETS
@@ -114,6 +114,13 @@ impl ThreadLocalState {
             .t_dir_sizes
             .entry((uid, parent.to_string()))
             .or_insert(0) += size as i64;
+
+        // Flush dir aggregates early to bound per-thread memory.
+        // At 7.67M dirs × 80 bytes/path = ~614 MB just for keys.
+        // Flushing at 50K entries keeps per-thread overhead <4 MB.
+        if self.t_dir_sizes.len() >= Self::DIR_SIZES_FLUSH_THRESHOLD {
+            self.flush_dir_aggregates();
+        }
     }
 
     pub(crate) fn flush_events(&mut self) {

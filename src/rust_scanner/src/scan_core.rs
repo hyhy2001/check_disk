@@ -54,7 +54,6 @@ pub(crate) fn run_scan_core(
     let prof_flush_bytes = Arc::new(AtomicU64::new(0));
     let prof_flush_count = Arc::new(AtomicU64::new(0));
     let prof_hardlink_checks = Arc::new(AtomicU64::new(0));
-    let prof_visited_dir_checks = Arc::new(AtomicU64::new(0));
     let prof_max_event_buf_records = Arc::new(AtomicU64::new(0));
     let prof_max_event_buf_bytes = Arc::new(AtomicU64::new(0));
 
@@ -75,25 +74,25 @@ pub(crate) fn run_scan_core(
     let pfb_clone = prof_flush_bytes.clone();
     let pfc_clone = prof_flush_count.clone();
     let ph_clone = prof_hardlink_checks.clone();
-    let pv_clone = prof_visited_dir_checks.clone();
     let pmaxr_clone = prof_max_event_buf_records.clone();
     let pmaxb_clone = prof_max_event_buf_bytes.clone();
 
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    // Keep a sane default and let CLI max_workers override explicitly.
-    let default_threads = (cpus * 2).clamp(4, 32);
+    // Phase 1 is metadata-I/O-bound (lstat dominates wall time on NFS /
+    // large filesystems — production logs show ~25 threads blocked on
+    // metadata vs ~559s wall). cpus*4 lets the kernel keep more inflight
+    // requests per disk; clamp(4, 64) keeps small machines reasonable
+    // while not capping I/O-rich storage. CLI `--max-workers` overrides.
+    let default_threads = (cpus * 4).clamp(4, 64);
     let threads_count = max_workers.unwrap_or(default_threads).max(1);
     let thread_counter = Arc::new(AtomicUsize::new(0));
     let target_uids_shared =
         Arc::new(target_uids.map(|uids| uids.into_iter().collect::<HashSet<u32>>()));
     // Shared cross-worker hard-link deduplication — DashSet avoids Mutex bottleneck
     let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
-    // Shared directory loop/bind-mount deduplication — DashSet (16 shards by default)
-    let visited_dirs: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let hardlink_inodes_profile = hardlink_inodes.clone();
-    let visited_dirs_profile = visited_dirs.clone();
 
     let _walk_thread = thread::spawn(move || {
         // Ensure `done` flips to true even if the parallel walk panics —
@@ -149,7 +148,6 @@ pub(crate) fn run_scan_core(
                     prof_flush_bytes: pfb_clone.clone(),
                     prof_flush_count: pfc_clone.clone(),
                     prof_hardlink_checks: ph_clone.clone(),
-                    prof_visited_dir_checks: pv_clone.clone(),
                     prof_max_event_buf_records: pmaxr_clone.clone(),
                     prof_max_event_buf_bytes: pmaxb_clone.clone(),
                     perm_writer: None,
@@ -157,7 +155,6 @@ pub(crate) fn run_scan_core(
                 };
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
-                let visited_dirs_shared = visited_dirs.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -209,7 +206,14 @@ pub(crate) fn run_scan_core(
                             }
                         }
 
-                        // --- Bind mount / Loop deduplication ---
+                        // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
+                        // We previously also kept a DashSet<(ino, dev)> of every
+                        // visited dir to break loops, but at 7M+ entries it cost
+                        // ~25% wall time to cache-miss into and only ever fired
+                        // once per scan in practice (POSIX forbids same-device
+                        // hardlinked dirs; ignore::WalkBuilder doesn't follow
+                        // symlinks by default; bind-mounts cross devices and
+                        // are already caught below).
                         let meta_start = debug.then(Instant::now);
                         if let Ok(meta) = entry.metadata() {
                             if let Some(start) = meta_start {
@@ -218,30 +222,16 @@ pub(crate) fn run_scan_core(
                                     Ordering::Relaxed,
                                 );
                             }
-                            let key = (meta.ino(), meta.dev());
-                            if debug {
-                                state
-                                    .prof_visited_dir_checks
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            // DashSet.insert() returns false when key already exists
-                            if !visited_dirs_shared.insert(key) {
-                                return WalkState::Skip;
-                            }
-
-                            // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
                             if let Some(rdev) = root_dev {
                                 if meta.dev() != rdev {
                                     return WalkState::Skip;
                                 }
                             }
-                        } else {
-                            if let Some(start) = meta_start {
-                                state.prof_metadata_ns.fetch_add(
-                                    start.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
-                            }
+                        } else if let Some(start) = meta_start {
+                            state.prof_metadata_ns.fetch_add(
+                                start.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
                         }
 
                         state.t_dirs += 1;
@@ -411,11 +401,9 @@ pub(crate) fn run_scan_core(
         let flush_bytes = prof_flush_bytes.load(Ordering::Relaxed);
         let flush_count = prof_flush_count.load(Ordering::Relaxed);
         let hardlink_checks = prof_hardlink_checks.load(Ordering::Relaxed);
-        let visited_checks = prof_visited_dir_checks.load(Ordering::Relaxed);
         let max_buf_records = prof_max_event_buf_records.load(Ordering::Relaxed);
         let max_buf_bytes = prof_max_event_buf_bytes.load(Ordering::Relaxed);
         let hardlink_set_size = hardlink_inodes_profile.len();
-        let visited_set_size = visited_dirs_profile.len();
         println!("\n[Phase 1 Profile]");
         println!("  Wall time:          {:.2}s", elapsed);
         println!(
@@ -428,7 +416,6 @@ pub(crate) fn run_scan_core(
         println!("  TSV flushes:        {}", format_num(flush_count));
         println!("  TSV bytes approx:   {}", format_size(flush_bytes));
         println!("  Hardlink checks:    {}", format_num(hardlink_checks));
-        println!("  Visited dir checks: {}", format_num(visited_checks));
         println!(
             "  Max event buffer:   {} records / {}",
             format_num(max_buf_records),
@@ -437,10 +424,6 @@ pub(crate) fn run_scan_core(
         println!(
             "  Hardlink set size:  {}",
             format_num(hardlink_set_size as u64)
-        );
-        println!(
-            "  Visited set size:   {}",
-            format_num(visited_set_size as u64)
         );
     }
 

@@ -22,6 +22,7 @@ use pyo3::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, ToSql};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 // ─── Constants / magic ────────────────────────────────────────────────
 
@@ -30,7 +31,7 @@ pub const DETAIL_APP_ID: i32 = 0xC0DD15D1u32 as i32;
 pub const SCHEMA_VERSION: i32 = 1;
 pub const PAGE_SIZE: i32 = 8192;
 
-pub const FILE_INSERT_CHUNK: usize = 100_000;
+pub const FILE_INSERT_CHUNK: usize = 200_000;
 pub const DEFAULT_TOP_K: usize = 1000;
 
 /// Rows packed into one `INSERT … VALUES (…),(…),…` statement.
@@ -203,12 +204,16 @@ fn stamp_db(conn: &Connection, app_id: i32) -> PyResult<()> {
     Ok(())
 }
 
-/// Below this size threshold (in bytes) we skip `VACUUM INTO` and atomically
-/// rename the build file directly. Rationale: VACUUM rewrites every page
-/// (read-all + write-all). For small DBs, page-clustering gain doesn't
-/// justify the extra IO. Inserts happen in PK-ascending order so
-/// fragmentation is minimal regardless.
-const VACUUM_SIZE_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+/// VACUUM INTO is skipped outside the `[MIN, MAX]` range. Inserts happen in
+/// PK-ascending order with `journal_mode=OFF`, so freed pages are ~zero and
+/// page clustering is already near-optimal — VACUUM mostly buys a marginally
+/// smaller file at the cost of read-all + write-all I/O.
+///
+/// - Below MIN: page-clustering gain doesn't justify the extra IO.
+/// - Above MAX: rewrite cost dominates (e.g. ~3min on 15 GB DB observed in
+///   production). Build files are already well-clustered; ship them as-is.
+const VACUUM_SIZE_MIN_BYTES: u64 = 100 * 1024 * 1024;
+const VACUUM_SIZE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResult<()> {
     let tmp_path = final_path.with_extension("tmp.db");
@@ -222,18 +227,46 @@ fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResu
     // around (e.g. when /tmp or the destination disk runs out of space mid-
     // write); a leaked tmp.db would otherwise sit on disk until the next run.
     let result: PyResult<()> = (|| {
+        let t_analyze = Instant::now();
         conn.execute_batch("ANALYZE;")
             .map_err(|e| PyRuntimeError::new_err(format!("analyze: {}", e)))?;
+        let analyze_secs = t_analyze.elapsed().as_secs_f64();
 
         let build_size = fs::metadata(build_path).map(|m| m.len()).unwrap_or(0);
-        let skip_vacuum = build_size < VACUUM_SIZE_THRESHOLD_BYTES;
+        let skip_vacuum =
+            build_size < VACUUM_SIZE_MIN_BYTES || build_size > VACUUM_SIZE_MAX_BYTES;
 
+        let mut vacuum_secs = 0.0f64;
         if !skip_vacuum {
             let tmp_str = tmp_path.to_string_lossy().replace('\'', "''");
+            let t_vacuum = Instant::now();
             conn.execute(&format!("VACUUM INTO '{}'", tmp_str), [])
                 .map_err(|e| PyRuntimeError::new_err(format!("vacuum into: {}", e)))?;
+            vacuum_secs = t_vacuum.elapsed().as_secs_f64();
         }
         drop(conn);
+
+        let final_name = final_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<db>");
+        let size_mb = build_size as f64 / (1024.0 * 1024.0);
+        if skip_vacuum {
+            let reason = if build_size < VACUUM_SIZE_MIN_BYTES {
+                "small"
+            } else {
+                "huge"
+            };
+            println!(
+                "[finalize] {}: analyze {:.2}s, vacuum skipped ({}, {:.1} MB)",
+                final_name, analyze_secs, reason, size_mb
+            );
+        } else {
+            println!(
+                "[finalize] {}: analyze {:.2}s, vacuum {:.2}s ({:.1} MB)",
+                final_name, analyze_secs, vacuum_secs, size_mb
+            );
+        }
 
         if final_path.exists() {
             fs::remove_file(final_path).map_err(|e| {
@@ -684,24 +717,89 @@ pub fn detail_insert_files_chunk(
     if len == 0 {
         return Ok(());
     }
-    packed_insert(
-        &mut handle.conn,
-        "files",
-        "dir_id, name_id, ext_id, uid, size",
-        5,
-        len,
-        |i| {
-            let r = &rows[i];
-            vec![
-                Box::new(r.dir_id),
-                Box::new(r.name_id),
-                Box::new(r.ext_id),
-                Box::new(r.uid),
-                Box::new(r.size),
-            ]
-        },
-        "files",
-    )?;
+    // Fast path: files is the hot insert at 48M+ rows, all-i64. The generic
+    // `packed_insert` path goes through `Box<dyn ToSql>` per cell, which at
+    // 5 cols × 48M rows = 240M heap allocations alone. We instead bind a
+    // contiguous `&[i64]` per packed statement so each cell is a stack copy
+    // — same 100-row packing strategy, no boxing, no FnMut indirection.
+    let tx = handle
+        .conn
+        .transaction()
+        .map_err(|e| PyRuntimeError::new_err(format!("tx files: {}", e)))?;
+    {
+        const COLS: usize = 5;
+        let full_chunks = len / PACK_ROWS;
+        let tail = len % PACK_ROWS;
+
+        // Cached prepared statement for full PACK_ROWS chunks.
+        let mut full_stmt = if full_chunks > 0 {
+            let group = placeholder_group(COLS);
+            let mut full_sql = String::with_capacity(48 + group.len() * PACK_ROWS);
+            full_sql.push_str(
+                "INSERT INTO files(dir_id, name_id, ext_id, uid, size) VALUES ",
+            );
+            for i in 0..PACK_ROWS {
+                if i > 0 {
+                    full_sql.push(',');
+                }
+                full_sql.push_str(&group);
+            }
+            Some(
+                tx.prepare(&full_sql)
+                    .map_err(|e| PyRuntimeError::new_err(format!("prep files full: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        let mut binds: Vec<i64> = Vec::with_capacity(PACK_ROWS * COLS);
+        let mut row_idx = 0usize;
+        if let Some(ref mut stmt) = full_stmt {
+            for _ in 0..full_chunks {
+                binds.clear();
+                for _ in 0..PACK_ROWS {
+                    let r = unsafe { rows.get_unchecked(row_idx) };
+                    binds.push(r.dir_id);
+                    binds.push(r.name_id);
+                    binds.push(r.ext_id);
+                    binds.push(r.uid);
+                    binds.push(r.size);
+                    row_idx += 1;
+                }
+                stmt.execute(params_from_iter(binds.iter()))
+                    .map_err(|e| PyRuntimeError::new_err(format!("ins files (packed): {}", e)))?;
+            }
+        }
+
+        if tail > 0 {
+            let group = placeholder_group(COLS);
+            let mut sql = String::with_capacity(48 + group.len() * tail);
+            sql.push_str("INSERT INTO files(dir_id, name_id, ext_id, uid, size) VALUES ");
+            for i in 0..tail {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&group);
+            }
+            let mut stmt = tx
+                .prepare(&sql)
+                .map_err(|e| PyRuntimeError::new_err(format!("prep files tail: {}", e)))?;
+            binds.clear();
+            for _ in 0..tail {
+                let r = unsafe { rows.get_unchecked(row_idx) };
+                binds.push(r.dir_id);
+                binds.push(r.name_id);
+                binds.push(r.ext_id);
+                binds.push(r.uid);
+                binds.push(r.size);
+                row_idx += 1;
+            }
+            stmt.execute(params_from_iter(binds.iter()))
+                .map_err(|e| PyRuntimeError::new_err(format!("ins files (tail): {}", e)))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| PyRuntimeError::new_err(format!("commit files: {}", e)))?;
     handle.files_inserted += len as i64;
     Ok(())
 }
