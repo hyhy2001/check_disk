@@ -44,7 +44,7 @@ const TREEMAP_DDL: &str = "
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT
-) WITHOUT ROWID;
+);
 
 -- DIR segment dictionary. Lives in treemap.db only — referenced by tm.dirs
 -- for path reconstruction. File basenames have their own table in detail.db
@@ -82,7 +82,7 @@ const DETAIL_DDL: &str = "
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
   value TEXT
-) WITHOUT ROWID;
+);
 
 CREATE TABLE users (
   uid               INTEGER PRIMARY KEY,
@@ -127,7 +127,7 @@ CREATE TABLE top_files (
   file_id INTEGER NOT NULL,
   size    INTEGER NOT NULL,
   PRIMARY KEY (uid, rank)
-) WITHOUT ROWID;
+);
 
 CREATE TABLE dir_user_size (
   uid    INTEGER NOT NULL,
@@ -135,7 +135,7 @@ CREATE TABLE dir_user_size (
   size   INTEGER NOT NULL,
   files  INTEGER NOT NULL,
   PRIMARY KEY (uid, dir_id)
-) WITHOUT ROWID;
+);
 ";
 
 const DETAIL_INDEX_DDL: &str = "
