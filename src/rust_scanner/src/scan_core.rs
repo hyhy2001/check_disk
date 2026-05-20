@@ -1,11 +1,12 @@
 use dashmap::DashSet;
-use ignore::{WalkBuilder, WalkState};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -106,16 +107,47 @@ pub(crate) fn run_scan_core(
         }
         let _done_guard = DoneGuard(d_clone.clone());
 
-        WalkBuilder::new(&dir_clone)
-            .hidden(false)
-            .ignore(false)
-            .git_ignore(false)
-            .git_exclude(false)
-            .git_global(false)
-            .threads(threads_count)
-            .build_parallel()
-            .run(|| {
-                let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
+        // ─── Bounded-queue parallel walker ─────────────────────────
+        // Replaces ignore::WalkBuilder. Caps queue at 200K dirs to
+        // bound RAM (was ~6 GB unbounded internal queue → ~40 MB now).
+        // Workers fall back to inline DFS via local Vec stack when
+        // the shared channel is full — no blocking, no deadlock.
+        const QUEUE_CAP: usize = 200_000;
+        let (tx, rx) = bounded::<PathBuf>(QUEUE_CAP);
+        let rx = Arc::new(rx);
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Seed root dir
+        let _ = tx.send(PathBuf::from(&dir_clone));
+
+        let mut handles = Vec::with_capacity(threads_count);
+        for _ in 0..threads_count {
+            let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
+            let tx_w: Sender<PathBuf> = tx.clone();
+            let rx_w = Arc::clone(&rx);
+            let active_w = Arc::clone(&active_count);
+            let shutdown_w = Arc::clone(&shutdown);
+
+            // Per-worker Arc clones (same as WalkBuilder factory)
+            let g_w = g_clone.clone();
+            let pf_w = pf_clone.clone();
+            let pd_w = pd_clone.clone();
+            let ps_w = ps_clone.clone();
+            let tmpdir_w = tmpdir_clone.clone();
+            let target_uids_w = target_uids_shared.clone();
+            let pm_w = pm_clone.clone();
+            let pp_w = pp_clone.clone();
+            let pfns_w = pfns_clone.clone();
+            let pfb_w = pfb_clone.clone();
+            let pfc_w = pfc_clone.clone();
+            let ph_w = ph_clone.clone();
+            let pmaxr_w = pmaxr_clone.clone();
+            let pmaxb_w = pmaxb_clone.clone();
+            let skips_w = skips.clone();
+            let hardlinks_w = hardlink_inodes.clone();
+
+            handles.push(thread::spawn(move || {
                 let mut state = ThreadLocalState {
                     t_files: 0,
                     t_dirs: 0,
@@ -129,205 +161,93 @@ pub(crate) fn run_scan_core(
                         .collect(),
                     t_event_buf_records: vec![0; ThreadLocalState::EVENT_BUCKETS],
                     t_event_flush_count: 0,
-                    event_bin_writers: (0..ThreadLocalState::EVENT_BUCKETS).map(|_| None).collect(),
+                    event_bin_writers: (0..ThreadLocalState::EVENT_BUCKETS)
+                        .map(|_| None)
+                        .collect(),
                     t_perm_issues: 0,
-                    global_stats: g_clone.clone(),
-                    prog_files: pf_clone.clone(),
-                    prog_dirs: pd_clone.clone(),
-                    prog_size: ps_clone.clone(),
+                    global_stats: g_w,
+                    prog_files: pf_w,
+                    prog_dirs: pd_w,
+                    prog_size: ps_w,
                     pending_prog_files: 0,
                     pending_prog_dirs: 0,
                     pending_prog_size: 0,
-                    tmpdir: tmpdir_clone.clone(),
-                    target_uids: (*target_uids_shared).clone(),
+                    tmpdir: tmpdir_w,
+                    target_uids: (*target_uids_w).clone(),
                     thread_id: tid,
                     profile_enabled: debug,
-                    prof_metadata_ns: pm_clone.clone(),
-                    prof_path_ns: pp_clone.clone(),
-                    prof_flush_ns: pfns_clone.clone(),
-                    prof_flush_bytes: pfb_clone.clone(),
-                    prof_flush_count: pfc_clone.clone(),
-                    prof_hardlink_checks: ph_clone.clone(),
-                    prof_max_event_buf_records: pmaxr_clone.clone(),
-                    prof_max_event_buf_bytes: pmaxb_clone.clone(),
+                    prof_metadata_ns: pm_w,
+                    prof_path_ns: pp_w,
+                    prof_flush_ns: pfns_w,
+                    prof_flush_bytes: pfb_w,
+                    prof_flush_count: pfc_w,
+                    prof_hardlink_checks: ph_w,
+                    prof_max_event_buf_records: pmaxr_w,
+                    prof_max_event_buf_bytes: pmaxb_w,
                     perm_writer: None,
                     dir_agg_writer: None,
                 };
-                let skips = skips.clone();
-                let hardlinks_shared = hardlink_inodes.clone();
 
-                Box::new(move |entry_res| {
-                    // --- Error entry: record as permission issue ---
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(err) => {
-                            let err_str = err.to_string();
-                            // ignore::Error formats as: "/path/to/dir: Permission denied (os error 13)"
-                            let path_str = err_str
-                                .find(": ")
-                                .map(|idx| err_str[..idx].to_string())
-                                .unwrap_or_default();
-
-                            state.t_perm_issues += 1;
-                            state.flush_permission_issue(
-                                &path_str,
-                                "directory",
-                                error_code_from_message(&err_str),
-                            );
-                            return WalkState::Continue;
-                        }
+                loop {
+                    if shutdown_w.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let dir_path = match rx_w.recv_timeout(Duration::from_millis(5)) {
+                        Ok(p) => p,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
                     };
 
-                    let path = entry.path();
+                    active_w.fetch_add(1, Ordering::AcqRel);
+                    process_dir_inline(
+                        dir_path,
+                        &tx_w,
+                        &mut state,
+                        &hardlinks_w,
+                        &skips_w,
+                        root_dev,
+                        debug,
+                    );
+                    let prev = active_w.fetch_sub(1, Ordering::AcqRel);
 
-                    // --- Configured skip_dirs (prefix match — prunes whole subtree) ---
-                    for s in &skips {
-                        if path.starts_with(s) {
-                            return WalkState::Skip;
-                        }
-                    }
-
-                    let ft = match entry.file_type() {
-                        Some(f) => f,
-                        None => return WalkState::Continue,
-                    };
-
-                    if ft.is_symlink() {
-                        state.t_inodes += 1;
-                        return WalkState::Continue;
-                    }
-
-                    if ft.is_dir() {
-                        // --- Name-based skip (critical_skip_dirs) ---
-                        if let Some(name) = path.file_name() {
-                            let name_str = name.to_string_lossy();
-                            if CRITICAL_SKIP_NAMES.contains(&name_str.as_ref()) {
-                                return WalkState::Skip;
-                            }
-                        }
-
-                        // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
-                        // We previously also kept a DashSet<(ino, dev)> of every
-                        // visited dir to break loops, but at 7M+ entries it cost
-                        // ~25% wall time to cache-miss into and only ever fired
-                        // once per scan in practice (POSIX forbids same-device
-                        // hardlinked dirs; ignore::WalkBuilder doesn't follow
-                        // symlinks by default; bind-mounts cross devices and
-                        // are already caught below).
-                        let meta_start = debug.then(Instant::now);
-                        if let Ok(meta) = entry.metadata() {
-                            if let Some(start) = meta_start {
-                                state.prof_metadata_ns.fetch_add(
-                                    start.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
-                            }
-                            if let Some(rdev) = root_dev {
-                                if meta.dev() != rdev {
-                                    return WalkState::Skip;
-                                }
-                            }
-                        } else if let Some(start) = meta_start {
-                            state.prof_metadata_ns.fetch_add(
-                                start.elapsed().as_nanos() as u64,
-                                Ordering::Relaxed,
-                            );
-                        }
-
-                        state.t_dirs += 1;
-                        state.t_inodes += 1;
-                        state.add_progress(0, 1, 0);
-                    } else if ft.is_file() {
-                        let meta_start = debug.then(Instant::now);
-                        let meta = match entry.metadata() {
-                            Ok(m) => {
-                                if let Some(start) = meta_start {
-                                    state.prof_metadata_ns.fetch_add(
-                                        start.elapsed().as_nanos() as u64,
-                                        Ordering::Relaxed,
+                    // Termination protocol: last active worker drains
+                    // remaining items, then signals shutdown if empty.
+                    if prev == 1 {
+                        loop {
+                            match rx_w.try_recv() {
+                                Ok(extra) => {
+                                    active_w.fetch_add(1, Ordering::AcqRel);
+                                    process_dir_inline(
+                                        extra,
+                                        &tx_w,
+                                        &mut state,
+                                        &hardlinks_w,
+                                        &skips_w,
+                                        root_dev,
+                                        debug,
                                     );
+                                    let p2 = active_w.fetch_sub(1, Ordering::AcqRel);
+                                    if p2 != 1 {
+                                        break;
+                                    }
                                 }
-                                m
-                            }
-                            Err(e) => {
-                                if let Some(start) = meta_start {
-                                    state.prof_metadata_ns.fetch_add(
-                                        start.elapsed().as_nanos() as u64,
-                                        Ordering::Relaxed,
-                                    );
+                                Err(_) => {
+                                    shutdown_w.store(true, Ordering::SeqCst);
+                                    break;
                                 }
-                                state.t_perm_issues += 1;
-                                let path_str = path.to_string_lossy().into_owned();
-                                state.flush_permission_issue(
-                                    &path_str,
-                                    "file",
-                                    error_code_from_message(&e.to_string()),
-                                );
-                                return WalkState::Continue;
-                            }
-                        };
-
-                        // --- Hard-link deduplication ---
-                        if meta.nlink() > 1 {
-                            if debug {
-                                state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
-                            }
-                            let key = (meta.ino(), meta.dev());
-                            if !hardlinks_shared.insert(key) {
-                                return WalkState::Continue;
                             }
                         }
-
-                        // st_blocks * 512 = actual on-disk bytes, same as Python legacy
-                        let size = meta.blocks() * 512;
-                        let uid = meta.uid();
-                        let is_target = match &state.target_uids {
-                            Some(set) => set.contains(&uid),
-                            None => true,
-                        };
-
-                        state.t_files += 1;
-                        state.t_inodes += 1;
-                        state.t_size += size;
-
-                        if is_target {
-                            *state.t_uid_sizes.entry(uid).or_insert(0) += size;
-                            *state.t_uid_files.entry(uid).or_insert(0) += 1;
-                            let path_start = debug.then(Instant::now);
-                            let path_owned = path.to_string_lossy();
-                            let path_str = path_owned.as_ref();
-                            if let Some(start) = path_start {
-                                state.prof_path_ns.fetch_add(
-                                    start.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                );
-                            }
-                            state.push_event_binary(1, uid, size, path_str);
-                            state.add_dir_size(uid, size, path_str);
-                            let total_records = state.event_records();
-                            let total_bytes = state.event_buffer_bytes();
-                            if debug {
-                                state
-                                    .prof_max_event_buf_records
-                                    .fetch_max(total_records as u64, Ordering::Relaxed);
-                                state
-                                    .prof_max_event_buf_bytes
-                                    .fetch_max(total_bytes as u64, Ordering::Relaxed);
-                            }
-                            if total_records >= SCAN_EVENT_FLUSH_THRESHOLD
-                                || total_bytes >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
-                            {
-                                state.flush_events();
-                            }
-                        }
-
-                        // Progress tracking
-                        state.add_progress(1, 0, size);
                     }
+                }
+                // state drops here → ThreadLocalState::drop() flushes all buffers
+            }));
+        }
+        drop(tx); // Main thread drops its sender
 
-                    WalkState::Continue
-                })
-            });
+        // Join all workers
+        for h in handles {
+            let _ = h.join();
+        }
 
         // The DoneGuard above already flips `done` on drop; this explicit
         // store is redundant but harmless and keeps the happy-path obvious.
@@ -428,4 +348,169 @@ pub(crate) fn run_scan_core(
     }
 
     Ok(result.into())
+}
+
+#[inline]
+fn record_metadata_ns(state: &mut ThreadLocalState, start: Option<Instant>, debug: bool) {
+    if debug {
+        if let Some(s) = start {
+            state
+                .prof_metadata_ns
+                .fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+#[inline]
+fn record_path_ns(state: &mut ThreadLocalState, start: Option<Instant>, debug: bool) {
+    if debug {
+        if let Some(s) = start {
+            state
+                .prof_path_ns
+                .fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+fn process_dir_inline(
+    root: std::path::PathBuf,
+    tx: &crossbeam_channel::Sender<std::path::PathBuf>,
+    state: &mut ThreadLocalState,
+    hardlinks: &Arc<DashSet<(u64, u64)>>,
+    skips: &[String],
+    root_dev: Option<u64>,
+    debug: bool,
+) {
+    let mut stack: Vec<std::path::PathBuf> = vec![root];
+    while let Some(dir_path) = stack.pop() {
+        let read_iter = match fs::read_dir(&dir_path) {
+            Ok(it) => it,
+            Err(e) => {
+                state.t_perm_issues += 1;
+                state.flush_permission_issue(
+                    &dir_path.to_string_lossy(),
+                    "directory",
+                    error_code_from_message(&e.to_string()),
+                );
+                continue;
+            }
+        };
+        'entry: for entry_res in read_iter {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(e) => {
+                    state.t_perm_issues += 1;
+                    state.flush_permission_issue(
+                        &dir_path.to_string_lossy(),
+                        "directory",
+                        error_code_from_message(&e.to_string()),
+                    );
+                    continue;
+                }
+            };
+            let path = entry.path();
+
+            for s in skips {
+                if path.starts_with(s) {
+                    continue 'entry;
+                }
+            }
+
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            if ft.is_symlink() {
+                state.t_inodes += 1;
+                continue;
+            }
+
+            let meta_start = debug.then(Instant::now);
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    record_metadata_ns(state, meta_start, debug);
+                    state.t_perm_issues += 1;
+                    state.flush_permission_issue(
+                        &path.to_string_lossy(),
+                        "file",
+                        error_code_from_message(&e.to_string()),
+                    );
+                    continue;
+                }
+            };
+            record_metadata_ns(state, meta_start, debug);
+
+            if ft.is_dir() {
+                if let Some(name) = path.file_name() {
+                    if CRITICAL_SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
+                        continue;
+                    }
+                }
+                if let Some(rdev) = root_dev {
+                    if meta.dev() != rdev {
+                        continue;
+                    }
+                }
+
+                state.t_dirs += 1;
+                state.t_inodes += 1;
+                state.add_progress(0, 1, 0);
+
+                match tx.try_send(path.clone()) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        stack.push(path);
+                    }
+                }
+            } else if ft.is_file() {
+                if meta.nlink() > 1 {
+                    if debug {
+                        state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !hardlinks.insert((meta.ino(), meta.dev())) {
+                        continue;
+                    }
+                }
+
+                let size = meta.blocks() * 512;
+                let uid = meta.uid();
+                let is_target = match state.target_uids.as_ref() {
+                    Some(s) => s.contains(&uid),
+                    None => true,
+                };
+
+                state.t_files += 1;
+                state.t_inodes += 1;
+                state.t_size += size;
+
+                if is_target {
+                    *state.t_uid_sizes.entry(uid).or_insert(0) += size;
+                    *state.t_uid_files.entry(uid).or_insert(0) += 1;
+                    let path_start = debug.then(Instant::now);
+                    let path_str = path.to_string_lossy();
+                    record_path_ns(state, path_start, debug);
+                    state.push_event_binary(1, uid, size, path_str.as_ref());
+                    state.add_dir_size(uid, size, path_str.as_ref());
+                    let recs = state.event_records();
+                    let bytes = state.event_buffer_bytes();
+                    if debug {
+                        state
+                            .prof_max_event_buf_records
+                            .fetch_max(recs as u64, Ordering::Relaxed);
+                        state
+                            .prof_max_event_buf_bytes
+                            .fetch_max(bytes as u64, Ordering::Relaxed);
+                    }
+                    if recs >= SCAN_EVENT_FLUSH_THRESHOLD
+                        || bytes >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
+                    {
+                        state.flush_events();
+                    }
+                }
+                state.add_progress(1, 0, size);
+            }
+        }
+    }
 }
