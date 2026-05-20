@@ -862,6 +862,8 @@ pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
         std::thread::spawn(move || -> Result<(String, f64), String> {
             let conn = Connection::open(&path)
                 .map_err(|e| format!("detail idx {} open {}: {}", idx_name, path.display(), e))?;
+            conn.busy_timeout(std::time::Duration::from_secs(600))
+                .map_err(|e| format!("detail idx {} busy_timeout: {}", idx_name, e))?;
             conn.pragma_update(None, "journal_mode", "OFF")
                 .map_err(|e| format!("detail idx {} pragma journal_mode: {}", idx_name, e))?;
             conn.pragma_update(None, "synchronous", "OFF")
@@ -882,6 +884,9 @@ pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
     let main_conn = Connection::open(&build_path).map_err(|e| {
         PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size open {}: {}", build_path.display(), e))
     })?;
+    main_conn
+        .busy_timeout(std::time::Duration::from_secs(600))
+        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size busy_timeout: {}", e)))?;
     main_conn
         .pragma_update(None, "journal_mode", "OFF")
         .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size pragma journal_mode: {}", e)))?;
