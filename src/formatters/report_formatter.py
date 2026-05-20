@@ -200,30 +200,22 @@ class ReportFormatter(BaseFormatter):
         top: int = 30,
         *,
         not_found_reason: Optional[str] = None,
+        search: str = "",
     ) -> None:
-        """Render dir + file detail reports for a single user.
-
-        Args:
-            user:        username (display only)
-            dir_report:  directory breakdown dict, or None when no data
-            file_report: file breakdown dict, or None when no data
-            top:         truncate breakdown tables to this many rows
-            not_found_reason: optional message displayed verbatim when both
-                reports are None — used to explain WHY (no DB / unknown
-                user / user has no files) instead of the previous opaque
-                "[dir detail report not found]".
-        """
         print("\n" + "=" * 60)
         print(f"DETAIL REPORT - {user}")
         print("=" * 60)
 
-        # Both reports None → display the explanatory reason and bail out.
         if dir_report is None and file_report is None:
             if not_found_reason:
                 print(f"  {not_found_reason}")
             else:
                 print(f"  No data found for user '{user}'.")
             return
+
+        kw = search.lower() if search else ""
+        if search:
+            print(f"Search: '{search}'  (>>> = match)")
 
         # --- Directory breakdown ---
         if dir_report:
@@ -238,10 +230,15 @@ class ReportFormatter(BaseFormatter):
             display_dirs = dirs[:top]
             if display_dirs:
                 headers = ["Directory", "Used"]
-                rows = [[d['path'], format_size(d['used'])] for d in display_dirs]
+                rows = [
+                    [
+                        f">>> {d['path']}" if kw and kw in d['path'].lower() else d['path'],
+                        format_size(d['used']),
+                    ]
+                    for d in display_dirs
+                ]
                 title = f"Directory Breakdown (top {len(display_dirs)} of {total_dirs:,})"
-                table = self.table_formatter.format_table(headers, rows, title=title)
-                print("\n" + table)
+                print("\n" + self.table_formatter.format_table(headers, rows, title=title))
             else:
                 print("  (no directory data)")
         else:
@@ -258,10 +255,15 @@ class ReportFormatter(BaseFormatter):
             display = files_sorted[:top]
             if display:
                 headers = ["File", "Size"]
-                rows = [[f['path'], format_size(f['size'])] for f in display]
+                rows = [
+                    [
+                        f">>> {f['path']}" if kw and kw in f['path'].lower() else f['path'],
+                        format_size(f['size']),
+                    ]
+                    for f in display
+                ]
                 title = f"Largest Files (top {len(display)} of {total_files:,})"
-                table = self.table_formatter.format_table(headers, rows, title=title)
-                print("\n" + table)
+                print("\n" + self.table_formatter.format_table(headers, rows, title=title))
             else:
                 print("  (no file data)")
         else:
@@ -279,6 +281,7 @@ class ReportFormatter(BaseFormatter):
         tree_path: str = "",
         tree_level: int = 3,
         tree_limit: int = 20,
+        search: str = "",
     ) -> None:
         """Load and render detail reports for multiple users from SQLite.
 
@@ -328,18 +331,18 @@ class ReportFormatter(BaseFormatter):
 
                 # Route by type_filter
                 if type_filter == "permission":
-                    perm = self._load_user_permissions(output_dir, user, top)
-                    self._display_permission_section(user, perm)
+                    perm = self._load_user_permissions(output_dir, user, top, search=search)
+                    self._display_permission_section(user, perm, search=search)
                     continue
 
                 if type_filter == "inode":
-                    inode = self._load_user_inodes(conn, user, top)
-                    self._display_inode_section(user, inode)
+                    inode = self._load_user_inodes(conn, user, top, search=search)
+                    self._display_inode_section(user, inode, search=search)
                     continue
 
                 # report / dirs / files all use detail_user_report rendering
-                dir_data = self._load_user_dirs(conn, user, top) if type_filter in ("report", "dirs") else None
-                file_data = self._load_user_files(conn, user, top) if type_filter in ("report", "files") else None
+                dir_data = self._load_user_dirs(conn, user, top, search=search) if type_filter in ("report", "dirs") else None
+                file_data = self._load_user_files(conn, user, top, search=search) if type_filter in ("report", "files") else None
                 if (
                     dir_data
                     and file_data
@@ -354,7 +357,7 @@ class ReportFormatter(BaseFormatter):
                         user, None, None, top, not_found_reason=reason
                     )
                     continue
-                self.display_user_detail_report(user, dir_data, file_data, top)
+                self.display_user_detail_report(user, dir_data, file_data, top, search=search)
         finally:
             conn.close()
 
@@ -460,7 +463,7 @@ class ReportFormatter(BaseFormatter):
         return "/" + joined.lstrip("/").lstrip("/")
 
     def _load_user_dirs(
-        self, conn: sqlite3.Connection, user: str, top: int
+        self, conn: sqlite3.Connection, user: str, top: int, search: str = ""
     ) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             "SELECT uid, total_dirs, total_files, total_size FROM users WHERE username = ?",
@@ -472,21 +475,23 @@ class ReportFormatter(BaseFormatter):
         scan_root = self._meta_get(conn, "scan_root")
         scan_ts = int(self._meta_get(conn, "scan_timestamp") or 0)
 
-        # Always pull dir_user_size — it lives in detail.db, no ATTACH needed.
-        # If treemap.db is also attached, we get human-readable paths via
-        # recursive CTE; otherwise we fall back to "<dir id N>" labels so
-        # the breakdown still appears (rather than silently disappearing
-        # when a scan was run without --tree-map).
         has_tm = self._has_treemap(conn)
+        kw = search.lower() if search else ""
+        # Load more rows when searching so we can post-filter to top N
+        fetch_limit = top * 5 if kw else top
         dirs: List[Dict[str, Any]] = []
         cursor = conn.execute(
             "SELECT dir_id, size FROM dir_user_size "
             "WHERE uid = ? ORDER BY size DESC LIMIT ?",
-            (uid, top),
+            (uid, fetch_limit),
         )
         for dir_id, size in cursor:
             path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
+            if kw and kw not in path.lower():
+                continue
             dirs.append({"path": path, "used": int(size)})
+            if len(dirs) >= top:
+                break
         return {
             "date": scan_ts,
             "user": user,
@@ -498,7 +503,7 @@ class ReportFormatter(BaseFormatter):
         }
 
     def _load_user_files(
-        self, conn: sqlite3.Connection, user: str, top: int
+        self, conn: sqlite3.Connection, user: str, top: int, search: str = ""
     ) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             "SELECT uid, total_files, total_size FROM users WHERE username = ?",
@@ -512,6 +517,10 @@ class ReportFormatter(BaseFormatter):
 
         files: List[Dict[str, Any]] = []
         has_tm = self._has_treemap(conn)
+        kw = search.lower() if search else ""
+        # Top_files only stores top-K per user; if filtering, expand the
+        # rank window so we still find matches further down.
+        rank_limit = top * 5 if kw else top
         cursor = conn.execute(
             """
             SELECT f.dir_id, n.name, e.ext, t.size
@@ -522,12 +531,16 @@ class ReportFormatter(BaseFormatter):
              WHERE t.uid = ? AND t.rank <= ?
              ORDER BY t.rank
             """,
-            (uid, top),
+            (uid, rank_limit),
         )
         for dir_id, basename, ext, size in cursor:
             parent = self._build_path(conn, dir_id) if has_tm else ""
             full_path = f"{parent.rstrip('/')}/{basename}" if parent else basename
+            if kw and kw not in full_path.lower():
+                continue
             files.append({"path": full_path, "size": int(size), "ext": ext or ""})
+            if len(files) >= top:
+                break
         return {
             "date": scan_ts,
             "user": user,
@@ -550,7 +563,7 @@ class ReportFormatter(BaseFormatter):
     # ------------------------------------------------------------------ #
 
     def _load_user_inodes(
-        self, conn: sqlite3.Connection, user: str, top: int
+        self, conn: sqlite3.Connection, user: str, top: int, search: str = ""
     ) -> Optional[Dict[str, Any]]:
         """Load per-directory file count (inode) breakdown for a user."""
         row = conn.execute(
@@ -564,15 +577,21 @@ class ReportFormatter(BaseFormatter):
         scan_ts = int(self._meta_get(conn, "scan_timestamp") or 0)
         has_tm = self._has_treemap(conn)
 
+        kw = search.lower() if search else ""
+        fetch_limit = top * 5 if kw else top
         dirs: List[Dict[str, Any]] = []
         cursor = conn.execute(
             "SELECT dir_id, files, size FROM dir_user_size "
             "WHERE uid = ? ORDER BY files DESC LIMIT ?",
-            (uid, top),
+            (uid, fetch_limit),
         )
         for dir_id, files, size in cursor:
             path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
+            if kw and kw not in path.lower():
+                continue
             dirs.append({"path": path, "files": int(files), "size": int(size)})
+            if len(dirs) >= top:
+                break
         return {
             "date": scan_ts,
             "user": user,
@@ -584,7 +603,7 @@ class ReportFormatter(BaseFormatter):
 
     @staticmethod
     def _load_user_permissions(
-        output_dir: str, user: str, top: int
+        output_dir: str, user: str, top: int, search: str = ""
     ) -> Optional[Dict[str, Any]]:
         """Load permission issues for a user from permission_issues.db."""
         perm_db = os.path.join(output_dir, PERMISSION_ISSUES_DB_FILENAME)
@@ -593,15 +612,28 @@ class ReportFormatter(BaseFormatter):
         try:
             conn = sqlite3.connect(f"file:{perm_db}?mode=ro", uri=True)
             try:
-                total_row = conn.execute(
-                    "SELECT COUNT(*) FROM issues WHERE user = ?", (user,)
-                ).fetchone()
-                total = int(total_row[0]) if total_row else 0
-                rows = conn.execute(
-                    "SELECT item_type, error, path FROM issues "
-                    "WHERE user = ? ORDER BY id LIMIT ?",
-                    (user, top),
-                ).fetchall()
+                if search:
+                    pattern = f"%{search}%"
+                    total_row = conn.execute(
+                        "SELECT COUNT(*) FROM issues WHERE user = ? AND path LIKE ? COLLATE NOCASE",
+                        (user, pattern),
+                    ).fetchone()
+                    total = int(total_row[0]) if total_row else 0
+                    rows = conn.execute(
+                        "SELECT item_type, error, path FROM issues "
+                        "WHERE user = ? AND path LIKE ? COLLATE NOCASE ORDER BY id LIMIT ?",
+                        (user, pattern, top),
+                    ).fetchall()
+                else:
+                    total_row = conn.execute(
+                        "SELECT COUNT(*) FROM issues WHERE user = ?", (user,)
+                    ).fetchone()
+                    total = int(total_row[0]) if total_row else 0
+                    rows = conn.execute(
+                        "SELECT item_type, error, path FROM issues "
+                        "WHERE user = ? ORDER BY id LIMIT ?",
+                        (user, top),
+                    ).fetchall()
             finally:
                 conn.close()
         except sqlite3.DatabaseError:
@@ -612,7 +644,7 @@ class ReportFormatter(BaseFormatter):
         }
 
     def _display_inode_section(
-        self, user: str, data: Optional[Dict[str, Any]]
+        self, user: str, data: Optional[Dict[str, Any]], search: str = ""
     ) -> None:
         print("\n" + "=" * 60)
         print(f"INODE REPORT - {user}")
@@ -622,11 +654,18 @@ class ReportFormatter(BaseFormatter):
             return
         print(f"Total files : {data['total_files']:,}")
         print(f"Total dirs  : {data['total_dirs']:,}")
+        if search:
+            print(f"Search: '{search}'  (>>> = match)")
         dirs = data.get("dirs", [])
         if dirs:
+            kw = search.lower() if search else ""
             headers = ["Directory", "Files", "Size"]
             rows = [
-                [d["path"], f"{d['files']:,}", format_size(d["size"])]
+                [
+                    f">>> {d['path']}" if kw and kw in d["path"].lower() else d["path"],
+                    f"{d['files']:,}",
+                    format_size(d["size"]),
+                ]
                 for d in dirs
             ]
             title = f"Directory File Count (top {len(dirs):,} of {data['total_dirs']:,})"
@@ -635,7 +674,7 @@ class ReportFormatter(BaseFormatter):
             print("  (no directory data)")
 
     def _display_permission_section(
-        self, user: str, data: Optional[Dict[str, Any]]
+        self, user: str, data: Optional[Dict[str, Any]], search: str = ""
     ) -> None:
         print("\n" + "=" * 60)
         print(f"PERMISSION REPORT - {user}")
@@ -646,9 +685,19 @@ class ReportFormatter(BaseFormatter):
         total = data.get("total", 0)
         issues = data.get("issues", [])
         print(f"Total permission issues: {total:,}")
+        if search:
+            print(f"Search: '{search}'  (>>> = match)")
         if issues:
+            kw = search.lower() if search else ""
             headers = ["Type", "Error", "Path"]
-            rows = [[i["type"], i["error"], i["path"]] for i in issues]
+            rows = [
+                [
+                    i["type"],
+                    i["error"],
+                    f">>> {i['path']}" if kw and kw in i["path"].lower() else i["path"],
+                ]
+                for i in issues
+            ]
             title = f"Permission Issues (top {len(issues):,} of {total:,})"
             print("\n" + self.table_formatter.format_table(headers, rows, title=title))
         else:

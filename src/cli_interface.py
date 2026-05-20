@@ -248,6 +248,7 @@ class CLIInterface:
         tree_path: str = "",
         tree_level: int = 3,
         tree_limit: int = 20,
+        search: str = "",
     ) -> None:
         """Display per-user detail reports from the generated SQLite database."""
         if prefix:
@@ -274,6 +275,7 @@ class CLIInterface:
             tree_path=tree_path,
             tree_level=tree_level,
             tree_limit=tree_limit,
+            search=search,
         )
 
     def display_tree_show(

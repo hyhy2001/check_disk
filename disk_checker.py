@@ -152,6 +152,7 @@ def cmd_detail(args, cli: CLIInterface) -> None:
     tree_path = getattr(args, "path", "") or ""
     tree_level = max(1, int(getattr(args, "level", 3) or 3))
     tree_limit = max(1, int(getattr(args, "limit", 20) or 20))
+    search = getattr(args, "search", "") or ""
     cli.display_check_users(
         users,
         prefix=prefix,
@@ -161,6 +162,7 @@ def cmd_detail(args, cli: CLIInterface) -> None:
         tree_path=tree_path,
         tree_level=tree_level,
         tree_limit=tree_limit,
+        search=search,
     )
 
 
