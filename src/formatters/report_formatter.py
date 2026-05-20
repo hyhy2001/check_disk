@@ -6,7 +6,9 @@ Contains the ReportFormatter class for formatting and displaying reports.
 
 import json
 import os
+import re
 import sqlite3
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..constants import (
@@ -32,6 +34,35 @@ class ReportFormatter(BaseFormatter):
         self.table_formatter = TableFormatter()
         self.config_display = ConfigDisplay()
         self.report_comparison = ReportComparison()
+        # ANSI color codes for highlighting search matches (bold yellow on
+        # default background). Disabled when stdout is not a TTY (piped output)
+        # or when NO_COLOR env var is set, per https://no-color.org/.
+        self._color_on = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        self._hl_open = "\033[1;33m" if self._color_on else ""
+        self._hl_close = "\033[0m" if self._color_on else ""
+
+    def _apply_search_highlight(self, text: str, keyword: str) -> str:
+        """Wrap occurrences of keyword in `text` with ANSI color codes
+        (case-insensitive). Returns text unchanged if color is disabled or
+        keyword is empty.
+        """
+        if not keyword or not self._color_on or not text:
+            return text
+        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+        return pattern.sub(
+            lambda m: f"{self._hl_open}{m.group(0)}{self._hl_close}",
+            text,
+        )
+
+    def _colorize_table(self, table_text: str, keyword: str) -> str:
+        """Colorize all occurrences of keyword in a pre-formatted table.
+
+        Apply AFTER `format_table` so column widths are calculated against
+        plain text. ANSI codes are inserted via regex replace post-hoc.
+        """
+        if not keyword or not self._color_on:
+            return table_text
+        return self._apply_search_highlight(table_text, keyword)
 
     def display_report_summary(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
         """Display a summary of a disk usage report."""
@@ -215,7 +246,7 @@ class ReportFormatter(BaseFormatter):
 
         kw = search.lower() if search else ""
         if search:
-            print(f"Search: '{search}'  (>>> = match)")
+            print(f"Search: '{search}'")
 
         # --- Directory breakdown ---
         if dir_report:
@@ -230,15 +261,10 @@ class ReportFormatter(BaseFormatter):
             display_dirs = dirs[:top]
             if display_dirs:
                 headers = ["Directory", "Used"]
-                rows = [
-                    [
-                        f">>> {d['path']}" if kw and kw in d['path'].lower() else d['path'],
-                        format_size(d['used']),
-                    ]
-                    for d in display_dirs
-                ]
+                rows = [[d['path'], format_size(d['used'])] for d in display_dirs]
                 title = f"Directory Breakdown (top {len(display_dirs)} of {total_dirs:,})"
-                print("\n" + self.table_formatter.format_table(headers, rows, title=title))
+                table = self.table_formatter.format_table(headers, rows, title=title)
+                print("\n" + self._colorize_table(table, search))
             else:
                 print("  (no directory data)")
         else:
@@ -255,15 +281,10 @@ class ReportFormatter(BaseFormatter):
             display = files_sorted[:top]
             if display:
                 headers = ["File", "Size"]
-                rows = [
-                    [
-                        f">>> {f['path']}" if kw and kw in f['path'].lower() else f['path'],
-                        format_size(f['size']),
-                    ]
-                    for f in display
-                ]
+                rows = [[f['path'], format_size(f['size'])] for f in display]
                 title = f"Largest Files (top {len(display)} of {total_files:,})"
-                print("\n" + self.table_formatter.format_table(headers, rows, title=title))
+                table = self.table_formatter.format_table(headers, rows, title=title)
+                print("\n" + self._colorize_table(table, search))
             else:
                 print("  (no file data)")
         else:
@@ -655,21 +676,17 @@ class ReportFormatter(BaseFormatter):
         print(f"Total files : {data['total_files']:,}")
         print(f"Total dirs  : {data['total_dirs']:,}")
         if search:
-            print(f"Search: '{search}'  (>>> = match)")
+            print(f"Search: '{search}'")
         dirs = data.get("dirs", [])
         if dirs:
-            kw = search.lower() if search else ""
             headers = ["Directory", "Files", "Size"]
             rows = [
-                [
-                    f">>> {d['path']}" if kw and kw in d["path"].lower() else d["path"],
-                    f"{d['files']:,}",
-                    format_size(d["size"]),
-                ]
+                [d["path"], f"{d['files']:,}", format_size(d["size"])]
                 for d in dirs
             ]
             title = f"Directory File Count (top {len(dirs):,} of {data['total_dirs']:,})"
-            print("\n" + self.table_formatter.format_table(headers, rows, title=title))
+            table = self.table_formatter.format_table(headers, rows, title=title)
+            print("\n" + self._colorize_table(table, search))
         else:
             print("  (no directory data)")
 
@@ -686,20 +703,13 @@ class ReportFormatter(BaseFormatter):
         issues = data.get("issues", [])
         print(f"Total permission issues: {total:,}")
         if search:
-            print(f"Search: '{search}'  (>>> = match)")
+            print(f"Search: '{search}'")
         if issues:
-            kw = search.lower() if search else ""
             headers = ["Type", "Error", "Path"]
-            rows = [
-                [
-                    i["type"],
-                    i["error"],
-                    f">>> {i['path']}" if kw and kw in i["path"].lower() else i["path"],
-                ]
-                for i in issues
-            ]
+            rows = [[i["type"], i["error"], i["path"]] for i in issues]
             title = f"Permission Issues (top {len(issues):,} of {total:,})"
-            print("\n" + self.table_formatter.format_table(headers, rows, title=title))
+            table = self.table_formatter.format_table(headers, rows, title=title)
+            print("\n" + self._colorize_table(table, search))
         else:
             print("  No permission issues found for this user.")
 
@@ -809,7 +819,7 @@ class ReportFormatter(BaseFormatter):
         else:
             print(f"User '{user}': no files in this subtree")
         if search:
-            print(f"Search: '{search}'  (>>> = match)")
+            print(f"Search: '{search}'")
         print(f"Depth: {max_depth}  |  Limit: {limit} per level\n")
 
         self._render_tree_node(
@@ -866,16 +876,17 @@ class ReportFormatter(BaseFormatter):
             child_prefix = prefix + ("    " if is_last else "|   ")
 
             is_match = bool(kw_lower) and kw_lower in name.lower()
-            marker = ">>> " if is_match else ""
             size_str = format_size(int(user_size))
             info = f"  [{size_str}, {int(user_files):,} files]"
 
-            avail = tw - len(prefix) - len(connector) - len(marker) - len(info) - 1
+            avail = tw - len(prefix) - len(connector) - len(info) - 1
             if avail < 4:
                 avail = 4
             display_name = name if len(name) <= avail else (name[: max(1, avail - 2)] + "..")
+            if is_match:
+                display_name = self._apply_search_highlight(display_name, search)
 
-            print(f"{prefix}{connector}{marker}{display_name}{info}")
+            print(f"{prefix}{connector}{display_name}{info}")
 
             if dir_count > 0 and depth + 1 < max_depth:
                 self._render_tree_node(
@@ -1033,7 +1044,7 @@ class ReportFormatter(BaseFormatter):
         print("=" * 60)
         print(f"Root path: {start_str}")
         if search:
-            print(f"Search: '{search}'  (>>> = match)")
+            print(f"Search: '{search}'")
         print(f"Depth: {level}  |  Limit: {limit} per level\n")
 
         self._render_total_tree_node(
@@ -1085,15 +1096,16 @@ class ReportFormatter(BaseFormatter):
             child_prefix = prefix + ("    " if is_last else "|   ")
 
             is_match = bool(kw_lower) and kw_lower in name.lower()
-            marker = ">>> " if is_match else ""
             info = f"  [{format_size(int(total_size))}, {int(file_count):,} files]"
 
-            avail = tw - len(prefix) - len(connector) - len(marker) - len(info) - 1
+            avail = tw - len(prefix) - len(connector) - len(info) - 1
             if avail < 4:
                 avail = 4
             display_name = name if len(name) <= avail else (name[: max(1, avail - 2)] + "..")
+            if is_match:
+                display_name = self._apply_search_highlight(display_name, search)
 
-            print(f"{prefix}{connector}{marker}{display_name}{info}")
+            print(f"{prefix}{connector}{display_name}{info}")
 
             if dir_count > 0 and depth + 1 < max_depth:
                 self._render_total_tree_node(
