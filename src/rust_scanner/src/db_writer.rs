@@ -169,7 +169,6 @@ fn apply_build_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
     conn.pragma_update(None, "cache_size", -1_048_576i64)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
-    conn.pragma_update(None, "mmap_size", 8_589_934_592i64)?;
     Ok(())
 }
 
@@ -829,14 +828,6 @@ pub fn detail_set_meta(handle: &mut DetailBuildHandle, meta: &[(String, String)]
 }
 
 pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
-    // Boost cache for index build phase — reduces I/O during sort passes.
-    // Safe at this point: most in-memory aggregation structures have been
-    // freed; estimated live RSS ~8-10 GB leaving headroom for +3 GB cache.
-    handle
-        .conn
-        .pragma_update(None, "cache_size", -4_194_304i64)  // 4 GB
-        .map_err(|e| PyRuntimeError::new_err(format!("cache_size boost: {}", e)))?;
-
     handle
         .conn
         .execute_batch(DETAIL_INDEX_DDL)
