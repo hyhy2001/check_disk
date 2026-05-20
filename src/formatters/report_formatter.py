@@ -327,13 +327,6 @@ class ReportFormatter(BaseFormatter):
                     continue
 
                 # Route by type_filter
-                if type_filter == "tree-map":
-                    if not self._has_treemap(conn):
-                        print(f"\n  Tree-map requires treemap.db (run scan with --tree-map).")
-                        continue
-                    self.display_user_tree(conn, user, tree_path, tree_level, tree_limit)
-                    continue
-
                 if type_filter == "permission":
                     perm = self._load_user_permissions(output_dir, user, top)
                     self._display_permission_section(user, perm)
@@ -717,13 +710,17 @@ class ReportFormatter(BaseFormatter):
         start_path: str = "",
         max_depth: int = 3,
         limit: int = 20,
+        search: str = "",
+        visible_ids: Optional[set] = None,
     ) -> None:
         """Render an ASCII directory tree of the user's contribution under
         start_path, capped at max_depth levels and limit children per level.
+
+        If `search` is set and `visible_ids` is provided, only branches with
+        matching dirs are rendered; matching dirs are highlighted with `>>>`.
         """
         tw = max(40, int(getattr(self, "terminal_width", 80) or 80))
 
-        # Get user uid + totals
         row = conn.execute(
             "SELECT uid, total_size, total_files FROM users WHERE username = ?",
             (user,),
@@ -733,29 +730,25 @@ class ReportFormatter(BaseFormatter):
             return
         uid = row[0]
 
-        # Resolve start_path → dir_id
         start_id = self._find_dir_id_by_path(conn, start_path)
         if start_id is None:
             label = start_path or "<scan root>"
             print(f"\n  Path '{label}' not found in scan tree.")
             return
 
-        # Build full path display
         scan_root = self._meta_get(conn, "scan_root") or "/"
         if start_id == 0 or not start_path:
             start_path_str = scan_root
         else:
             start_path_str = self._build_path(conn, start_id) or scan_root
 
-        # Get user's contribution at start_id
         root_user = conn.execute(
             "SELECT size, files FROM dir_user_size WHERE uid = ? AND dir_id = ?",
             (uid, start_id),
         ).fetchone()
 
-        # Header
         print("\n" + "=" * 60)
-        print(f"TREE-MAP - {user}")
+        print(f"TREE-SHOW - {user}")
         print("=" * 60)
         print(f"Root path: {start_path_str}")
         if root_user:
@@ -766,10 +759,14 @@ class ReportFormatter(BaseFormatter):
             )
         else:
             print(f"User '{user}': no files in this subtree")
+        if search:
+            print(f"Search: '{search}'  (>>> = match)")
         print(f"Depth: {max_depth}  |  Limit: {limit} per level\n")
 
-        # Render
-        self._render_tree_node(conn, uid, start_id, "", 0, max_depth, limit, tw)
+        self._render_tree_node(
+            conn, uid, start_id, "", 0, max_depth, limit, tw,
+            search=search, visible_ids=visible_ids,
+        )
 
     def _render_tree_node(
         self,
@@ -781,12 +778,12 @@ class ReportFormatter(BaseFormatter):
         max_depth: int,
         limit: int,
         tw: int,
+        search: str = "",
+        visible_ids: Optional[set] = None,
     ) -> None:
         if depth >= max_depth:
             return
 
-        # Children where user has size > 0, ordered by user contribution.
-        # Fetch limit+1 to detect overflow.
         children = conn.execute(
             """
             SELECT d.id, n.name, d.dir_count,
@@ -804,31 +801,256 @@ class ReportFormatter(BaseFormatter):
             (uid, dir_id, limit + 1),
         ).fetchall()
 
+        # Filter by visible_ids when search is active.
+        if visible_ids is not None:
+            children = [c for c in children if c[0] in visible_ids]
+
         has_more = len(children) > limit
         if has_more:
             children = children[:limit]
 
+        kw_lower = search.lower() if search else ""
         n = len(children)
         for i, (cid, name, dir_count, user_size, user_files) in enumerate(children):
             is_last = (i == n - 1) and not has_more
             connector = "\\-- " if is_last else "|-- "
             child_prefix = prefix + ("    " if is_last else "|   ")
 
+            is_match = bool(kw_lower) and kw_lower in name.lower()
+            marker = ">>> " if is_match else ""
             size_str = format_size(int(user_size))
             info = f"  [{size_str}, {int(user_files):,} files]"
 
-            # Adapt name to terminal width
-            avail = tw - len(prefix) - len(connector) - len(info) - 1
+            avail = tw - len(prefix) - len(connector) - len(marker) - len(info) - 1
             if avail < 4:
                 avail = 4
             display_name = name if len(name) <= avail else (name[: max(1, avail - 2)] + "..")
 
-            print(f"{prefix}{connector}{display_name}{info}")
+            print(f"{prefix}{connector}{marker}{display_name}{info}")
 
             if dir_count > 0 and depth + 1 < max_depth:
                 self._render_tree_node(
                     conn, uid, cid, child_prefix,
                     depth + 1, max_depth, limit, tw,
+                    search=search, visible_ids=visible_ids,
+                )
+
+        if has_more:
+            print(f"{prefix}\\-- ... ({limit}+ more, increase --limit to see)")
+
+    # ------------------------------------------------------------------ #
+    # Standalone --tree-show entry point                                   #
+    # ------------------------------------------------------------------ #
+
+    def _find_matching_dir_ids(
+        self, conn: sqlite3.Connection, keyword: str
+    ) -> set:
+        """Return set of dir_ids whose name contains keyword (case-insensitive)."""
+        if not keyword:
+            return set()
+        try:
+            rows = conn.execute(
+                "SELECT d.id FROM tm.dirs d "
+                "JOIN tm.names n ON d.name_id = n.id "
+                "WHERE n.name LIKE ? COLLATE NOCASE",
+                (f"%{keyword}%",),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return set()
+        return {r[0] for r in rows}
+
+    def _collect_ancestors(
+        self, conn: sqlite3.Connection, dir_ids: set
+    ) -> set:
+        """Walk parent chain for each dir_id, return set of all ancestor dir_ids."""
+        visible = set(dir_ids)
+        queue = list(dir_ids)
+        while queue:
+            batch = queue[:500]
+            queue = queue[500:]
+            placeholders = ",".join("?" * len(batch))
+            try:
+                rows = conn.execute(
+                    f"SELECT id, parent_id FROM tm.dirs WHERE id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                break
+            for _did, parent_id in rows:
+                if parent_id is not None and parent_id not in visible:
+                    visible.add(parent_id)
+                    queue.append(parent_id)
+        return visible
+
+    def display_tree_show(
+        self,
+        detail_db: Optional[str],
+        treemap_db: Optional[str],
+        users: List[str],
+        path: str = "",
+        level: int = 3,
+        limit: int = 20,
+        search: str = "",
+    ) -> None:
+        """Standalone entry point for --tree-show.
+
+        - Without users: total dir tree from tm.dirs (all-user totals)
+        - With users:    separate tree per user from dir_user_size
+        - With search:   only branches containing matching dirs are rendered
+        """
+        if not treemap_db or not os.path.isfile(treemap_db):
+            print("  Tree-show requires treemap.db. Run scan with --tree-map flag.")
+            return
+
+        # detail.db is required when filtering by user (dir_user_size lives there).
+        # Without users we can rely solely on treemap.db.
+        if users and (not detail_db or not os.path.isfile(detail_db)):
+            print("  Tree-show with --user requires data_detail.db. Run scan first.")
+            return
+
+        if users and detail_db:
+            conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
+            owns_conn = True
+        else:
+            conn = sqlite3.connect(f"file:{treemap_db}?mode=ro", uri=True)
+            owns_conn = True
+
+        try:
+            if users and detail_db:
+                self._configure_read_conn(conn, treemap_db)
+            else:
+                # Treat opened treemap.db as the "tm" attached schema for path
+                # helpers, and disable writes.
+                try:
+                    conn.execute("PRAGMA query_only = 1")
+                except sqlite3.DatabaseError:
+                    pass
+                try:
+                    conn.execute("ATTACH DATABASE ? AS tm",
+                                  (f"file:{treemap_db}?mode=ro",))
+                except sqlite3.DatabaseError:
+                    # Already opened on the same file; ignore.
+                    pass
+
+            # Build visibility set when search is requested.
+            visible_ids: Optional[set] = None
+            if search:
+                matching = self._find_matching_dir_ids(conn, search)
+                if not matching:
+                    print(f"  No directories found matching '{search}'.")
+                    return
+                visible_ids = self._collect_ancestors(conn, matching)
+                visible_ids.update(matching)
+
+            if not users:
+                self._display_total_tree(conn, path, level, limit, search, visible_ids)
+                return
+
+            known = self._known_usernames(conn)
+            for user in users:
+                if user not in known:
+                    print(f"\n  User '{user}' not found in scan results.")
+                    continue
+                self.display_user_tree(
+                    conn, user, start_path=path,
+                    max_depth=level, limit=limit,
+                    search=search, visible_ids=visible_ids,
+                )
+        finally:
+            if owns_conn:
+                conn.close()
+
+    def _display_total_tree(
+        self,
+        conn: sqlite3.Connection,
+        path: str,
+        level: int,
+        limit: int,
+        search: str,
+        visible_ids: Optional[set],
+    ) -> None:
+        tw = max(40, int(getattr(self, "terminal_width", 80) or 80))
+        start_id = self._find_dir_id_by_path(conn, path)
+        if start_id is None:
+            print(f"  Path '{path or '<root>'}' not found in scan tree.")
+            return
+        scan_root = self._meta_get(conn, "scan_root") or "/"
+        start_str = self._build_path(conn, start_id) if path else scan_root
+        if not start_str:
+            start_str = scan_root
+
+        print("\n" + "=" * 60)
+        print("TREE-SHOW (all users)")
+        print("=" * 60)
+        print(f"Root path: {start_str}")
+        if search:
+            print(f"Search: '{search}'  (>>> = match)")
+        print(f"Depth: {level}  |  Limit: {limit} per level\n")
+
+        self._render_total_tree_node(
+            conn, start_id, "", 0, level, limit, tw,
+            search, visible_ids,
+        )
+
+    def _render_total_tree_node(
+        self,
+        conn: sqlite3.Connection,
+        dir_id: int,
+        prefix: str,
+        depth: int,
+        max_depth: int,
+        limit: int,
+        tw: int,
+        search: str,
+        visible_ids: Optional[set],
+    ) -> None:
+        if depth >= max_depth:
+            return
+        try:
+            children = conn.execute(
+                """
+                SELECT d.id, n.name, d.dir_count, d.total_size, d.file_count
+                  FROM tm.dirs d
+                  JOIN tm.names n ON d.name_id = n.id
+                 WHERE d.parent_id = ?
+                 ORDER BY d.total_size DESC
+                 LIMIT ?
+                """,
+                (dir_id, limit + 1),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return
+
+        if visible_ids is not None:
+            children = [c for c in children if c[0] in visible_ids]
+
+        has_more = len(children) > limit
+        if has_more:
+            children = children[:limit]
+
+        kw_lower = search.lower() if search else ""
+        n = len(children)
+        for i, (cid, name, dir_count, total_size, file_count) in enumerate(children):
+            is_last = (i == n - 1) and not has_more
+            connector = "\\-- " if is_last else "|-- "
+            child_prefix = prefix + ("    " if is_last else "|   ")
+
+            is_match = bool(kw_lower) and kw_lower in name.lower()
+            marker = ">>> " if is_match else ""
+            info = f"  [{format_size(int(total_size))}, {int(file_count):,} files]"
+
+            avail = tw - len(prefix) - len(connector) - len(marker) - len(info) - 1
+            if avail < 4:
+                avail = 4
+            display_name = name if len(name) <= avail else (name[: max(1, avail - 2)] + "..")
+
+            print(f"{prefix}{connector}{marker}{display_name}{info}")
+
+            if dir_count > 0 and depth + 1 < max_depth:
+                self._render_total_tree_node(
+                    conn, cid, child_prefix,
+                    depth + 1, max_depth, limit, tw,
+                    search, visible_ids,
                 )
 
         if has_more:

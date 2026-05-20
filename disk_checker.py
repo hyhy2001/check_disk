@@ -158,7 +158,17 @@ def cmd_check_users(args, cli: CLIInterface) -> None:
     )
 
 
-# ─── --run pipeline ────────────────────────────────────────────────────
+def cmd_tree_show(args, cli: CLIInterface) -> None:
+    output_dir = args.output_dir or "."
+    users = getattr(args, "user", None) or []
+    if isinstance(users, str):
+        users = users.split()
+    path = getattr(args, "path", "") or ""
+    level = max(1, int(getattr(args, "level", 3) or 3))
+    limit = max(1, int(getattr(args, "limit", 20) or 20))
+    search = getattr(args, "search", "") or ""
+    cli.display_tree_show(output_dir, users, path=path, level=level,
+                          limit=limit, search=search)
 
 
 def _prepare_run_config(args, config_manager: ConfigManager) -> dict:
@@ -470,6 +480,8 @@ def main():
         cmd_show_report(args, cli)
     elif args.check_users:
         cmd_check_users(args, cli)
+    elif getattr(args, "tree_show", False):
+        cmd_tree_show(args, cli)
     elif args.run:
         cmd_run(args, config_manager)
     else:

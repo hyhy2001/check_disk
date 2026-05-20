@@ -9,7 +9,7 @@ import glob
 import os
 from typing import Any, Dict, List
 
-from .constants import DETAIL_USERS_DIRNAME
+from .constants import DETAIL_USERS_DIRNAME, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME
 from .formatters.report_formatter import ReportFormatter
 from .utils import load_json_report
 
@@ -72,13 +72,17 @@ class CLIInterface:
         report_group.add_argument("--top", type=int, default=30,
                                 help="Top N rows to display for both directory and file breakdown in --check-users (default: 30).")
         report_group.add_argument("--type", dest="type",
-                                choices=["report", "inode", "permission", "files", "dirs", "tree-map"],
+                                choices=["report", "inode", "permission", "files", "dirs"],
                                 default="report",
-                                help="Section type for --check-users: report (default), inode, permission, files, dirs, tree-map.")
+                                help="Section type for --check-users: report (default), inode, permission, files, dirs.")
         report_group.add_argument("--path", metavar="PATH", default="",
-                                help="For --type tree-map: start tree from this path (default: scan root).")
+                                help="For --tree-show: start tree from this path (default: scan root).")
         report_group.add_argument("--limit", type=int, default=20,
-                                help="For --type tree-map: max child folders per level (default: 20).")
+                                help="For --tree-show: max child folders per level (default: 20).")
+        report_group.add_argument("--tree-show", dest="tree_show", action="store_true",
+                                help="Show ASCII directory tree (use --user, --search, --level, --limit, --path).")
+        report_group.add_argument("--search", metavar="KEYWORD", default="",
+                                help="For --tree-show: highlight dirs whose name contains KEYWORD (case-insensitive).")
 
         # Report filtering options
         filter_group = parser.add_argument_group('Report Filtering Options')
@@ -270,4 +274,34 @@ class CLIInterface:
             tree_path=tree_path,
             tree_level=tree_level,
             tree_limit=tree_limit,
+        )
+
+    def display_tree_show(
+        self,
+        output_dir: str,
+        users: List[str],
+        path: str = "",
+        level: int = 3,
+        limit: int = 20,
+        search: str = "",
+    ) -> None:
+        """Render ASCII directory tree from treemap.db.
+
+        Without `users`, shows total dir sizes (all-user totals).
+        With `users`, renders a separate tree per user using dir_user_size.
+        With `search`, only shows branches that contain matching dirs.
+        """
+        from .constants import DETAIL_USERS_DB_FILENAME
+        detail_dir = os.path.join(output_dir, DETAIL_USERS_DIRNAME)
+        detail_db = os.path.join(detail_dir, DETAIL_USERS_DB_FILENAME)
+        treemap_db = os.path.join(output_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
+
+        self.report_formatter.display_tree_show(
+            detail_db=detail_db if os.path.isfile(detail_db) else None,
+            treemap_db=treemap_db if os.path.isfile(treemap_db) else None,
+            users=users or [],
+            path=path,
+            level=level,
+            limit=limit,
+            search=search,
         )
