@@ -828,109 +828,27 @@ pub fn detail_set_meta(handle: &mut DetailBuildHandle, meta: &[(String, String)]
 }
 
 pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
+    handle
+        .conn
+        .execute_batch(DETAIL_INDEX_DDL)
+        .map_err(|e| PyRuntimeError::new_err(format!("detail idx: {}", e)))?;
+
+    stamp_db(&handle.conn, DETAIL_APP_ID)?;
+
+    if handle.debug {
+        println!(
+            "[Phase 2] data_detail.db built (files={})",
+            handle.files_inserted
+        );
+    }
+
     let DetailBuildHandle {
         conn,
         build_path,
         final_path,
-        debug,
         files_inserted,
+        ..
     } = handle;
-
-    let t_total = Instant::now();
-
-    conn.pragma_update(None, "locking_mode", "NORMAL")
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx lock mode: {}", e)))?;
-    drop(conn);
-
-    let idx_threads = [
-        (
-            "ix_files_uid_size",
-            "CREATE INDEX ix_files_uid_size ON files(uid, size DESC);",
-        ),
-        (
-            "ix_files_uid_ext_size",
-            "CREATE INDEX ix_files_uid_ext_size ON files(uid, ext_id, size DESC);",
-        ),
-        (
-            "ix_files_name_uid",
-            "CREATE INDEX ix_files_name_uid ON files(name_id, uid);",
-        ),
-    ]
-    .into_iter()
-    .map(|(idx_name, ddl)| {
-        let path = build_path.clone();
-        std::thread::spawn(move || -> Result<(String, f64), String> {
-            let conn = Connection::open(&path)
-                .map_err(|e| format!("detail idx {} open {}: {}", idx_name, path.display(), e))?;
-            conn.busy_timeout(std::time::Duration::from_secs(600))
-                .map_err(|e| format!("detail idx {} busy_timeout: {}", idx_name, e))?;
-            conn.pragma_update(None, "journal_mode", "OFF")
-                .map_err(|e| format!("detail idx {} pragma journal_mode: {}", idx_name, e))?;
-            conn.pragma_update(None, "synchronous", "OFF")
-                .map_err(|e| format!("detail idx {} pragma synchronous: {}", idx_name, e))?;
-            conn.pragma_update(None, "temp_store", "MEMORY")
-                .map_err(|e| format!("detail idx {} pragma temp_store: {}", idx_name, e))?;
-            conn.pragma_update(None, "cache_size", -524_288i64)
-                .map_err(|e| format!("detail idx {} pragma cache_size: {}", idx_name, e))?;
-
-            let t_idx = Instant::now();
-            conn.execute_batch(ddl)
-                .map_err(|e| format!("detail idx {}: {}", idx_name, e))?;
-            Ok((idx_name.to_string(), t_idx.elapsed().as_secs_f64()))
-        })
-    })
-    .collect::<Vec<_>>();
-
-    let main_conn = Connection::open(&build_path).map_err(|e| {
-        PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size open {}: {}", build_path.display(), e))
-    })?;
-    main_conn
-        .busy_timeout(std::time::Duration::from_secs(600))
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size busy_timeout: {}", e)))?;
-    main_conn
-        .pragma_update(None, "journal_mode", "OFF")
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size pragma journal_mode: {}", e)))?;
-    main_conn
-        .pragma_update(None, "synchronous", "OFF")
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size pragma synchronous: {}", e)))?;
-    main_conn
-        .pragma_update(None, "temp_store", "MEMORY")
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size pragma temp_store: {}", e)))?;
-    main_conn
-        .pragma_update(None, "cache_size", -524_288i64)
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size pragma cache_size: {}", e)))?;
-
-    let t_dus = Instant::now();
-    main_conn
-        .execute_batch("CREATE INDEX ix_dus_uid_size ON dir_user_size(uid, size DESC);")
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx ix_dus_uid_size: {}", e)))?;
-    if debug {
-        println!(
-            "[Phase 2] index ix_dus_uid_size: {:.2}s",
-            t_dus.elapsed().as_secs_f64()
-        );
-    }
-
-    for thread in idx_threads {
-        let join_res = thread
-            .join()
-            .map_err(|_| PyRuntimeError::new_err("detail idx thread panic"))?;
-        let (idx_name, secs) = join_res.map_err(PyRuntimeError::new_err)?;
-        if debug {
-            println!("[Phase 2] index {}: {:.2}s", idx_name, secs);
-        }
-    }
-
-    if debug {
-        println!("[Phase 2] index total wall: {:.2}s", t_total.elapsed().as_secs_f64());
-    }
-
-    stamp_db(&main_conn, DETAIL_APP_ID)?;
-
-    if debug {
-        println!("[Phase 2] data_detail.db built (files={})", files_inserted);
-    }
-
-    finalize_db(main_conn, &build_path, &final_path)?;
+    finalize_db(conn, &build_path, &final_path)?;
     Ok(files_inserted)
 }
