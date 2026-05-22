@@ -1,12 +1,13 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use dashmap::DashMap;
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -605,110 +606,126 @@ pub(crate) fn build_detail_db_impl(
         // Eliminates per-row String allocations in the streaming insert pass.
         let t_reencode = Instant::now();
 
-        let mut file_name_id_of: HashMap<String, i64> = HashMap::new();
-        let mut file_names: Vec<String> = Vec::new();
-        let mut ext_id_of_lookup: HashMap<String, i64> = HashMap::new();
-        let mut next_ext_id: i64 = 1;
+        let file_name_id_of: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
+        let next_name_id = Arc::new(AtomicU32::new(0));
+        let ext_id_map: Arc<DashMap<String, u16>> = Arc::new(DashMap::new());
+        let next_ext_id_atomic = Arc::new(AtomicU16::new(1));
 
         // Intern empty ext as id 0.
-        ext_id_of_lookup.insert(String::new(), 0);
+        ext_id_map.insert(String::new(), 0u16);
 
-        let mut compact_row_spills: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let spill_seq_compact = Arc::new(AtomicU64::new(1_000_000));
 
-        for (username, spill_paths) in &row_spills {
-            let safe = sanitize_filename(username);
-            let compact_paths = compact_row_spills.entry(username.clone()).or_default();
-            for spill_path in spill_paths {
-                // Read full-path spill
-                let file = match std::fs::File::open(spill_path) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let mut decoder = FrameDecoder::new(file);
-                let mut compact_rows: Vec<(u64, u32, u32, u16)> = Vec::new();
-                let mut size_buf = [0u8; 8];
-                let mut plen_buf = [0u8; 4];
-                let mut elen_buf = [0u8; 2];
-                let mut row_idx_local: usize = 0;
-                loop {
-                    match decoder.read_exact(&mut size_buf) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(PyRuntimeError::new_err(format!(
-                            "re-encode read size at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                        ))),
+        let compact_entries: Vec<(String, Vec<PathBuf>)> = row_spills
+            .par_iter()
+            .map(|(username, spill_paths)| -> PyResult<(String, Vec<PathBuf>)> {
+                let safe = sanitize_filename(username);
+                let mut compact_paths = Vec::new();
+                for spill_path in spill_paths {
+                    // Read full-path spill
+                    let file = match std::fs::File::open(spill_path) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let mut decoder = FrameDecoder::new(file);
+                    let mut compact_rows: Vec<(u64, u32, u32, u16)> = Vec::new();
+                    let mut size_buf = [0u8; 8];
+                    let mut plen_buf = [0u8; 4];
+                    let mut elen_buf = [0u8; 2];
+                    let mut row_idx_local: usize = 0;
+                    loop {
+                        match decoder.read_exact(&mut size_buf) {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                            Err(e) => return Err(PyRuntimeError::new_err(format!(
+                                "re-encode read size at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                            ))),
+                        }
+                        decoder.read_exact(&mut plen_buf).map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode read path_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        )))?;
+                        let plen = u32::from_le_bytes(plen_buf) as usize;
+                        let mut path_bytes = vec![0u8; plen];
+                        decoder.read_exact(&mut path_bytes).map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode read path_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        )))?;
+                        decoder.read_exact(&mut elen_buf).map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode read ext_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        )))?;
+                        let elen = u16::from_le_bytes(elen_buf) as usize;
+                        let mut ext_bytes = vec![0u8; elen];
+                        decoder.read_exact(&mut ext_bytes).map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode read ext_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        )))?;
+
+                        let size = u64::from_le_bytes(size_buf);
+                        let safe_path = match std::str::from_utf8(&path_bytes) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => String::from_utf8_lossy(&path_bytes).into_owned(),
+                        };
+                        let ext = match std::str::from_utf8(&ext_bytes) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => String::from_utf8_lossy(&ext_bytes).into_owned(),
+                        };
+
+                        // Resolve dir_id
+                        let parent = crate::pipe_types::parent_path(&safe_path)
+                            .unwrap_or_else(|| root.clone());
+                        let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0) as u32;
+
+                        // Intern basename → name_id
+                        let basename = tm_basename(&safe_path);
+                        let name_id = if let Some(id) = file_name_id_of.get(&basename) {
+                            *id
+                        } else {
+                            let new_id = next_name_id.fetch_add(1, Ordering::Relaxed);
+                            *file_name_id_of.entry(basename).or_insert(new_id)
+                        };
+
+                        // Intern ext → ext_id
+                        let ext_id = if let Some(id) = ext_id_map.get(&ext) {
+                            *id
+                        } else {
+                            let new_id = next_ext_id_atomic.fetch_add(1, Ordering::Relaxed);
+                            *ext_id_map.entry(ext).or_insert(new_id)
+                        };
+
+                        compact_rows.push((size, dir_id, name_id, ext_id));
+                        row_idx_local += 1;
                     }
-                    decoder.read_exact(&mut plen_buf).map_err(|e| PyRuntimeError::new_err(format!(
-                        "re-encode read path_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                    )))?;
-                    let plen = u32::from_le_bytes(plen_buf) as usize;
-                    let mut path_bytes = vec![0u8; plen];
-                    decoder.read_exact(&mut path_bytes).map_err(|e| PyRuntimeError::new_err(format!(
-                        "re-encode read path_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                    )))?;
-                    decoder.read_exact(&mut elen_buf).map_err(|e| PyRuntimeError::new_err(format!(
-                        "re-encode read ext_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                    )))?;
-                    let elen = u16::from_le_bytes(elen_buf) as usize;
-                    let mut ext_bytes = vec![0u8; elen];
-                    decoder.read_exact(&mut ext_bytes).map_err(|e| PyRuntimeError::new_err(format!(
-                        "re-encode read ext_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                    )))?;
 
-                    let size = u64::from_le_bytes(size_buf);
-                    let safe_path = match std::str::from_utf8(&path_bytes) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => String::from_utf8_lossy(&path_bytes).into_owned(),
-                    };
-                    let ext = match std::str::from_utf8(&ext_bytes) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => String::from_utf8_lossy(&ext_bytes).into_owned(),
-                    };
-
-                    // Resolve dir_id
-                    let parent = crate::pipe_types::parent_path(&safe_path)
-                        .unwrap_or_else(|| root.clone());
-                    let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0) as u32;
-
-                    // Intern basename → name_id
-                    let basename = tm_basename(&safe_path);
-                    let name_id = if let Some(&id) = file_name_id_of.get(&basename) {
-                        id as u32
-                    } else {
-                        let id = file_names.len() as i64;
-                        file_name_id_of.insert(basename.clone(), id);
-                        file_names.push(basename);
-                        id as u32
-                    };
-
-                    // Intern ext → ext_id
-                    let ext_id = if let Some(&id) = ext_id_of_lookup.get(&ext) {
-                        id as u16
-                    } else {
-                        let id = next_ext_id;
-                        next_ext_id = next_ext_id.saturating_add(1);
-                        ext_id_of_lookup.insert(ext, id);
-                        id as u16
-                    };
-
-                    compact_rows.push((size, dir_id, name_id, ext_id));
-                    row_idx_local += 1;
+                    // Write compact spill
+                    let id = spill_seq_compact.fetch_add(1, Ordering::Relaxed);
+                    let compact_path = spool_root.join(format!("{}_{}.rows.compact", safe, id));
+                    write_compact_spill(&compact_path, &compact_rows)?;
+                    compact_paths.push(compact_path);
+                    // Delete original full-path spill
+                    let _ = fs::remove_file(spill_path);
                 }
+                Ok((username.clone(), compact_paths))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
 
-                // Write compact spill
-                let id = spill_seq_compact.fetch_add(1, Ordering::Relaxed);
-                let compact_path = spool_root.join(format!("{}_{}.rows.compact", safe, id));
-                write_compact_spill(&compact_path, &compact_rows)?;
-                compact_paths.push(compact_path);
-                // Delete original full-path spill
-                let _ = fs::remove_file(spill_path);
-            }
-        }
+        let compact_row_spills: HashMap<String, Vec<PathBuf>> = compact_entries.into_iter().collect();
         drop(row_spills); // free original spill map
 
+        let total_names = next_name_id.load(Ordering::Relaxed) as usize;
+        let mut file_names: Vec<String> = vec![String::new(); total_names];
+        for entry in file_name_id_of.iter() {
+            let idx = *entry.value() as usize;
+            if idx < file_names.len() {
+                file_names[idx] = entry.key().clone();
+            }
+        }
+
+        let mut ext_id_of_lookup: HashMap<String, u16> = HashMap::new();
+        for entry in ext_id_map.iter() {
+            ext_id_of_lookup.insert(entry.key().clone(), *entry.value());
+        }
+        let next_ext_id = next_ext_id_atomic.load(Ordering::Relaxed);
+
         if debug {
-            println!("[Phase 2] Re-encoded spills in {:.2}s ({} users)",
+            println!("[Phase 2] Re-encoded spills in {:.2}s ({} users, parallel)",
                 t_reencode.elapsed().as_secs_f64(), compact_row_spills.len());
         }
 
