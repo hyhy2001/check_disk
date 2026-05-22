@@ -239,11 +239,11 @@ fn read_compact_spill(path: &Path) -> PyResult<Vec<(u64, u32, u32, u16)>> {
 /// up to `root`. Assigns BFS-ordered `dir_id` (root = 0) and interns every
 /// path segment into `name_id`.
 struct PathTree {
-    /// dir path → dir_id
+    /// dir path -> dir_id
     dir_id_of: HashMap<String, i64>,
     /// dir path stored alongside parent_id for downstream metadata building.
     dirs_in_order: Vec<DirRowDraft>,
-    /// segment string → name_id (extended later with file basenames)
+    /// segment string -> name_id (extended later with file basenames)
     #[allow(dead_code)]
     name_id_of: HashMap<String, i64>,
     /// names[i] is the segment string for name_id == i (extended later).
@@ -587,7 +587,7 @@ pub(crate) fn build_detail_db_impl(
         // and lookups go through dir_id_of from here on.
         drop(dir_paths_set);
 
-        // ─── STAGE 2b: re-encode full-path spills → compact ID spills ─────
+        // ─── STAGE 2b: re-encode full-path spills -> compact ID spills ─────
         // Replaces (size, path_str, ext_str) rows with (size, dir_id, name_id, ext_id).
         // Eliminates per-row String allocations in the streaming insert pass.
         let t_reencode = Instant::now();
@@ -671,7 +671,7 @@ pub(crate) fn build_detail_db_impl(
                             .unwrap_or_else(|| root.clone());
                         let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0) as u32;
 
-                        // Intern basename → name_id
+                        // Intern basename -> name_id
                         let basename = tm_basename(&safe_path);
                         let name_id = if let Some(id) = file_name_id_of.get(&basename) {
                             *id
@@ -680,7 +680,7 @@ pub(crate) fn build_detail_db_impl(
                             *file_name_id_of.entry(basename).or_insert(new_id)
                         };
 
-                        // Intern ext → ext_id
+                        // Intern ext -> ext_id
                         let ext_id = if let Some(id) = ext_id_map.get(&ext) {
                             *id
                         } else {
@@ -739,7 +739,7 @@ pub(crate) fn build_detail_db_impl(
                 t_reencode.elapsed().as_secs_f64(), compact_row_spills.len());
         }
 
-        // username → uid (POSIX preferred; for unknown users keep negative slot.)
+        // username -> uid (POSIX preferred; for unknown users keep negative slot.)
         let mut username_to_uid: HashMap<String, i64> = HashMap::new();
         let mut uid_to_username: HashMap<i64, String> = HashMap::new();
         for (uid, name) in &uids_map {
@@ -769,7 +769,7 @@ pub(crate) fn build_detail_db_impl(
         //
         // dir_ids are dense 0..N (BFS-assigned), so per-dir scalar maps go
         // into Vec instead of HashMap — saves the 24-32 B/entry HashMap
-        // overhead. Roughly 1.4 GB → 480 MB at 75M scale.
+        // overhead. Roughly 1.4 GB -> 480 MB at 75M scale.
         //
         // owner_weights replaces the previous HashMap<i64, HashMap<i64, i64>>:
         // - Outer HashMap of 4.25M dirs alone cost ~250 MB just in alloc
@@ -886,7 +886,7 @@ pub(crate) fn build_detail_db_impl(
         // entire spill payload twice. Now we do everything in ONE pass:
         //
         //   • Open detail.db, set up DDL.
-        //   • Stream each spill row → intern basename into path_tree.names,
+        //   • Stream each spill row -> intern basename into path_tree.names,
         //     intern ext, aggregate user_dir_size/totals, push
         //     FileRow into a chunk buffer (flushed every FILE_INSERT_CHUNK
         //     rows), maintain top-K heap per user.
@@ -1127,7 +1127,7 @@ pub(crate) fn build_detail_db_impl(
             let rss_after = crate::pipe_types::get_rss_mb();
             if debug {
                 println!(
-                    "[Phase 2] malloc_trim(0)={} RSS: {:.1} MB → {:.1} MB (delta: {:+.1} MB)",
+                    "[Phase 2] malloc_trim(0)={} RSS: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
                     trim_result, rss_before, rss_after, rss_after - rss_before
                 );
             }
@@ -1191,7 +1191,7 @@ pub(crate) fn build_detail_db_impl(
             t_treemap_db = t3a.elapsed().as_secs_f64();
             if debug {
                 println!(
-                    "[Phase 2] Persisted treemap aggregates ({:.2}s) → {}",
+                    "[Phase 2] Persisted treemap aggregates ({:.2}s) -> {}",
                     t_persist.elapsed().as_secs_f64(),
                     agg_path.display()
                 );

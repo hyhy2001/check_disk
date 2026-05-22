@@ -109,7 +109,7 @@ pub(crate) fn run_scan_core(
 
         // ─── Bounded-queue parallel walker ─────────────────────────
         // Replaces ignore::WalkBuilder. Caps queue at 200K dirs to
-        // bound RAM (was ~6 GB unbounded internal queue → ~40 MB now).
+        // bound RAM (was ~6 GB unbounded internal queue -> ~40 MB now).
         // Workers fall back to inline DFS via local Vec stack when
         // the shared channel is full — no blocking, no deadlock.
         const QUEUE_CAP: usize = 200_000;
@@ -239,7 +239,7 @@ pub(crate) fn run_scan_core(
                         }
                     }
                 }
-                // state drops here → ThreadLocalState::drop() flushes all buffers
+                // state drops here -> ThreadLocalState::drop() flushes all buffers
             }));
         }
         drop(tx); // Main thread drops its sender

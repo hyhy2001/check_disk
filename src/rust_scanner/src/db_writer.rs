@@ -142,7 +142,7 @@ const DETAIL_INDEX_DDL: &str = "
 -- Full (uid, size DESC) index. Replaces the previous partial-on-1MB version
 -- because the dashboard issues `ORDER BY size DESC` for arbitrary pages, and
 -- the partial only covered ~5% of rows — leaving the rest to a temp B-tree
--- sort over every row of the user (~700k for `root` at demo scale → 1+s
+-- sort over every row of the user (~700k for `root` at demo scale -> 1+s
 -- per page). Full index streams the result already-sorted: any page is
 -- ~ms regardless of OFFSET, at the cost of ~10 MB demo / ~1.5 GB at 75M.
 CREATE INDEX ix_files_uid_size       ON files(uid, size DESC);
