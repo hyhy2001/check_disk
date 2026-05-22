@@ -1122,8 +1122,14 @@ pub(crate) fn build_detail_db_impl(
             unsafe extern "C" {
                 fn malloc_trim(pad: usize) -> i32;
             }
-            unsafe {
-                malloc_trim(0);
+            let rss_before = crate::pipe_types::get_rss_mb();
+            let trim_result = unsafe { malloc_trim(0) };
+            let rss_after = crate::pipe_types::get_rss_mb();
+            if debug {
+                println!(
+                    "[Phase 2] malloc_trim(0)={} RSS: {:.1} MB → {:.1} MB (delta: {:+.1} MB)",
+                    trim_result, rss_before, rss_after, rss_after - rss_before
+                );
             }
         }
 
