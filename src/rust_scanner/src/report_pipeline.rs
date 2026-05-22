@@ -575,6 +575,21 @@ pub(crate) fn build_detail_db_impl(
             println!("[RSS checkpoint] after stage 1 ingest: {:.1} MB", crate::pipe_types::get_rss_mb());
         }
 
+        // Trim glibc heap after stage 1 ingest — rows_by_user and dir_sizes
+        // have been spilled/drained; freed pages can be returned to OS before
+        // PathTree build allocates fresh memory.
+        #[cfg(target_os = "linux")]
+        {
+            extern "C" { fn malloc_trim(pad: usize) -> i32; }
+            let _rss_before = crate::pipe_types::get_rss_mb();
+            unsafe { malloc_trim(0); }
+            if debug {
+                let _rss_after = crate::pipe_types::get_rss_mb();
+                println!("[Phase 2] malloc_trim after ingest: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
+                    _rss_before, _rss_after, _rss_after - _rss_before);
+            }
+        }
+
         // ─── STAGE 2: Path tree + dir aggregate ────────────────────
         let _t2 = Instant::now();
         let root = normalize_root(&treemap_root);
@@ -588,6 +603,20 @@ pub(crate) fn build_detail_db_impl(
         let mut path_tree = PathTree::build(&root, &dir_paths_set);
         if debug {
             println!("[RSS checkpoint] after path tree built: {:.1} MB", crate::pipe_types::get_rss_mb());
+        }
+
+        // Trim after PathTree build — dir_paths_set and intermediate BFS
+        // structures have been dropped; free pages before re-encode allocates.
+        #[cfg(target_os = "linux")]
+        {
+            extern "C" { fn malloc_trim(pad: usize) -> i32; }
+            let _rss_before = crate::pipe_types::get_rss_mb();
+            unsafe { malloc_trim(0); }
+            if debug {
+                let _rss_after = crate::pipe_types::get_rss_mb();
+                println!("[Phase 2] malloc_trim after path tree: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
+                    _rss_before, _rss_after, _rss_after - _rss_before);
+            }
         }
         // Free the path-keyed set now — path_tree owns the canonical layout
         // and lookups go through dir_id_of from here on.
