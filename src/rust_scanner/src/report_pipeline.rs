@@ -413,8 +413,8 @@ pub(crate) fn build_detail_db_impl(
         extern "C" {
             fn mallopt(param: i32, value: i32) -> i32;
         }
-        mallopt(-3, 128 * 1024); // M_MMAP_THRESHOLD = 128KB
-        mallopt(-1, 128 * 1024); // M_TRIM_THRESHOLD = 128KB
+        mallopt(-3, 64 * 1024); // M_MMAP_THRESHOLD = 64KB
+        mallopt(-1, 64 * 1024); // M_TRIM_THRESHOLD = 64KB
     }
 
     py.allow_threads(move || -> PyResult<(u64, Option<PathBuf>)> {
