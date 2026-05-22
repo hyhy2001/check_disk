@@ -178,49 +178,72 @@ fn sanitize_filename(s: &str) -> String {
 }
 
 // Helper: write compact spill rows (size:u64 LE, dir_id:u32 LE, name_id:u32 LE, ext_id:u16 LE)
-fn write_compact_spill(path: &Path, rows: &[(u64, u32, u32, u16)]) -> bool {
-    let file = match OpenOptions::new().create(true).write(true).truncate(true).open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
+fn write_compact_spill(path: &Path, rows: &[(u64, u32, u32, u16)]) -> PyResult<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| PyRuntimeError::new_err(format!("write_compact_spill open {}: {}", path.display(), e)))?;
     let mut writer = FrameEncoder::new(file);
-    for &(size, dir_id, name_id, ext_id) in rows {
-        if writer.write_all(&size.to_le_bytes()).is_err()
-            || writer.write_all(&dir_id.to_le_bytes()).is_err()
-            || writer.write_all(&name_id.to_le_bytes()).is_err()
-            || writer.write_all(&ext_id.to_le_bytes()).is_err()
-        {
-            return false;
-        }
+    for (i, &(size, dir_id, name_id, ext_id)) in rows.iter().enumerate() {
+        writer.write_all(&size.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
+            "write_compact_spill row {} in {}: {}", i, path.display(), e
+        )))?;
+        writer.write_all(&dir_id.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
+            "write_compact_spill row {} in {}: {}", i, path.display(), e
+        )))?;
+        writer.write_all(&name_id.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
+            "write_compact_spill row {} in {}: {}", i, path.display(), e
+        )))?;
+        writer.write_all(&ext_id.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
+            "write_compact_spill row {} in {}: {}", i, path.display(), e
+        )))?;
     }
-    writer.flush().is_ok()
+    writer.flush().map_err(|e| PyRuntimeError::new_err(format!(
+        "write_compact_spill flush {}: {}", path.display(), e
+    )))?;
+    Ok(())
 }
 
 // Helper: read compact spill rows back into Vec
-fn read_compact_spill(path: &Path) -> Vec<(u64, u32, u32, u16)> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
+fn read_compact_spill(path: &Path) -> PyResult<Vec<(u64, u32, u32, u16)>> {
+    let file = std::fs::File::open(path).map_err(|e| PyRuntimeError::new_err(format!(
+        "read_compact_spill open {}: {}", path.display(), e
+    )))?;
     let mut decoder = FrameDecoder::new(file);
     let mut rows = Vec::new();
     let mut buf_size = [0u8; 8];
     let mut buf_dir = [0u8; 4];
     let mut buf_name = [0u8; 4];
     let mut buf_ext = [0u8; 2];
+    let mut row_idx: usize = 0;
     loop {
-        if decoder.read_exact(&mut buf_size).is_err() { break; }
-        if decoder.read_exact(&mut buf_dir).is_err() { break; }
-        if decoder.read_exact(&mut buf_name).is_err() { break; }
-        if decoder.read_exact(&mut buf_ext).is_err() { break; }
+        match decoder.read_exact(&mut buf_size) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(PyRuntimeError::new_err(format!(
+                "read_compact_spill: size at row {} in {}: {}", row_idx, path.display(), e
+            ))),
+        }
+        decoder.read_exact(&mut buf_dir).map_err(|e| PyRuntimeError::new_err(format!(
+            "read_compact_spill: dir_id at row {} in {}: {}", row_idx, path.display(), e
+        )))?;
+        decoder.read_exact(&mut buf_name).map_err(|e| PyRuntimeError::new_err(format!(
+            "read_compact_spill: name_id at row {} in {}: {}", row_idx, path.display(), e
+        )))?;
+        decoder.read_exact(&mut buf_ext).map_err(|e| PyRuntimeError::new_err(format!(
+            "read_compact_spill: ext_id at row {} in {}: {}", row_idx, path.display(), e
+        )))?;
         rows.push((
             u64::from_le_bytes(buf_size),
             u32::from_le_bytes(buf_dir),
             u32::from_le_bytes(buf_name),
             u16::from_le_bytes(buf_ext),
         ));
+        row_idx += 1;
     }
-    rows
+    Ok(rows)
 }
 
 // ─── Path tree assembly ───────────────────────────────────────────────
@@ -607,16 +630,31 @@ pub(crate) fn build_detail_db_impl(
                 let mut size_buf = [0u8; 8];
                 let mut plen_buf = [0u8; 4];
                 let mut elen_buf = [0u8; 2];
+                let mut row_idx_local: usize = 0;
                 loop {
-                    if decoder.read_exact(&mut size_buf).is_err() { break; }
-                    if decoder.read_exact(&mut plen_buf).is_err() { break; }
+                    match decoder.read_exact(&mut size_buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(PyRuntimeError::new_err(format!(
+                            "re-encode read size at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        ))),
+                    }
+                    decoder.read_exact(&mut plen_buf).map_err(|e| PyRuntimeError::new_err(format!(
+                        "re-encode read path_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                    )))?;
                     let plen = u32::from_le_bytes(plen_buf) as usize;
                     let mut path_bytes = vec![0u8; plen];
-                    if decoder.read_exact(&mut path_bytes).is_err() { break; }
-                    if decoder.read_exact(&mut elen_buf).is_err() { break; }
+                    decoder.read_exact(&mut path_bytes).map_err(|e| PyRuntimeError::new_err(format!(
+                        "re-encode read path_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                    )))?;
+                    decoder.read_exact(&mut elen_buf).map_err(|e| PyRuntimeError::new_err(format!(
+                        "re-encode read ext_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                    )))?;
                     let elen = u16::from_le_bytes(elen_buf) as usize;
                     let mut ext_bytes = vec![0u8; elen];
-                    if decoder.read_exact(&mut ext_bytes).is_err() { break; }
+                    decoder.read_exact(&mut ext_bytes).map_err(|e| PyRuntimeError::new_err(format!(
+                        "re-encode read ext_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                    )))?;
 
                     let size = u64::from_le_bytes(size_buf);
                     let safe_path = match std::str::from_utf8(&path_bytes) {
@@ -655,14 +693,14 @@ pub(crate) fn build_detail_db_impl(
                     };
 
                     compact_rows.push((size, dir_id, name_id, ext_id));
+                    row_idx_local += 1;
                 }
 
                 // Write compact spill
                 let id = spill_seq_compact.fetch_add(1, Ordering::Relaxed);
                 let compact_path = spool_root.join(format!("{}_{}.rows.compact", safe, id));
-                if write_compact_spill(&compact_path, &compact_rows) {
-                    compact_paths.push(compact_path);
-                }
+                write_compact_spill(&compact_path, &compact_rows)?;
+                compact_paths.push(compact_path);
                 // Delete original full-path spill
                 let _ = fs::remove_file(spill_path);
             }
@@ -879,7 +917,7 @@ pub(crate) fn build_detail_db_impl(
                 if let Ok(meta) = fs::metadata(spill_path) {
                     total_spill_read += meta.len();
                 }
-                let rows = read_compact_spill(spill_path);
+                let rows = read_compact_spill(spill_path)?;
                 for (size, dir_id_u32, name_id_u32, ext_id_u16) in rows {
                     let size_i64 = size as i64;
                     let dir_id = dir_id_u32 as i64;
