@@ -26,8 +26,10 @@ use crate::pipe_types::FILE_PART_RECORDS;
 
 const ROW_SPILL_THRESHOLD: usize = 200_000;
 /// Spill rows_by_user when approximate bytes-in-flight exceeds this per LocalAgg.
-/// 64 MB × 64 threads = ~4 GB max from active LocalAggs.
-const ROW_SPILL_BYTES: usize = 64 * 1024 * 1024;
+/// 16 MB × 64 threads = ~1 GB logical, ~3 GB after Vec/HashMap/allocator slack.
+/// Production at 64MB still peaked at 9.5GB stage 1; estimate underestimates
+/// real RAM by ~2-3x due to Vec capacity slack and allocator overhead.
+const ROW_SPILL_BYTES: usize = 16 * 1024 * 1024;
 const TREEMAP_AGG_VERSION: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize)]
