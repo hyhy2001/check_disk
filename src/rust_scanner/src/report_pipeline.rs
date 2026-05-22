@@ -404,6 +404,19 @@ pub(crate) fn build_detail_db_impl(
     build_treemap: bool,
     debug: bool,
 ) -> PyResult<(u64, Option<PathBuf>)> {
+    // Configure glibc allocator to reduce heap fragmentation during large
+    // parallel workloads. M_MMAP_THRESHOLD forces allocations > 128KB to
+    // use mmap() which is returned to OS immediately on free().
+    // M_TRIM_THRESHOLD triggers heap trimming more aggressively.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        mallopt(-3, 128 * 1024); // M_MMAP_THRESHOLD = 128KB
+        mallopt(-1, 128 * 1024); // M_TRIM_THRESHOLD = 128KB
+    }
+
     py.allow_threads(move || -> PyResult<(u64, Option<PathBuf>)> {
         let t_all = Instant::now();
         #[allow(unused_assignments)]
