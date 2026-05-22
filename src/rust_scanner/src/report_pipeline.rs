@@ -25,6 +25,9 @@ use crate::pipe_treemap::{tm_basename, tm_parent, normalize_root};
 use crate::pipe_types::FILE_PART_RECORDS;
 
 const ROW_SPILL_THRESHOLD: usize = 200_000;
+/// Spill rows_by_user when approximate bytes-in-flight exceeds this per LocalAgg.
+/// 64 MB × 64 threads = ~4 GB max from active LocalAggs.
+const ROW_SPILL_BYTES: usize = 64 * 1024 * 1024;
 const TREEMAP_AGG_VERSION: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -370,6 +373,7 @@ struct LocalAgg {
     rows_by_user: HashMap<String, Vec<(u64, String, String)>>,
     row_spills: HashMap<String, Vec<PathBuf>>,
     row_count: usize,
+    bytes_in_flight: usize,
     spill_bytes_written: u64,
 }
 
@@ -479,11 +483,13 @@ pub(crate) fn build_detail_db_impl(
                         .unwrap_or_else(|| format!("uid-{}", event.uid));
                     let safe_path = crate::sanitise_path(&event.path);
                     let ext = crate::pipe_types::extension_for_path(&safe_path);
+                    let added_bytes = 8 + safe_path.len() + ext.len() + 56; // u64 + 2×String payload + tuple overhead
                     agg.rows_by_user
                         .entry(username)
                         .or_default()
                         .push((event.size, safe_path.clone(), ext));
                     agg.row_count += 1;
+                    agg.bytes_in_flight += added_bytes;
                     if !has_dir_agg {
                         if let Some(parent) = crate::pipe_types::parent_path(&safe_path) {
                             let user_sizes = agg.dir_sizes.entry(parent).or_default();
@@ -491,7 +497,7 @@ pub(crate) fn build_detail_db_impl(
                         }
                     }
                 });
-                if agg.row_count >= ROW_SPILL_THRESHOLD {
+                if agg.bytes_in_flight >= ROW_SPILL_BYTES || agg.row_count >= ROW_SPILL_THRESHOLD {
                     agg.spill_bytes_written += spill_rows_to_disk(
                         &spool_root,
                         &spill_seq,
@@ -499,6 +505,7 @@ pub(crate) fn build_detail_db_impl(
                         &mut agg.row_spills,
                     );
                     agg.row_count = 0;
+                    agg.bytes_in_flight = 0;
                 }
                 agg
             })
@@ -517,8 +524,9 @@ pub(crate) fn build_detail_db_impl(
                         *sizes_a.entry(uid).or_insert(0) += size;
                     }
                 }
+                a.bytes_in_flight += b.bytes_in_flight;
                 a.spill_bytes_written += b.spill_bytes_written;
-                if a.row_count >= ROW_SPILL_THRESHOLD {
+                if a.bytes_in_flight >= ROW_SPILL_BYTES || a.row_count >= ROW_SPILL_THRESHOLD {
                     a.spill_bytes_written += spill_rows_to_disk(
                         &spool_root,
                         &spill_seq,
@@ -526,6 +534,7 @@ pub(crate) fn build_detail_db_impl(
                         &mut a.row_spills,
                     );
                     a.row_count = 0;
+                    a.bytes_in_flight = 0;
                 }
                 a
             });
@@ -570,6 +579,7 @@ pub(crate) fn build_detail_db_impl(
             &mut row_spills,
         );
         rows_by_user.clear();
+        // bytes_in_flight for merged_agg is no longer needed after final spill.
         t_ingest = t1.elapsed().as_secs_f64();
         if debug {
             println!("[RSS checkpoint] after stage 1 ingest: {:.1} MB", crate::pipe_types::get_rss_mb());
