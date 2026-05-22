@@ -13,12 +13,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::scan_constants::{
-    CRITICAL_SKIP_NAMES, SCAN_EVENT_FLUSH_BYTES_THRESHOLD, SCAN_EVENT_FLUSH_THRESHOLD,
+    CRITICAL_SKIP_NAMES, DIR_CHUNK_SIZE, DIR_CHUNK_THRESHOLD, SCAN_EVENT_FLUSH_BYTES_THRESHOLD,
+    SCAN_EVENT_FLUSH_THRESHOLD,
 };
 use crate::scan_state::{GlobalStats, ThreadLocalState};
 use crate::scan_utils::{
     error_code_from_message, format_num, format_rate, format_size, get_rss_mb,
 };
+
+enum ScanTask {
+    /// Process an entire directory: read entries, stat each, recurse into subdirs.
+    Dir(std::path::PathBuf),
+    /// Process a chunk of file entries from a parent directory (already read but not yet stat'd).
+    FileChunk {
+        parent: std::path::PathBuf,
+        files: Vec<std::ffi::OsString>,
+    },
+}
 
 pub(crate) fn run_scan_core(
     py: Python,
@@ -114,18 +125,18 @@ pub(crate) fn run_scan_core(
         // Workers fall back to inline DFS via local Vec stack when
         // the shared channel is full — no blocking, no deadlock.
         const QUEUE_CAP: usize = 2_000_000;
-        let (tx, rx) = bounded::<PathBuf>(QUEUE_CAP);
+        let (tx, rx) = bounded::<ScanTask>(QUEUE_CAP);
         let rx = Arc::new(rx);
         let active_count = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Seed root dir
-        let _ = tx.send(PathBuf::from(&dir_clone));
+        let _ = tx.send(ScanTask::Dir(PathBuf::from(&dir_clone)));
 
         let mut handles = Vec::with_capacity(threads_count);
         for _ in 0..threads_count {
             let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
-            let tx_w: Sender<PathBuf> = tx.clone();
+            let tx_w: Sender<ScanTask> = tx.clone();
             let rx_w = Arc::clone(&rx);
             let active_w = Arc::clone(&active_count);
             let shutdown_w = Arc::clone(&shutdown);
@@ -194,22 +205,33 @@ pub(crate) fn run_scan_core(
                     if shutdown_w.load(Ordering::Relaxed) {
                         break;
                     }
-                    let dir_path = match rx_w.recv_timeout(Duration::from_millis(5)) {
-                        Ok(p) => p,
+                    let task = match rx_w.recv_timeout(Duration::from_millis(5)) {
+                        Ok(t) => t,
                         Err(RecvTimeoutError::Timeout) => continue,
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
 
                     active_w.fetch_add(1, Ordering::AcqRel);
-                    process_dir_inline(
-                        dir_path,
-                        &tx_w,
-                        &mut state,
-                        &hardlinks_w,
-                        &skips_w,
-                        root_dev,
-                        debug,
-                    );
+                    match task {
+                        ScanTask::Dir(dir_path) => process_dir_inline(
+                            dir_path,
+                            &tx_w,
+                            &mut state,
+                            &hardlinks_w,
+                            &skips_w,
+                            root_dev,
+                            debug,
+                        ),
+                        ScanTask::FileChunk { parent, files } => process_file_chunk(
+                            parent,
+                            files,
+                            &mut state,
+                            &hardlinks_w,
+                            &skips_w,
+                            root_dev,
+                            debug,
+                        ),
+                    }
                     let prev = active_w.fetch_sub(1, Ordering::AcqRel);
 
                     // Termination protocol: last active worker drains
@@ -219,15 +241,26 @@ pub(crate) fn run_scan_core(
                             match rx_w.try_recv() {
                                 Ok(extra) => {
                                     active_w.fetch_add(1, Ordering::AcqRel);
-                                    process_dir_inline(
-                                        extra,
-                                        &tx_w,
-                                        &mut state,
-                                        &hardlinks_w,
-                                        &skips_w,
-                                        root_dev,
-                                        debug,
-                                    );
+                                    match extra {
+                                        ScanTask::Dir(dir_path) => process_dir_inline(
+                                            dir_path,
+                                            &tx_w,
+                                            &mut state,
+                                            &hardlinks_w,
+                                            &skips_w,
+                                            root_dev,
+                                            debug,
+                                        ),
+                                        ScanTask::FileChunk { parent, files } => process_file_chunk(
+                                            parent,
+                                            files,
+                                            &mut state,
+                                            &hardlinks_w,
+                                            &skips_w,
+                                            root_dev,
+                                            debug,
+                                        ),
+                                    }
                                     let p2 = active_w.fetch_sub(1, Ordering::AcqRel);
                                     if p2 != 1 {
                                         break;
@@ -376,9 +409,125 @@ fn record_path_ns(state: &mut ThreadLocalState, start: Option<Instant>, debug: b
     }
 }
 
+fn process_file_entry(
+    path: &std::path::PathBuf,
+    state: &mut ThreadLocalState,
+    hardlinks: &Arc<DashSet<(u64, u64)>>,
+    skips: &[String],
+    root_dev: Option<u64>,
+    debug: bool,
+) {
+    for s in skips {
+        if path.starts_with(s) {
+            return;
+        }
+    }
+
+    let meta_start = debug.then(Instant::now);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            record_metadata_ns(state, meta_start, debug);
+            state.t_perm_issues += 1;
+            state.flush_permission_issue(
+                &path.to_string_lossy(),
+                "file",
+                error_code_from_message(&e.to_string()),
+            );
+            return;
+        }
+    };
+    record_metadata_ns(state, meta_start, debug);
+
+    if let Ok(ft) = path.symlink_metadata().and_then(|m| Ok(m.file_type())) {
+        if ft.is_dir() {
+            if let Some(rdev) = root_dev {
+                if meta.dev() != rdev {
+                    return;
+                }
+            }
+            state.t_dirs += 1;
+            state.t_inodes += 1;
+            state.add_progress(0, 1, 0);
+            match state.global_stats.lock() {
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            // Attempt to enqueue dir for further processing
+            // Note: we don't have tx here; directories are primarily handled in process_dir_inline
+            return;
+        }
+    }
+
+    if meta.file_type().is_symlink() {
+        state.t_inodes += 1;
+        return;
+    }
+
+    if meta.nlink() > 1 {
+        if debug {
+            state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
+        }
+        if !hardlinks.insert((meta.ino(), meta.dev())) {
+            return;
+        }
+    }
+
+    let size = meta.blocks() * 512;
+    let uid = meta.uid();
+    let is_target = match state.target_uids.as_ref() {
+        Some(s) => s.contains(&uid),
+        None => true,
+    };
+
+    state.t_files += 1;
+    state.t_inodes += 1;
+    state.t_size += size;
+
+    if is_target {
+        *state.t_uid_sizes.entry(uid).or_insert(0) += size;
+        *state.t_uid_files.entry(uid).or_insert(0) += 1;
+        let path_start = debug.then(Instant::now);
+        let path_str = path.to_string_lossy();
+        record_path_ns(state, path_start, debug);
+        state.push_event_binary(1, uid, size, path_str.as_ref());
+        state.add_dir_size(uid, size, path_str.as_ref());
+        let recs = state.event_records();
+        let bytes = state.event_buffer_bytes();
+        if debug {
+            state
+                .prof_max_event_buf_records
+                .fetch_max(recs as u64, Ordering::Relaxed);
+            state
+                .prof_max_event_buf_bytes
+                .fetch_max(bytes as u64, Ordering::Relaxed);
+        }
+        if recs >= SCAN_EVENT_FLUSH_THRESHOLD || bytes >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
+        {
+            state.flush_events();
+        }
+    }
+    state.add_progress(1, 0, size);
+}
+
+fn process_file_chunk(
+    parent: std::path::PathBuf,
+    files: Vec<std::ffi::OsString>,
+    state: &mut ThreadLocalState,
+    hardlinks: &Arc<DashSet<(u64, u64)>>,
+    skips: &[String],
+    root_dev: Option<u64>,
+    debug: bool,
+) {
+    for name in files {
+        let path = parent.join(&name);
+        process_file_entry(&path, state, hardlinks, skips, root_dev, debug);
+    }
+}
+
 fn process_dir_inline(
     root: std::path::PathBuf,
-    tx: &crossbeam_channel::Sender<std::path::PathBuf>,
+    tx: &crossbeam_channel::Sender<ScanTask>,
     state: &mut ThreadLocalState,
     hardlinks: &Arc<DashSet<(u64, u64)>>,
     skips: &[String],
@@ -399,7 +548,12 @@ fn process_dir_inline(
                 continue;
             }
         };
-        'entry: for entry_res in read_iter {
+
+        // First, collect entries into vectors of names to allow chunking.
+        let mut file_names: Vec<std::ffi::OsString> = Vec::new();
+        let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+
+        'entry_collect: for entry_res in read_iter {
             let entry = match entry_res {
                 Ok(e) => e,
                 Err(e) => {
@@ -412,11 +566,12 @@ fn process_dir_inline(
                     continue;
                 }
             };
+
             let path = entry.path();
 
             for s in skips {
                 if path.starts_with(s) {
-                    continue 'entry;
+                    continue 'entry_collect;
                 }
             }
 
@@ -430,91 +585,70 @@ fn process_dir_inline(
                 continue;
             }
 
-            let meta_start = debug.then(Instant::now);
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    record_metadata_ns(state, meta_start, debug);
-                    state.t_perm_issues += 1;
-                    state.flush_permission_issue(
-                        &path.to_string_lossy(),
-                        "file",
-                        error_code_from_message(&e.to_string()),
-                    );
-                    continue;
-                }
-            };
-            record_metadata_ns(state, meta_start, debug);
-
             if ft.is_dir() {
                 if let Some(name) = path.file_name() {
                     if CRITICAL_SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
                         continue;
                     }
                 }
-                if let Some(rdev) = root_dev {
-                    if meta.dev() != rdev {
-                        continue;
-                    }
+                // Defer device check and metadata until worker processes dir.
+                subdirs.push(path);
+            } else if ft.is_file() {
+                if let Some(name) = path.file_name() {
+                    file_names.push(name.to_os_string());
                 }
+            }
+        }
 
-                state.t_dirs += 1;
-                state.t_inodes += 1;
-                state.add_progress(0, 1, 0);
+        // Enqueue subdirectories first.
+        for sub in subdirs {
+            state.t_dirs += 1;
+            state.t_inodes += 1;
+            state.add_progress(0, 1, 0);
+            match tx.try_send(ScanTask::Dir(sub.clone())) {
+                Ok(_) => {}
+                Err(_) => {
+                    stack.push(sub);
+                    state.queue_full_fallbacks += 1;
+                }
+            }
+        }
 
-                match tx.try_send(path.clone()) {
+        // Files: decide whether to chunk or process inline.
+        if file_names.len() > DIR_CHUNK_THRESHOLD {
+            // split into chunks
+            let mut i = 0usize;
+            while i < file_names.len() {
+                let end = (i + DIR_CHUNK_SIZE).min(file_names.len());
+                let chunk = file_names[i..end].to_vec();
+                match tx.try_send(ScanTask::FileChunk {
+                    parent: dir_path.clone(),
+                    files: chunk,
+                }) {
                     Ok(_) => {}
                     Err(_) => {
-                        stack.push(path);
+                        // fallback: process inline (to maintain forward progress)
                         state.queue_full_fallbacks += 1;
+                        for name in file_names[i..end].iter() {
+                            let path = dir_path.join(name);
+                            process_file_entry(
+                                &path,
+                                state,
+                                hardlinks,
+                                skips,
+                                root_dev,
+                                debug,
+                            );
+                        }
                     }
                 }
-            } else if ft.is_file() {
-                if meta.nlink() > 1 {
-                    if debug {
-                        state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if !hardlinks.insert((meta.ino(), meta.dev())) {
-                        continue;
-                    }
-                }
-
-                let size = meta.blocks() * 512;
-                let uid = meta.uid();
-                let is_target = match state.target_uids.as_ref() {
-                    Some(s) => s.contains(&uid),
-                    None => true,
-                };
-
-                state.t_files += 1;
-                state.t_inodes += 1;
-                state.t_size += size;
-
-                if is_target {
-                    *state.t_uid_sizes.entry(uid).or_insert(0) += size;
-                    *state.t_uid_files.entry(uid).or_insert(0) += 1;
-                    let path_start = debug.then(Instant::now);
-                    let path_str = path.to_string_lossy();
-                    record_path_ns(state, path_start, debug);
-                    state.push_event_binary(1, uid, size, path_str.as_ref());
-                    state.add_dir_size(uid, size, path_str.as_ref());
-                    let recs = state.event_records();
-                    let bytes = state.event_buffer_bytes();
-                    if debug {
-                        state
-                            .prof_max_event_buf_records
-                            .fetch_max(recs as u64, Ordering::Relaxed);
-                        state
-                            .prof_max_event_buf_bytes
-                            .fetch_max(bytes as u64, Ordering::Relaxed);
-                    }
-                    if recs >= SCAN_EVENT_FLUSH_THRESHOLD
-                        || bytes >= SCAN_EVENT_FLUSH_BYTES_THRESHOLD
-                    {
-                        state.flush_events();
-                    }
-                }
-                state.add_progress(1, 0, size);
+                i = end;
+            }
+        } else {
+            // small dir: stat inline as before
+            for name in file_names {
+                let path = dir_path.join(name);
+                process_file_entry(&path, state, hardlinks, skips, root_dev, debug);
             }
         }
     }
