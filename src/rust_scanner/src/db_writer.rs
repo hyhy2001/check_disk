@@ -221,8 +221,8 @@ fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResu
     // write); a leaked tmp.db would otherwise sit on disk until the next run.
     let result: PyResult<()> = (|| {
         let t_analyze = Instant::now();
-        conn.execute_batch("ANALYZE;")
-            .map_err(|e| PyRuntimeError::new_err(format!("analyze: {}", e)))?;
+        conn.execute_batch("PRAGMA optimize;")
+            .map_err(|e| PyRuntimeError::new_err(format!("optimize: {}", e)))?;
         let analyze_secs = t_analyze.elapsed().as_secs_f64();
 
         let build_size = fs::metadata(build_path).map(|m| m.len()).unwrap_or(0);
@@ -828,6 +828,17 @@ pub fn detail_set_meta(handle: &mut DetailBuildHandle, meta: &[(String, String)]
 }
 
 pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
+    // Boost cache + mmap for CREATE INDEX phase. Indexes are built by
+    // scanning the entire `files` table multiple times — bigger cache
+    // means fewer disk re-reads. Restored to default after finalize.
+    handle
+        .conn
+        .execute_batch(
+            "PRAGMA cache_size = -4194304;\
+             PRAGMA mmap_size = 8589934592;",
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("pragma boost: {}", e)))?;
+
     handle
         .conn
         .execute_batch(DETAIL_INDEX_DDL)
