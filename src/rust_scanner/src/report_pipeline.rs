@@ -110,7 +110,7 @@ pub fn cleanup_stale_build_dirs(parent: &Path, prefix: &str, active_path: &Path)
 fn spill_rows_to_disk(
     spool_root: &Path,
     seq: &Arc<AtomicU64>,
-    rows_by_user: &mut HashMap<String, Vec<(u64, String, String)>>,
+    rows_by_user: &mut HashMap<String, Vec<(u64, u32, u16)>>,
     row_spills: &mut HashMap<String, Vec<PathBuf>>,
 ) -> u64 {
     if rows_by_user.is_empty() {
@@ -139,20 +139,10 @@ fn spill_rows_to_disk(
             };
             let mut writer = FrameEncoder::new(file);
             let mut write_ok = true;
-            for (size, safe_path, ext) in rows_chunk {
-                let path_bytes = safe_path.as_bytes();
-                let path_len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
-                let ext_bytes = ext.as_bytes();
-                let ext_len = u16::try_from(ext_bytes.len()).unwrap_or(u16::MAX);
+            for (size, path_id, ext_id) in rows_chunk {
                 if writer.write_all(&size.to_le_bytes()).is_err()
-                    || writer.write_all(&path_len.to_le_bytes()).is_err()
-                    || writer
-                        .write_all(&path_bytes[..(path_len as usize).min(path_bytes.len())])
-                        .is_err()
-                    || writer.write_all(&ext_len.to_le_bytes()).is_err()
-                    || writer
-                        .write_all(&ext_bytes[..(ext_len as usize).min(ext_bytes.len())])
-                        .is_err()
+                    || writer.write_all(&path_id.to_le_bytes()).is_err()
+                    || writer.write_all(&ext_id.to_le_bytes()).is_err()
                 {
                     write_ok = false;
                     break;
@@ -372,7 +362,7 @@ impl PathTree {
 #[derive(Default)]
 struct LocalAgg {
     dir_sizes: HashMap<String, HashMap<u32, i64>>,
-    rows_by_user: HashMap<String, Vec<(u64, String, String)>>,
+    rows_by_user: HashMap<String, Vec<(u64, u32, u16)>>,
     row_spills: HashMap<String, Vec<PathBuf>>,
     row_count: usize,
     bytes_in_flight: usize,
@@ -475,9 +465,31 @@ pub(crate) fn build_detail_db_impl(
         let t1 = Instant::now();
         let spill_seq = Arc::new(AtomicU64::new(0));
 
+        let path_interner: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
+        let next_path_id: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
+        let ext_interner: Arc<DashMap<String, u16>> = Arc::new(DashMap::new());
+        let next_ext_id: Arc<AtomicU16> = Arc::new(AtomicU16::new(1));
+        ext_interner.insert(String::new(), 0u16);
+
         let merged_agg = bin_paths
             .into_par_iter()
-            .fold(LocalAgg::default, |mut agg, path| {
+            .fold(
+                {
+                    let path_interner = path_interner.clone();
+                    let next_path_id = next_path_id.clone();
+                    let ext_interner = ext_interner.clone();
+                    let next_ext_id = next_ext_id.clone();
+                    move || {
+                        let _ = (&path_interner, &next_path_id, &ext_interner, &next_ext_id);
+                        LocalAgg::default()
+                    }
+                },
+                |mut agg, path| {
+                let path_interner_local = path_interner.clone();
+                let next_path_id_local = next_path_id.clone();
+                let ext_interner_local = ext_interner.clone();
+                let next_ext_id_local = next_ext_id.clone();
                 let _ = for_each_scan_event_in_file(&path, |event| {
                     let username = uids_map
                         .get(&event.uid)
@@ -485,13 +497,27 @@ pub(crate) fn build_detail_db_impl(
                         .unwrap_or_else(|| format!("uid-{}", event.uid));
                     let safe_path = crate::sanitise_path(&event.path);
                     let ext = crate::pipe_types::extension_for_path(&safe_path);
-                    let added_bytes = 8 + safe_path.len() + ext.len() + 56; // u64 + 2×String payload + tuple overhead
+
+                    let path_id = if let Some(id) = path_interner_local.get(&safe_path) {
+                        *id
+                    } else {
+                        let new_id = next_path_id_local.fetch_add(1, Ordering::Relaxed);
+                        *path_interner_local.entry(safe_path.clone()).or_insert(new_id)
+                    };
+
+                    let ext_id = if let Some(id) = ext_interner_local.get(&ext) {
+                        *id
+                    } else {
+                        let new_id = next_ext_id_local.fetch_add(1, Ordering::Relaxed);
+                        *ext_interner_local.entry(ext).or_insert(new_id)
+                    };
+
                     agg.rows_by_user
                         .entry(username)
                         .or_default()
-                        .push((event.size, safe_path.clone(), ext));
+                        .push((event.size, path_id, ext_id));
                     agg.row_count += 1;
-                    agg.bytes_in_flight += added_bytes;
+                    agg.bytes_in_flight += 16;
                     if !has_dir_agg {
                         if let Some(parent) = crate::pipe_types::parent_path(&safe_path) {
                             let user_sizes = agg.dir_sizes.entry(parent).or_default();
@@ -499,6 +525,7 @@ pub(crate) fn build_detail_db_impl(
                         }
                     }
                 });
+
                 if agg.bytes_in_flight >= ROW_SPILL_BYTES || agg.row_count >= ROW_SPILL_THRESHOLD {
                     agg.spill_bytes_written += spill_rows_to_disk(
                         &spool_root,
@@ -639,13 +666,29 @@ pub(crate) fn build_detail_db_impl(
         // Eliminates per-row String allocations in the streaming insert pass.
         let t_reencode = Instant::now();
 
+        // Materialize global interners into dense Vecs so re-encode can map
+        // path_id -> String and ext_id -> String without holding the heavy
+        // DashMaps during the streaming re-encode.
+        let total_paths = next_path_id.load(Ordering::Relaxed) as usize;
+        let mut path_vec: Vec<String> = vec![String::new(); total_paths];
+        for entry in path_interner.iter() {
+            let idx = *entry.value() as usize;
+            if idx < path_vec.len() { path_vec[idx] = entry.key().clone(); }
+        }
+        drop(path_interner);
+        drop(next_path_id);
+
+        let total_exts = next_ext_id.load(Ordering::Relaxed) as usize;
+        let mut stage1_ext_vec: Vec<String> = vec![String::new(); total_exts];
+        for entry in ext_interner.iter() {
+            let idx = *entry.value() as usize;
+            if idx < stage1_ext_vec.len() { stage1_ext_vec[idx] = entry.key().clone(); }
+        }
+        drop(ext_interner);
+        drop(next_ext_id);
+
         let file_name_id_of: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
         let next_name_id = Arc::new(AtomicU32::new(0));
-        let ext_id_map: Arc<DashMap<String, u16>> = Arc::new(DashMap::new());
-        let next_ext_id_atomic = Arc::new(AtomicU16::new(1));
-
-        // Intern empty ext as id 0.
-        ext_id_map.insert(String::new(), 0u16);
 
         let spill_seq_compact = Arc::new(AtomicU64::new(1_000_000));
 
@@ -655,7 +698,7 @@ pub(crate) fn build_detail_db_impl(
                 let safe = sanitize_filename(username);
                 let mut compact_paths = Vec::new();
                 for spill_path in spill_paths {
-                    // Read full-path spill
+                    // Read compact full-path spill (size, path_id, ext_id)
                     let file = match std::fs::File::open(spill_path) {
                         Ok(f) => f,
                         Err(_) => continue,
@@ -675,8 +718,8 @@ pub(crate) fn build_detail_db_impl(
                     let mut compact_writer = FrameEncoder::new(compact_file);
 
                     let mut size_buf = [0u8; 8];
-                    let mut plen_buf = [0u8; 4];
-                    let mut elen_buf = [0u8; 2];
+                    let mut path_id_buf = [0u8; 4];
+                    let mut ext_id_buf = [0u8; 2];
                     let mut row_idx_local: usize = 0;
                     loop {
                         match decoder.read_exact(&mut size_buf) {
@@ -686,40 +729,30 @@ pub(crate) fn build_detail_db_impl(
                                 "re-encode read size at row {} in {}: {}", row_idx_local, spill_path.display(), e
                             ))),
                         }
-                        decoder.read_exact(&mut plen_buf).map_err(|e| PyRuntimeError::new_err(format!(
-                            "re-encode read path_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        decoder.read_exact(&mut path_id_buf).map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode read path_id at row {} in {}: {}", row_idx_local, spill_path.display(), e
                         )))?;
-                        let plen = u32::from_le_bytes(plen_buf) as usize;
-                        let mut path_bytes = vec![0u8; plen];
-                        decoder.read_exact(&mut path_bytes).map_err(|e| PyRuntimeError::new_err(format!(
-                            "re-encode read path_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                        )))?;
-                        decoder.read_exact(&mut elen_buf).map_err(|e| PyRuntimeError::new_err(format!(
-                            "re-encode read ext_len at row {} in {}: {}", row_idx_local, spill_path.display(), e
-                        )))?;
-                        let elen = u16::from_le_bytes(elen_buf) as usize;
-                        let mut ext_bytes = vec![0u8; elen];
-                        decoder.read_exact(&mut ext_bytes).map_err(|e| PyRuntimeError::new_err(format!(
-                            "re-encode read ext_bytes at row {} in {}: {}", row_idx_local, spill_path.display(), e
+                        decoder.read_exact(&mut ext_id_buf).map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode read ext_id at row {} in {}: {}", row_idx_local, spill_path.display(), e
                         )))?;
 
                         let size = u64::from_le_bytes(size_buf);
-                        let safe_path = match std::str::from_utf8(&path_bytes) {
-                            Ok(s) => s.to_string(),
-                            Err(_) => String::from_utf8_lossy(&path_bytes).into_owned(),
-                        };
-                        let ext = match std::str::from_utf8(&ext_bytes) {
-                            Ok(s) => s.to_string(),
-                            Err(_) => String::from_utf8_lossy(&ext_bytes).into_owned(),
+                        let path_id = u32::from_le_bytes(path_id_buf) as usize;
+                        let ext_id = u16::from_le_bytes(ext_id_buf);
+
+                        // Resolve safe_path from stage1 interner snapshot.
+                        let safe_path = if path_id < path_vec.len() {
+                            &path_vec[path_id]
+                        } else {
+                            ""
                         };
 
-                        // Resolve dir_id
-                        let parent = crate::pipe_types::parent_path(&safe_path)
+                        let parent = crate::pipe_types::parent_path(safe_path)
                             .unwrap_or_else(|| root.clone());
                         let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0) as u32;
 
                         // Intern basename -> name_id
-                        let basename = tm_basename(&safe_path);
+                        let basename = tm_basename(safe_path);
                         let name_id = if let Some(id) = file_name_id_of.get(&basename) {
                             *id
                         } else {
@@ -727,13 +760,7 @@ pub(crate) fn build_detail_db_impl(
                             *file_name_id_of.entry(basename).or_insert(new_id)
                         };
 
-                        // Intern ext -> ext_id
-                        let ext_id = if let Some(id) = ext_id_map.get(&ext) {
-                            *id
-                        } else {
-                            let new_id = next_ext_id_atomic.fetch_add(1, Ordering::Relaxed);
-                            *ext_id_map.entry(ext).or_insert(new_id)
-                        };
+                        // ext_id already provided by stage 1 — use directly
 
                         write_compact_row(&mut compact_writer, size, dir_id, name_id, ext_id)
                             .map_err(|e| PyRuntimeError::new_err(format!(
@@ -766,26 +793,23 @@ pub(crate) fn build_detail_db_impl(
             }
         }
         // Drop large DashMaps/Arcs now that we've converted them to owned
-        // collections (file_names, ext_id_of_lookup). This frees the
-        // basename/ext lookup tables from memory before the heavy streaming
+        // collections (file_names, ext_strings). This frees the
+        // basename lookup table from memory before the heavy streaming
         // and insert phases that follow.
         drop(file_name_id_of);
         drop(next_name_id);
 
-        let mut ext_id_of_lookup: HashMap<String, u16> = HashMap::new();
-        for entry in ext_id_map.iter() {
-            ext_id_of_lookup.insert(entry.key().clone(), *entry.value());
-        }
-        // Drop ext map & its atomic counter as they're no longer needed.
-        drop(ext_id_map);
-        let next_ext_id = next_ext_id_atomic.load(Ordering::Relaxed);
-        drop(next_ext_id_atomic);
+        // Use the stage1 ext vec built earlier instead of re-interning here.
+        let ext_strings: Vec<String> = stage1_ext_vec;
 
         if debug {
             println!("[Phase 2] Re-encoded spills in {:.2}s ({} users, parallel)",
                 t_reencode.elapsed().as_secs_f64(), compact_row_spills.len());
             println!("[RSS checkpoint] after re-encode: {:.1} MB", crate::pipe_types::get_rss_mb());
         }
+
+        // Free path_vec now that it's no longer needed to reduce peak memory.
+        drop(path_vec);
 
         // username -> uid (POSIX preferred; for unknown users keep negative slot.)
         let mut username_to_uid: HashMap<String, i64> = HashMap::new();
@@ -1104,15 +1128,8 @@ pub(crate) fn build_detail_db_impl(
 
         // ─── Insert dictionary + aggregate tables into detail.db ───
         // exts: order by id ascending. (names live in tm.names, not detail.db.)
-        let mut ext_strings: Vec<String> = vec![String::new(); next_ext_id as usize];
-        for (ext, id) in &ext_id_of_lookup {
-            if (*id as usize) < ext_strings.len() {
-                ext_strings[*id as usize] = ext.clone();
-            }
-        }
         db_writer::detail_insert_exts(&mut detail_handle, &ext_strings)?;
         drop(ext_strings);
-        drop(ext_id_of_lookup);
 
         // File basenames (detail.db's local names table; tm.names holds dir
         // segments only).
