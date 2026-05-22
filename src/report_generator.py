@@ -21,7 +21,7 @@ from .utils import save_json_report
 
 try:
     from src import fast_scanner as _fast_scanner
-    HAS_RUST_PIPELINE = hasattr(_fast_scanner, 'build_pipeline')
+    HAS_RUST_PIPELINE = hasattr(_fast_scanner, 'build_detail_db')
 except ImportError:
     _fast_scanner = None  # type: ignore
     HAS_RUST_PIPELINE = False
@@ -220,18 +220,33 @@ class ReportGenerator:
         level: int = 3,
         max_workers: Optional[int] = None,
     ) -> str:
-        """Return the TreeMap database path built by the Rust pipeline."""
+        """Build the TreeMap database via Phase 3 Rust pipeline."""
         self.config["tree_map_level"] = int(level)
-        if self.debug and max_workers is not None and scan_result.detail_tmpdir:
-            print(f"[Phase 3] TreeMap already built by Rust pipeline ({max_workers}w)")
         output_dir = os.path.dirname(self.output_file) or "."
         treemap_db = os.path.join(output_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
-        if os.path.exists(treemap_db):
-            return treemap_db
-        raise RuntimeError(
-            "TreeMap generation is part of Phase 2 SQLite output build. "
-            "Call generate_detail_reports() with build_treemap=True before generate_tree_map()."
+
+        agg_path = getattr(self, '_treemap_aggregates_path', None)
+        if not agg_path or not os.path.exists(agg_path):
+            if os.path.exists(treemap_db):
+                return treemap_db
+            raise RuntimeError(
+                "Treemap aggregates not found. "
+                "Run generate_detail_reports() with build_treemap=True first."
+            )
+
+        if self.debug:
+            print(f"[Phase 3] Building treemap from aggregates: {agg_path}")
+
+        _fast_scanner.build_treemap_db(
+            agg_path,
+            treemap_db,
+            getattr(self, '_treemap_root', self.config.get("directory", "/")),
+            int(getattr(self, '_treemap_max_level', level)),
+            int(getattr(self, '_treemap_min_size_bytes', 0)),
+            int(getattr(self, '_treemap_timestamp', scan_result.timestamp)),
+            bool(self.debug),
         )
+        return treemap_db
 
     @staticmethod
     def _get_rss_mb() -> float:
@@ -325,13 +340,24 @@ class ReportGenerator:
             int(max(1, int(max_workers))),
             bool(build_treemap),
         )
-        if not hasattr(_fast_scanner, "build_pipeline"):
-            raise RuntimeError("fast_scanner.build_pipeline is required")
+        if not hasattr(_fast_scanner, "build_detail_db"):
+            raise RuntimeError("fast_scanner.build_detail_db is required")
         print("[Phase 2] Rust pipeline started (large datasets may take a while)...")
-        total_files = int(_fast_scanner.build_pipeline(*build_args, bool(self.debug)))
+        total_files, agg_path = _fast_scanner.build_detail_db(*build_args, bool(self.debug))
+        total_files = int(total_files)
+        self._treemap_aggregates_path = agg_path
+        self._treemap_db_path = treemap_db_path
+        self._treemap_root = self.config.get("directory", "/")
+        self._treemap_max_level = int(max(1, tree_map_level))
+        self._treemap_min_size_bytes = 0
+        self._treemap_timestamp = int(scan_result.timestamp)
 
         created: List[str] = [detail_db_path]
-        if build_treemap:
+        if build_treemap and getattr(self, '_treemap_aggregates_path', None):
+            # Phase 3: build treemap.db immediately (backward-compat).
+            # cmd_run calls generate_tree_map() separately for the phase label;
+            # direct callers (tests, scripts) get treemap built here.
+            self.generate_tree_map(scan_result)
             created.append(treemap_db_path)
         self.cleanup_stale_detail_reports(created)
 

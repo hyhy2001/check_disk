@@ -24,6 +24,60 @@ use crate::pipe_treemap::{tm_basename, tm_parent, normalize_root};
 use crate::pipe_types::FILE_PART_RECORDS;
 
 const ROW_SPILL_THRESHOLD: usize = 200_000;
+const TREEMAP_AGG_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct TreemapAggregates {
+    pub(crate) version: u32,
+    pub(crate) names: Vec<String>,
+    pub(crate) dirs_in_order: Vec<SerializableDirRow>,
+    pub(crate) owner_weights: Vec<(i64, i64, i64)>,
+    pub(crate) subtree_size: Vec<i64>,
+    pub(crate) subtree_files: Vec<i64>,
+    pub(crate) direct_dir_count: Vec<i64>,
+    pub(crate) direct_file_count: Vec<i64>,
+    pub(crate) total_size_by_dir: Vec<i64>,
+    pub(crate) uid_to_username: HashMap<i64, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct SerializableDirRow {
+    pub(crate) id: i64,
+    pub(crate) parent_id: Option<i64>,
+    pub(crate) name_id: i64,
+    pub(crate) depth: i64,
+}
+
+fn persist_aggregates(path: &Path, agg: &TreemapAggregates) -> PyResult<()> {
+    let file = std::fs::File::create(path).map_err(|e| {
+        PyRuntimeError::new_err(format!("persist_aggregates create {}: {}", path.display(), e))
+    })?;
+    let mut encoder = zstd::Encoder::new(file, 3)
+        .map_err(|e| PyRuntimeError::new_err(format!("persist_aggregates zstd init: {}", e)))?;
+    bincode::serialize_into(&mut encoder, agg)
+        .map_err(|e| PyRuntimeError::new_err(format!("persist_aggregates bincode: {}", e)))?;
+    encoder
+        .finish()
+        .map_err(|e| PyRuntimeError::new_err(format!("persist_aggregates zstd finish: {}", e)))?;
+    Ok(())
+}
+
+fn load_aggregates(path: &Path) -> PyResult<TreemapAggregates> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| PyRuntimeError::new_err(format!("load_aggregates open {}: {}", path.display(), e)))?;
+    let decoder = zstd::Decoder::new(file)
+        .map_err(|e| PyRuntimeError::new_err(format!("load_aggregates zstd decoder: {}", e)))?;
+    let agg: TreemapAggregates = bincode::deserialize_from(decoder)
+        .map_err(|e| PyRuntimeError::new_err(format!("load_aggregates bincode: {}", e)))?;
+    if agg.version != TREEMAP_AGG_VERSION {
+        return Err(PyRuntimeError::new_err(format!(
+            "aggregates version mismatch: file={} expected={}",
+            agg.version, TREEMAP_AGG_VERSION
+        )));
+    }
+    Ok(agg)
+}
+
 
 /// Remove old `.detail_users_build_*` / `.tree_map_data_build_*` from previous
 /// crashed runs (anything that does not match the active build directory).
@@ -273,7 +327,7 @@ struct UserTotals {
 // ─── Main entry point ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-pub fn build_pipeline_dbs_impl(
+pub(crate) fn build_detail_db_impl(
     py: Python<'_>,
     tmpdir: String,
     uids_map: HashMap<u32, String>,
@@ -287,8 +341,8 @@ pub fn build_pipeline_dbs_impl(
     _max_workers: usize,
     build_treemap: bool,
     debug: bool,
-) -> PyResult<u64> {
-    py.allow_threads(move || -> PyResult<u64> {
+) -> PyResult<(u64, Option<PathBuf>)> {
+    py.allow_threads(move || -> PyResult<(u64, Option<PathBuf>)> {
         let t_all = Instant::now();
         #[allow(unused_assignments)]
         let mut t_perm_tsv = 0.0f64;
@@ -863,187 +917,15 @@ pub fn build_pipeline_dbs_impl(
             }
         }
 
-        // ─── STAGE 3a (after streaming): build treemap.db ──────────
-        // Spawn the treemap build on a background thread so it runs in
-        // parallel with detail.db's remaining dict + aggregate inserts and
-        // (more importantly) the detail.db CREATE INDEX + VACUUM finalize.
-        // Both DBs are atomically renamed into place at the very end of this
-        // function, so concurrent build is safe — neither file references the
-        // other at write time.
+        // ─── STAGE 3a: persist treemap aggregates (if build_treemap) ──────────
+        // Treemap building is now a separate phase — see build_treemap_db_impl.
+        // Aggregates needed by treemap stage are computed here and serialized
+        // to disk. Phase 2 (detail) returns; phase 3 (treemap) loads them with
+        // a clean Rust heap.
         let dirs_in_order_arc = Arc::new(std::mem::take(&mut path_tree.dirs_in_order));
         let uid_to_username_arc = Arc::new(uid_to_username);
 
         let t3a = Instant::now();
-        let treemap_thread: Option<std::thread::JoinHandle<PyResult<()>>> = if build_treemap {
-            let dirs_in_order_for_treemap = Arc::clone(&dirs_in_order_arc);
-            let uid_to_username_for_treemap = Arc::clone(&uid_to_username_arc);
-            let owner_weights_for_treemap = std::mem::take(&mut owner_weights);
-            let subtree_size_for_treemap = std::mem::take(&mut subtree_size);
-            let subtree_files_for_treemap = std::mem::take(&mut subtree_files);
-            let direct_dir_count_for_treemap = std::mem::take(&mut direct_dir_count);
-            let direct_file_count_for_treemap = std::mem::take(&mut direct_file_count);
-            let total_size_by_dir_for_treemap = std::mem::take(&mut total_size_by_dir);
-            let names_for_treemap = std::mem::take(&mut path_tree.names);
-            let root_for_treemap = root.clone();
-            let treemap_db_pb_clone = treemap_db_pb.clone();
-            let treemap_work_dir_clone = treemap_work_dir.clone();
-            Some(std::thread::spawn(move || -> PyResult<()> {
-                let _t_thread_start = std::time::Instant::now();
-                let t_owners = std::time::Instant::now();
-                // Precompute owner_uid per dir (= uid with max weight in that
-                // dir) in one linear scan over the sorted owner_weights. Avoids
-                // re-iterating a HashMap of HashMaps per included dir below.
-                // dir_ids are dense 0..n_dirs so a Vec is enough; entries with
-                // no weight stay at owner_uid_fallback after the loop.
-                let mut all_uids: HashSet<i64> = uid_to_username_for_treemap.keys().copied().collect();
-                for &(_, uid, _) in &owner_weights_for_treemap {
-                    all_uids.insert(uid);
-                }
-                let mut owners: Vec<OwnerRow> = all_uids
-                    .into_iter()
-                    .filter_map(|uid| {
-                        uid_to_username_for_treemap
-                            .get(&uid)
-                            .cloned()
-                            .map(|username| OwnerRow { uid, username })
-                    })
-                    .collect();
-                owners.sort_by_key(|o| o.uid);
-
-                let owner_uid_fallback = owners.first().map(|o| o.uid).unwrap_or(0);
-                let n_dirs_for_treemap = dirs_in_order_for_treemap.len();
-                // Helper: read a Vec slot indexed by dir_id, with bounds check.
-                let vec_at = |v: &Vec<i64>, id: i64| -> i64 {
-                    let idx = id as usize;
-                    if idx < v.len() { v[idx] } else { 0 }
-                };
-
-                // Precompute owner_uid_by_dir from sorted owner_weights in a
-                // single linear scan: per (dir_id, uid) run, track max size and
-                // emit the winning uid into the dir's slot. Replaces 4M+ HashMap
-                // lookups + per-dir argmax scans done in the previous version.
-                let mut owner_uid_by_dir: Vec<i64> = vec![owner_uid_fallback; n_dirs_for_treemap];
-                {
-                    let mut i = 0;
-                    while i < owner_weights_for_treemap.len() {
-                        let dir_id = owner_weights_for_treemap[i].0;
-                        let mut best_uid = owner_weights_for_treemap[i].1;
-                        let mut best_size = owner_weights_for_treemap[i].2;
-                        let mut j = i + 1;
-                        while j < owner_weights_for_treemap.len() && owner_weights_for_treemap[j].0 == dir_id {
-                            if owner_weights_for_treemap[j].2 > best_size {
-                                best_size = owner_weights_for_treemap[j].2;
-                                best_uid = owner_weights_for_treemap[j].1;
-                            }
-                            j += 1;
-                        }
-                        if (dir_id as usize) < owner_uid_by_dir.len() {
-                            owner_uid_by_dir[dir_id as usize] = best_uid;
-                        }
-                        i = j;
-                    }
-                }
-
-                let t_owners_done = t_owners.elapsed();
-                let t_filter = std::time::Instant::now();
-
-                // Filter dirs by max_level + min_size_bytes.
-                let mut included: HashSet<i64> = HashSet::new();
-                for d in dirs_in_order_for_treemap.iter() {
-                    if d.depth as usize > max_level {
-                        continue;
-                    }
-                    let size = vec_at(&subtree_size_for_treemap, d.id);
-                    if d.id != 0 && size < min_size_bytes {
-                        continue;
-                    }
-                    included.insert(d.id);
-                }
-                // Always include root.
-                included.insert(0);
-
-                let t_filter_done = t_filter.elapsed();
-                let t_dir_rows = std::time::Instant::now();
-
-                let dir_rows: Vec<DirRow> = dirs_in_order_for_treemap
-                    .iter()
-                    .filter(|d| included.contains(&d.id))
-                    .map(|d| {
-                        let total = vec_at(&subtree_size_for_treemap, d.id);
-                        let files = vec_at(&subtree_files_for_treemap, d.id);
-                        let _ = files;
-                        let dir_count = vec_at(&direct_dir_count_for_treemap, d.id);
-                        let file_count = vec_at(&direct_file_count_for_treemap, d.id);
-                        let owner_uid = vec_at(&owner_uid_by_dir, d.id);
-                        let has_files = if file_count > 0 || vec_at(&total_size_by_dir_for_treemap, d.id) > 0 {
-                            1
-                        } else {
-                            0
-                        };
-                        DirRow {
-                            id: d.id,
-                            parent_id: d.parent_id,
-                            name_id: d.name_id,
-                            total_size: total,
-                            file_count,
-                            dir_count,
-                            owner_uid,
-                            has_files,
-                        }
-                    })
-                    .collect();
-
-                let t_dir_rows_done = t_dir_rows.elapsed();
-                let t_build_db = std::time::Instant::now();
-
-                drop(owner_weights_for_treemap);
-
-                let treemap_total_size = vec_at(&subtree_size_for_treemap, 0);
-                let meta = vec![
-                    ("scan_root".to_string(), root_for_treemap),
-                    ("scan_timestamp".to_string(), timestamp.to_string()),
-                    ("max_level".to_string(), max_level.to_string()),
-                    ("total_size".to_string(), treemap_total_size.to_string()),
-                    (
-                        "total_dirs".to_string(),
-                        dirs_in_order_for_treemap.len().to_string(),
-                    ),
-                    ("schema_version".to_string(), "1".to_string()),
-                ];
-
-                let input = TreemapInput {
-                    names: names_for_treemap,
-                    owners,
-                    dirs: dir_rows,
-                    meta,
-                };
-                println!(
-                    "[Phase 2] Building treemap ({} dirs, max_level {}) in background...",
-                    input.dirs.len(),
-                    max_level
-                );
-                let result = db_writer::build_treemap_db(
-                    &treemap_db_pb_clone,
-                    &treemap_work_dir_clone,
-                    input,
-                    debug,
-                );
-                let t_build_db_done = t_build_db.elapsed();
-                if debug {
-                    eprintln!(
-                        "[treemap thread] owners={:.2}s filter={:.2}s dir_rows={:.2}s build_db={:.2}s total={:.2}s",
-                        t_owners_done.as_secs_f64(),
-                        t_filter_done.as_secs_f64(),
-                        t_dir_rows_done.as_secs_f64(),
-                        t_build_db_done.as_secs_f64(),
-                        _t_thread_start.elapsed().as_secs_f64(),
-                    );
-                }
-                result
-            }))
-        } else {
-            None
-        };
 
         // ─── Insert dictionary + aggregate tables into detail.db ───
         // exts: order by id ascending. (names live in tm.names, not detail.db.)
@@ -1133,19 +1015,46 @@ pub fn build_pipeline_dbs_impl(
         let files_inserted = db_writer::detail_finalize(detail_handle)?;
         t_finalize_detail = t5.elapsed().as_secs_f64();
 
-        // Join the parallel treemap-build thread spawned at Stage 3a.
-        if let Some(handle) = treemap_thread {
-            println!("[Phase 2] Waiting for treemap build to finish...");
-            match handle.join() {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(PyRuntimeError::new_err(
-                        "treemap build thread panicked".to_string(),
-                    ));
-                }
+        // ─── STAGE 6: persist treemap aggregates if requested ─────────
+        let agg_path_out: Option<PathBuf> = if build_treemap {
+            let t_persist = Instant::now();
+            let dirs_serialized: Vec<SerializableDirRow> = dirs_in_order_arc
+                .iter()
+                .map(|d| SerializableDirRow {
+                    id: d.id,
+                    parent_id: d.parent_id,
+                    name_id: d.name_id,
+                    depth: d.depth,
+                })
+                .collect();
+            let agg = TreemapAggregates {
+                version: TREEMAP_AGG_VERSION,
+                names: std::mem::take(&mut path_tree.names),
+                dirs_in_order: dirs_serialized,
+                owner_weights: std::mem::take(&mut owner_weights),
+                subtree_size: std::mem::take(&mut subtree_size),
+                subtree_files: std::mem::take(&mut subtree_files),
+                direct_dir_count: std::mem::take(&mut direct_dir_count),
+                direct_file_count: std::mem::take(&mut direct_file_count),
+                total_size_by_dir: std::mem::take(&mut total_size_by_dir),
+                uid_to_username: Arc::try_unwrap(uid_to_username_arc.clone())
+                    .unwrap_or_else(|arc| (*arc).clone()),
+            };
+            let agg_path = treemap_work_dir.join("aggregates.bin.zst");
+            persist_aggregates(&agg_path, &agg)?;
+            t_treemap_db = t3a.elapsed().as_secs_f64();
+            if debug {
+                println!(
+                    "[Phase 2] Persisted treemap aggregates ({:.2}s) → {}",
+                    t_persist.elapsed().as_secs_f64(),
+                    agg_path.display()
+                );
             }
-        }
-        t_treemap_db = t3a.elapsed().as_secs_f64();
+            Some(agg_path)
+        } else {
+            t_treemap_db = 0.0;
+            None
+        };
 
         // ─── Permission issues ─────────────────────────────────────
         let t_perm = Instant::now();
@@ -1168,7 +1077,11 @@ pub fn build_pipeline_dbs_impl(
         // ─── Cleanup work dirs ─────────────────────────────────────
         let _ = fs::remove_dir_all(&spool_root);
         let _ = fs::remove_dir_all(&detail_work_root);
-        let _ = fs::remove_dir_all(&treemap_work_dir);
+        // Keep treemap_work_dir when aggregates were persisted there —
+        // build_treemap_db_impl will clean it up after phase 3 completes.
+        if agg_path_out.is_none() {
+            let _ = fs::remove_dir_all(&treemap_work_dir);
+        }
         cleanup_legacy_artifacts(&detail_root, &treemap_root_dir);
 
         if debug {
@@ -1191,8 +1104,138 @@ pub fn build_pipeline_dbs_impl(
             println!("  Perm JSON write:    {:.4}s", t_perm_write);
             println!("  Peak RSS:           {:.1} MB", rss_mb);
         }
-        Ok(files_inserted as u64)
+        Ok((files_inserted as u64, agg_path_out))
     })
+}
+
+pub(crate) fn build_treemap_db_impl(
+    aggregates_path: &Path,
+    treemap_db_path: &Path,
+    treemap_root: &str,
+    max_level: usize,
+    min_size_bytes: i64,
+    timestamp: i64,
+    debug: bool,
+) -> PyResult<()> {
+    let t_start = Instant::now();
+    let agg = load_aggregates(aggregates_path)?;
+    if debug {
+        println!("[Phase 3] Loaded aggregates in {:.2}s ({} dirs)",
+            t_start.elapsed().as_secs_f64(), agg.dirs_in_order.len());
+    }
+
+    let treemap_parent = treemap_db_path.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let treemap_work_dir = treemap_parent.join(format!(".tree_map_data_build_{}", std::process::id()));
+    cleanup_stale_build_dirs(&treemap_parent, ".tree_map_data_build_", &treemap_work_dir);
+    recreate_dir(&treemap_work_dir)?;
+
+    let t_owners = Instant::now();
+    let mut all_uids: HashSet<i64> = agg.uid_to_username.keys().copied().collect();
+    for &(_, uid, _) in &agg.owner_weights {
+        all_uids.insert(uid);
+    }
+    let mut owners: Vec<OwnerRow> = all_uids
+        .into_iter()
+        .filter_map(|uid| {
+            agg.uid_to_username.get(&uid).cloned()
+                .map(|username| OwnerRow { uid, username })
+        })
+        .collect();
+    owners.sort_by_key(|o| o.uid);
+
+    let owner_uid_fallback = owners.first().map(|o| o.uid).unwrap_or(0);
+    let n_dirs = agg.dirs_in_order.len();
+    let vec_at = |v: &Vec<i64>, id: i64| -> i64 {
+        let idx = id as usize;
+        if idx < v.len() { v[idx] } else { 0 }
+    };
+
+    let mut owner_uid_by_dir: Vec<i64> = vec![owner_uid_fallback; n_dirs];
+    {
+        let mut i = 0;
+        while i < agg.owner_weights.len() {
+            let dir_id = agg.owner_weights[i].0;
+            let mut best_uid = agg.owner_weights[i].1;
+            let mut best_size = agg.owner_weights[i].2;
+            let mut j = i + 1;
+            while j < agg.owner_weights.len() && agg.owner_weights[j].0 == dir_id {
+                if agg.owner_weights[j].2 > best_size {
+                    best_size = agg.owner_weights[j].2;
+                    best_uid = agg.owner_weights[j].1;
+                }
+                j += 1;
+            }
+            if (dir_id as usize) < owner_uid_by_dir.len() {
+                owner_uid_by_dir[dir_id as usize] = best_uid;
+            }
+            i = j;
+        }
+    }
+    let t_owners_done = t_owners.elapsed();
+
+    let t_filter = Instant::now();
+    let mut included: HashSet<i64> = HashSet::new();
+    for d in &agg.dirs_in_order {
+        if d.depth as usize > max_level { continue; }
+        let size = vec_at(&agg.subtree_size, d.id);
+        if d.id != 0 && size < min_size_bytes { continue; }
+        included.insert(d.id);
+    }
+    included.insert(0);
+    let t_filter_done = t_filter.elapsed();
+
+    let t_dir_rows = Instant::now();
+    let dir_rows: Vec<DirRow> = agg.dirs_in_order.iter()
+        .filter(|d| included.contains(&d.id))
+        .map(|d| {
+            let total = vec_at(&agg.subtree_size, d.id);
+            let dir_count = vec_at(&agg.direct_dir_count, d.id);
+            let file_count = vec_at(&agg.direct_file_count, d.id);
+            let owner_uid = vec_at(&owner_uid_by_dir, d.id);
+            let has_files = if file_count > 0 || vec_at(&agg.total_size_by_dir, d.id) > 0 { 1 } else { 0 };
+            DirRow {
+                id: d.id,
+                parent_id: d.parent_id,
+                name_id: d.name_id,
+                total_size: total,
+                file_count,
+                dir_count,
+                owner_uid,
+                has_files,
+            }
+        })
+        .collect();
+    let t_dir_rows_done = t_dir_rows.elapsed();
+
+    let treemap_total_size = vec_at(&agg.subtree_size, 0);
+    let meta = vec![
+        ("scan_root".to_string(), normalize_root(treemap_root).to_string()),
+        ("scan_timestamp".to_string(), timestamp.to_string()),
+        ("max_level".to_string(), max_level.to_string()),
+        ("total_size".to_string(), treemap_total_size.to_string()),
+        ("total_dirs".to_string(), agg.dirs_in_order.len().to_string()),
+        ("schema_version".to_string(), "1".to_string()),
+    ];
+
+    let input = TreemapInput { names: agg.names, owners, dirs: dir_rows, meta };
+    println!("[Phase 3] Building treemap.db ({} dirs, max_level {})...", input.dirs.len(), max_level);
+
+    let t_build = Instant::now();
+    db_writer::build_treemap_db(treemap_db_path, &treemap_work_dir, input, debug)?;
+    let t_build_done = t_build.elapsed();
+
+    if debug {
+        eprintln!("[Phase 3] owners={:.2}s filter={:.2}s dir_rows={:.2}s build_db={:.2}s total={:.2}s",
+            t_owners_done.as_secs_f64(), t_filter_done.as_secs_f64(),
+            t_dir_rows_done.as_secs_f64(), t_build_done.as_secs_f64(),
+            t_start.elapsed().as_secs_f64());
+    }
+
+    let _ = std::fs::remove_file(aggregates_path);
+    let _ = std::fs::remove_dir_all(&treemap_work_dir);
+    Ok(())
 }
 
 /// Remove legacy NDJSON / shard outputs from previous runs that now have a

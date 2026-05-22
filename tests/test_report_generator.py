@@ -69,7 +69,7 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
     import src.report_generator as report_generator_module
 
     if not report_generator_module.HAS_RUST_PIPELINE:
-        pytest.skip("fast_scanner.build_pipeline is not available")
+        pytest.skip("fast_scanner.build_detail_db is not available")
 
     detail_tmpdir = tmp_path / "detail_tmp"
     detail_tmpdir.mkdir()

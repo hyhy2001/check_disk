@@ -49,6 +49,56 @@ fn scan_disk(
 
 #[pyfunction(signature = (tmpdir, uids_map, team_map, detail_db_path, treemap_db_path, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
 #[allow(clippy::too_many_arguments)]
+fn build_detail_db(
+    py: Python<'_>,
+    tmpdir: String,
+    uids_map: HashMap<u32, String>,
+    team_map: HashMap<String, String>,
+    detail_db_path: String,
+    treemap_db_path: String,
+    treemap_root: String,
+    max_level: usize,
+    min_size_bytes: i64,
+    timestamp: i64,
+    max_workers: usize,
+    build_treemap: bool,
+    debug: bool,
+) -> PyResult<(u64, Option<String>)> {
+    let (count, agg_path) = report_pipeline::build_detail_db_impl(
+        py, tmpdir, uids_map, team_map, detail_db_path, treemap_db_path,
+        treemap_root, max_level, min_size_bytes, timestamp, max_workers,
+        build_treemap, debug,
+    )?;
+    Ok((count, agg_path.map(|p| p.to_string_lossy().into_owned())))
+}
+
+#[pyfunction(signature = (aggregates_path, treemap_db_path, treemap_root, max_level, min_size_bytes, timestamp, debug=false))]
+#[allow(clippy::too_many_arguments)]
+fn build_treemap_db(
+    py: Python<'_>,
+    aggregates_path: String,
+    treemap_db_path: String,
+    treemap_root: String,
+    max_level: usize,
+    min_size_bytes: i64,
+    timestamp: i64,
+    debug: bool,
+) -> PyResult<()> {
+    py.allow_threads(|| {
+        report_pipeline::build_treemap_db_impl(
+            std::path::Path::new(&aggregates_path),
+            std::path::Path::new(&treemap_db_path),
+            &treemap_root,
+            max_level,
+            min_size_bytes,
+            timestamp,
+            debug,
+        )
+    })
+}
+
+#[pyfunction(signature = (tmpdir, uids_map, team_map, detail_db_path, treemap_db_path, treemap_root, max_level, min_size_bytes, timestamp, max_workers, build_treemap=true, debug=false))]
+#[allow(clippy::too_many_arguments)]
 fn build_pipeline(
     py: Python<'_>,
     tmpdir: String,
@@ -64,26 +114,27 @@ fn build_pipeline(
     build_treemap: bool,
     debug: bool,
 ) -> PyResult<u64> {
-    report_pipeline::build_pipeline_dbs_impl(
-        py,
-        tmpdir,
-        uids_map,
-        team_map,
-        detail_db_path,
-        treemap_db_path,
-        treemap_root,
-        max_level,
-        min_size_bytes,
-        timestamp,
-        max_workers,
-        build_treemap,
-        debug,
-    )
+    let (count, agg_path) = report_pipeline::build_detail_db_impl(
+        py, tmpdir, uids_map, team_map, detail_db_path.clone(), treemap_db_path.clone(),
+        treemap_root.clone(), max_level, min_size_bytes, timestamp, max_workers,
+        build_treemap, debug,
+    )?;
+    if let Some(p) = agg_path {
+        report_pipeline::build_treemap_db_impl(
+            &p,
+            std::path::Path::new(&treemap_db_path),
+            &treemap_root,
+            max_level, min_size_bytes, timestamp, debug,
+        )?;
+    }
+    Ok(count)
 }
 
 #[pymodule]
 fn fast_scanner(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_disk, m)?)?;
+    m.add_function(wrap_pyfunction!(build_detail_db, m)?)?;
+    m.add_function(wrap_pyfunction!(build_treemap_db, m)?)?;
     m.add_function(wrap_pyfunction!(build_pipeline, m)?)?;
     Ok(())
 }
