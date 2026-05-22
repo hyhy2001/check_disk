@@ -23,7 +23,7 @@ use crate::pipe_permission::write_permission_issues_db;
 use crate::pipe_treemap::{tm_basename, tm_parent, normalize_root};
 use crate::pipe_types::FILE_PART_RECORDS;
 
-const ROW_SPILL_THRESHOLD: usize = 500_000;
+const ROW_SPILL_THRESHOLD: usize = 200_000;
 const TREEMAP_AGG_VERSION: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize)]
