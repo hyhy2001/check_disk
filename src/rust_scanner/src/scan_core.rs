@@ -44,6 +44,7 @@ pub(crate) fn run_scan_core(
         uid_sizes: HashMap::new(),
         uid_files: HashMap::new(),
         permission_issues_count: 0,
+        total_queue_full_fallbacks: 0,
     }));
     let prog_files = Arc::new(AtomicU64::new(0));
     let prog_dirs = Arc::new(AtomicU64::new(0));
@@ -112,7 +113,7 @@ pub(crate) fn run_scan_core(
         // bound RAM (was ~6 GB unbounded internal queue -> ~40 MB now).
         // Workers fall back to inline DFS via local Vec stack when
         // the shared channel is full — no blocking, no deadlock.
-        const QUEUE_CAP: usize = 200_000;
+        const QUEUE_CAP: usize = 2_000_000;
         let (tx, rx) = bounded::<PathBuf>(QUEUE_CAP);
         let rx = Arc::new(rx);
         let active_count = Arc::new(AtomicUsize::new(0));
@@ -165,6 +166,7 @@ pub(crate) fn run_scan_core(
                         .map(|_| None)
                         .collect(),
                     t_perm_issues: 0,
+                    queue_full_fallbacks: 0,
                     global_stats: g_w,
                     prog_files: pf_w,
                     prog_dirs: pd_w,
@@ -321,6 +323,7 @@ pub(crate) fn run_scan_core(
         let flush_bytes = prof_flush_bytes.load(Ordering::Relaxed);
         let flush_count = prof_flush_count.load(Ordering::Relaxed);
         let hardlink_checks = prof_hardlink_checks.load(Ordering::Relaxed);
+        let total_queue_full_fallbacks = g.total_queue_full_fallbacks;
         let max_buf_records = prof_max_event_buf_records.load(Ordering::Relaxed);
         let max_buf_bytes = prof_max_event_buf_bytes.load(Ordering::Relaxed);
         let hardlink_set_size = hardlink_inodes_profile.len();
@@ -345,6 +348,7 @@ pub(crate) fn run_scan_core(
             "  Hardlink set size:  {}",
             format_num(hardlink_set_size as u64)
         );
+        println!("  Queue-full fallbacks: {}", format_num(total_queue_full_fallbacks));
     }
 
     Ok(result.into())
@@ -462,6 +466,7 @@ fn process_dir_inline(
                     Ok(_) => {}
                     Err(_) => {
                         stack.push(path);
+                        state.queue_full_fallbacks += 1;
                     }
                 }
             } else if ft.is_file() {

@@ -16,9 +16,11 @@ pub(crate) struct GlobalStats {
     pub(crate) uid_sizes: HashMap<u32, u64>,
     pub(crate) uid_files: HashMap<u32, u64>,
     pub(crate) permission_issues_count: u64,
+    pub(crate) total_queue_full_fallbacks: u64,
 }
 
 pub(crate) struct ThreadLocalState {
+    pub(crate) queue_full_fallbacks: u64,
     pub(crate) t_files: u64,
     pub(crate) t_dirs: u64,
     pub(crate) t_inodes: u64,
@@ -254,6 +256,7 @@ impl Drop for ThreadLocalState {
                 *g.uid_files.entry(*uid).or_insert(0) += files;
             }
             g.permission_issues_count += self.t_perm_issues;
+            g.total_queue_full_fallbacks += self.queue_full_fallbacks;
         }
     }
 }
