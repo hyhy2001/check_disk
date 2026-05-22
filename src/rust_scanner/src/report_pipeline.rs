@@ -571,6 +571,9 @@ pub(crate) fn build_detail_db_impl(
         );
         rows_by_user.clear();
         t_ingest = t1.elapsed().as_secs_f64();
+        if debug {
+            println!("[RSS checkpoint] after stage 1 ingest: {:.1} MB", crate::pipe_types::get_rss_mb());
+        }
 
         // ─── STAGE 2: Path tree + dir aggregate ────────────────────
         let _t2 = Instant::now();
@@ -583,6 +586,9 @@ pub(crate) fn build_detail_db_impl(
             dir_paths_set.len()
         );
         let mut path_tree = PathTree::build(&root, &dir_paths_set);
+        if debug {
+            println!("[RSS checkpoint] after path tree built: {:.1} MB", crate::pipe_types::get_rss_mb());
+        }
         // Free the path-keyed set now — path_tree owns the canonical layout
         // and lookups go through dir_id_of from here on.
         drop(dir_paths_set);
@@ -737,6 +743,7 @@ pub(crate) fn build_detail_db_impl(
         if debug {
             println!("[Phase 2] Re-encoded spills in {:.2}s ({} users, parallel)",
                 t_reencode.elapsed().as_secs_f64(), compact_row_spills.len());
+            println!("[RSS checkpoint] after re-encode: {:.1} MB", crate::pipe_types::get_rss_mb());
         }
 
         // username -> uid (POSIX preferred; for unknown users keep negative slot.)
@@ -931,6 +938,9 @@ pub(crate) fn build_detail_db_impl(
             .collect();
 
         let total_users = sorted_users.len();
+        if debug {
+            println!("[RSS checkpoint] before streaming insert: {:.1} MB", crate::pipe_types::get_rss_mb());
+        }
         println!(
             "[Phase 2] Building user detail for {} users...",
             total_users
@@ -1003,6 +1013,9 @@ pub(crate) fn build_detail_db_impl(
         if !chunk.is_empty() {
             db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
             chunk.clear();
+        }
+        if debug {
+            println!("[RSS checkpoint] after streaming insert: {:.1} MB", crate::pipe_types::get_rss_mb());
         }
         // Streaming pass is done — compact spill map can be dropped now.
         drop(compact_row_spills);
@@ -1123,9 +1136,13 @@ pub(crate) fn build_detail_db_impl(
                 fn malloc_trim(pad: usize) -> i32;
             }
             let rss_before = crate::pipe_types::get_rss_mb();
+            if debug {
+                println!("[RSS checkpoint] before malloc_trim: {:.1} MB", rss_before);
+            }
             let trim_result = unsafe { malloc_trim(0) };
             let rss_after = crate::pipe_types::get_rss_mb();
             if debug {
+                println!("[RSS checkpoint] after malloc_trim: {:.1} MB", rss_after);
                 println!(
                     "[Phase 2] malloc_trim(0)={} RSS: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
                     trim_result, rss_before, rss_after, rss_after - rss_before
