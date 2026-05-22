@@ -177,6 +177,52 @@ fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
+// Helper: write compact spill rows (size:u64 LE, dir_id:u32 LE, name_id:u32 LE, ext_id:u16 LE)
+fn write_compact_spill(path: &Path, rows: &[(u64, u32, u32, u16)]) -> bool {
+    let file = match OpenOptions::new().create(true).write(true).truncate(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut writer = FrameEncoder::new(file);
+    for &(size, dir_id, name_id, ext_id) in rows {
+        if writer.write_all(&size.to_le_bytes()).is_err()
+            || writer.write_all(&dir_id.to_le_bytes()).is_err()
+            || writer.write_all(&name_id.to_le_bytes()).is_err()
+            || writer.write_all(&ext_id.to_le_bytes()).is_err()
+        {
+            return false;
+        }
+    }
+    writer.flush().is_ok()
+}
+
+// Helper: read compact spill rows back into Vec
+fn read_compact_spill(path: &Path) -> Vec<(u64, u32, u32, u16)> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut decoder = FrameDecoder::new(file);
+    let mut rows = Vec::new();
+    let mut buf_size = [0u8; 8];
+    let mut buf_dir = [0u8; 4];
+    let mut buf_name = [0u8; 4];
+    let mut buf_ext = [0u8; 2];
+    loop {
+        if decoder.read_exact(&mut buf_size).is_err() { break; }
+        if decoder.read_exact(&mut buf_dir).is_err() { break; }
+        if decoder.read_exact(&mut buf_name).is_err() { break; }
+        if decoder.read_exact(&mut buf_ext).is_err() { break; }
+        rows.push((
+            u64::from_le_bytes(buf_size),
+            u32::from_le_bytes(buf_dir),
+            u32::from_le_bytes(buf_name),
+            u16::from_le_bytes(buf_ext),
+        ));
+    }
+    rows
+}
+
 // ─── Path tree assembly ───────────────────────────────────────────────
 
 /// Walks the set of directory paths discovered during ingestion + every parent
@@ -531,6 +577,103 @@ pub(crate) fn build_detail_db_impl(
         // and lookups go through dir_id_of from here on.
         drop(dir_paths_set);
 
+        // ─── STAGE 2b: re-encode full-path spills → compact ID spills ─────
+        // Replaces (size, path_str, ext_str) rows with (size, dir_id, name_id, ext_id).
+        // Eliminates per-row String allocations in the streaming insert pass.
+        let t_reencode = Instant::now();
+
+        let mut file_name_id_of: HashMap<String, i64> = HashMap::new();
+        let mut file_names: Vec<String> = Vec::new();
+        let mut ext_id_of_lookup: HashMap<String, i64> = HashMap::new();
+        let mut next_ext_id: i64 = 1;
+
+        // Intern empty ext as id 0.
+        ext_id_of_lookup.insert(String::new(), 0);
+
+        let mut compact_row_spills: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let spill_seq_compact = Arc::new(AtomicU64::new(1_000_000));
+
+        for (username, spill_paths) in &row_spills {
+            let safe = sanitize_filename(username);
+            let compact_paths = compact_row_spills.entry(username.clone()).or_default();
+            for spill_path in spill_paths {
+                // Read full-path spill
+                let file = match std::fs::File::open(spill_path) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let mut decoder = FrameDecoder::new(file);
+                let mut compact_rows: Vec<(u64, u32, u32, u16)> = Vec::new();
+                let mut size_buf = [0u8; 8];
+                let mut plen_buf = [0u8; 4];
+                let mut elen_buf = [0u8; 2];
+                loop {
+                    if decoder.read_exact(&mut size_buf).is_err() { break; }
+                    if decoder.read_exact(&mut plen_buf).is_err() { break; }
+                    let plen = u32::from_le_bytes(plen_buf) as usize;
+                    let mut path_bytes = vec![0u8; plen];
+                    if decoder.read_exact(&mut path_bytes).is_err() { break; }
+                    if decoder.read_exact(&mut elen_buf).is_err() { break; }
+                    let elen = u16::from_le_bytes(elen_buf) as usize;
+                    let mut ext_bytes = vec![0u8; elen];
+                    if decoder.read_exact(&mut ext_bytes).is_err() { break; }
+
+                    let size = u64::from_le_bytes(size_buf);
+                    let safe_path = match std::str::from_utf8(&path_bytes) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => String::from_utf8_lossy(&path_bytes).into_owned(),
+                    };
+                    let ext = match std::str::from_utf8(&ext_bytes) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => String::from_utf8_lossy(&ext_bytes).into_owned(),
+                    };
+
+                    // Resolve dir_id
+                    let parent = crate::pipe_types::parent_path(&safe_path)
+                        .unwrap_or_else(|| root.clone());
+                    let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0) as u32;
+
+                    // Intern basename → name_id
+                    let basename = tm_basename(&safe_path);
+                    let name_id = if let Some(&id) = file_name_id_of.get(&basename) {
+                        id as u32
+                    } else {
+                        let id = file_names.len() as i64;
+                        file_name_id_of.insert(basename.clone(), id);
+                        file_names.push(basename);
+                        id as u32
+                    };
+
+                    // Intern ext → ext_id
+                    let ext_id = if let Some(&id) = ext_id_of_lookup.get(&ext) {
+                        id as u16
+                    } else {
+                        let id = next_ext_id;
+                        next_ext_id = next_ext_id.saturating_add(1);
+                        ext_id_of_lookup.insert(ext, id);
+                        id as u16
+                    };
+
+                    compact_rows.push((size, dir_id, name_id, ext_id));
+                }
+
+                // Write compact spill
+                let id = spill_seq_compact.fetch_add(1, Ordering::Relaxed);
+                let compact_path = spool_root.join(format!("{}_{}.rows.compact", safe, id));
+                if write_compact_spill(&compact_path, &compact_rows) {
+                    compact_paths.push(compact_path);
+                }
+                // Delete original full-path spill
+                let _ = fs::remove_file(spill_path);
+            }
+        }
+        drop(row_spills); // free original spill map
+
+        if debug {
+            println!("[Phase 2] Re-encoded spills in {:.2}s ({} users)",
+                t_reencode.elapsed().as_secs_f64(), compact_row_spills.len());
+        }
+
         // username → uid (POSIX preferred; for unknown users keep negative slot.)
         let mut username_to_uid: HashMap<String, i64> = HashMap::new();
         let mut uid_to_username: HashMap<i64, String> = HashMap::new();
@@ -587,6 +730,9 @@ pub(crate) fn build_detail_db_impl(
             })
             .collect();
         drop(dir_sizes_by_user);
+
+        // dir_id_of is no longer needed after re-encode and dir aggregate remap.
+        path_tree.dir_id_of = HashMap::new();
 
         for (dir_id, uid_sizes) in &dir_sizes_drained {
             let mut total: i64 = 0;
@@ -691,14 +837,9 @@ pub(crate) fn build_detail_db_impl(
 
         let mut detail_handle = db_writer::detail_open(&detail_db_pb, &detail_work_root, debug)?;
 
-        let mut ext_id_of_lookup: HashMap<String, i64> = HashMap::new();
-        let mut next_ext_id: i64 = 0;
-
-        // File basenames live in detail.db, separately from tm.names (which
-        // holds DIR segments only). Splitting keeps treemap.db lean for the
-        // treemap UI consumer.
-        let mut file_name_id_of: HashMap<String, i64> = HashMap::new();
-        let mut file_names: Vec<String> = Vec::new();
+        // Note: file_name_id_of, file_names, ext_id_of_lookup and next_ext_id were
+        // populated during the re-encode pass above so the streaming loop can
+        // operate purely on integer IDs without allocating path Strings per row.
 
         let mut user_totals: HashMap<i64, UserTotals> = HashMap::new();
         let mut user_dir_size: HashMap<(i64, i64), (i64, i64)> = HashMap::new();
@@ -711,7 +852,7 @@ pub(crate) fn build_detail_db_impl(
         let mut next_file_id: i64 = 1;
         let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
 
-        let mut sorted_users: Vec<String> = row_spills.keys().cloned().collect();
+        let mut sorted_users: Vec<String> = compact_row_spills.keys().cloned().collect();
         sorted_users.sort();
 
         // Pre-size top_heaps with the exact user count so we don't pay the
@@ -719,7 +860,7 @@ pub(crate) fn build_detail_db_impl(
         let mut top_heaps: HashMap<i64, BinaryHeap<Reverse<(i64, i64)>>> =
             HashMap::with_capacity(sorted_users.len());
 
-        let user_spill_paths: HashMap<String, Vec<PathBuf>> = row_spills
+        let user_spill_paths: HashMap<String, Vec<PathBuf>> = compact_row_spills
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -738,92 +879,15 @@ pub(crate) fn build_detail_db_impl(
                 if let Ok(meta) = fs::metadata(spill_path) {
                     total_spill_read += meta.len();
                 }
-                let mut reader = match fs::File::open(spill_path) {
-                    Ok(f) => FrameDecoder::new(f),
-                    Err(_) => continue,
-                };
-                let mut head = [0u8; 12];
-                let mut ext_len_buf = [0u8; 2];
-                let mut path_bytes: Vec<u8> = Vec::new();
-                let mut ext_bytes: Vec<u8> = Vec::new();
-                loop {
-                    match reader.read_exact(&mut head) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => {
-                            return Err(PyRuntimeError::new_err(format!(
-                                "read spill head {}: {}",
-                                spill_path.display(),
-                                e
-                            )));
-                        }
-                    }
-                    let size = u64::from_le_bytes(head[0..8].try_into().unwrap_or([0u8; 8]));
-                    let path_len =
-                        u32::from_le_bytes(head[8..12].try_into().unwrap_or([0u8; 4])) as usize;
-                    path_bytes.clear();
-                    path_bytes.resize(path_len, 0);
-                    reader.read_exact(&mut path_bytes).map_err(|e| {
-                        PyRuntimeError::new_err(format!(
-                            "read spill path {}: {}",
-                            spill_path.display(),
-                            e
-                        ))
-                    })?;
-                    reader.read_exact(&mut ext_len_buf).map_err(|e| {
-                        PyRuntimeError::new_err(format!(
-                            "read spill ext len {}: {}",
-                            spill_path.display(),
-                            e
-                        ))
-                    })?;
-                    let ext_len = u16::from_le_bytes(ext_len_buf) as usize;
-                    ext_bytes.clear();
-                    ext_bytes.resize(ext_len, 0);
-                    reader.read_exact(&mut ext_bytes).map_err(|e| {
-                        PyRuntimeError::new_err(format!(
-                            "read spill ext {}: {}",
-                            spill_path.display(),
-                            e
-                        ))
-                    })?;
-                    let safe_path = match std::str::from_utf8(&path_bytes) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => String::from_utf8_lossy(&path_bytes).into_owned(),
-                    };
-                    let ext = match std::str::from_utf8(&ext_bytes) {
-                        Ok(s) => s.to_string(),
-                        Err(_) => String::from_utf8_lossy(&ext_bytes).into_owned(),
-                    };
-                    let basename = tm_basename(&safe_path);
+                let rows = read_compact_spill(spill_path);
+                for (size, dir_id_u32, name_id_u32, ext_id_u16) in rows {
+                    let size_i64 = size as i64;
+                    let dir_id = dir_id_u32 as i64;
+                    let name_id = name_id_u32 as i64;
+                    let ext_id = ext_id_u16 as i64;
 
-                    // Intern basename into detail.db's local file_names table.
-                    let name_id = match file_name_id_of.get(&basename) {
-                        Some(id) => *id,
-                        None => {
-                            let id = file_names.len() as i64;
-                            file_names.push(basename.clone());
-                            file_name_id_of.insert(basename, id);
-                            id
-                        }
-                    };
-
-                    // Intern ext.
-                    let ext_id = match ext_id_of_lookup.get(&ext) {
-                        Some(id) => *id,
-                        None => {
-                            let id = next_ext_id;
-                            next_ext_id += 1;
-                            ext_id_of_lookup.insert(ext.clone(), id);
-                            id
-                        }
-                    };
-
-                    let parent = crate::pipe_types::parent_path(&safe_path)
-                        .unwrap_or_else(|| root.clone());
-                    let dir_id = path_tree.dir_id_of.get(&parent).copied().unwrap_or(0);
                     let dus = user_dir_size.entry((uid, dir_id)).or_insert((0, 0));
-                    dus.0 += size as i64;
+                    dus.0 += size_i64;
                     dus.1 += 1;
 
                     if (dir_id as usize) < direct_file_count.len() {
@@ -831,21 +895,20 @@ pub(crate) fn build_detail_db_impl(
                     }
 
                     totals.files += 1;
-                    totals.size += size as i64;
+                    totals.size += size_i64;
                     total_docs += 1;
-                    total_size += size as i64;
+                    total_size += size_i64;
 
                     // Maintain top-K heap.
                     let file_id = next_file_id;
                     next_file_id += 1;
                     let h = top_heaps.entry(uid).or_default();
-                    let size_i = size as i64;
                     if h.len() < DEFAULT_TOP_K {
-                        h.push(Reverse((size_i, file_id)));
+                        h.push(Reverse((size_i64, file_id)));
                     } else if let Some(&Reverse((min_size, _))) = h.peek() {
-                        if size_i > min_size {
+                        if size_i64 > min_size {
                             h.pop();
-                            h.push(Reverse((size_i, file_id)));
+                            h.push(Reverse((size_i64, file_id)));
                         }
                     }
 
@@ -854,7 +917,7 @@ pub(crate) fn build_detail_db_impl(
                         name_id,
                         ext_id,
                         uid,
-                        size: size_i,
+                        size: size_i64,
                     });
                     if chunk.len() >= FILE_INSERT_CHUNK {
                         db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
@@ -887,7 +950,7 @@ pub(crate) fn build_detail_db_impl(
         // Saves ~1.5 GB (basename map) + ~1.5 GB (dir_id_of) at 75M-file
         // / 15M-dir scale.
         drop(file_name_id_of);
-        path_tree.dir_id_of = HashMap::new();
+        // path_tree.dir_id_of already cleared earlier after re-encode
 
         // Recompute subtree_files bottom-up now that direct_file_count is final.
         for d in &path_tree.dirs_in_order {
@@ -1009,7 +1072,7 @@ pub(crate) fn build_detail_db_impl(
         ];
         db_writer::detail_set_meta(&mut detail_handle, &detail_meta)?;
 
-        // ─── STAGE 5: index + finalize detail.db ───────────────────
+        // ─── STAGE 5: index + finalize detail.db ─────────────────
         let t5 = Instant::now();
         println!("[Phase 2] Finalizing detail.db (index + vacuum)...");
         let files_inserted = db_writer::detail_finalize(detail_handle)?;
