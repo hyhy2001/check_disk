@@ -1057,10 +1057,13 @@ pub(crate) fn build_detail_db_impl(
             }
         }
         db_writer::detail_insert_exts(&mut detail_handle, &ext_strings)?;
+        drop(ext_strings);
+        drop(ext_id_of_lookup);
 
         // File basenames (detail.db's local names table; tm.names holds dir
         // segments only).
         db_writer::detail_insert_names(&mut detail_handle, &file_names)?;
+        drop(file_names);
 
         // users
         let mut user_rows: Vec<UserRow> = Vec::with_capacity(user_totals.len());
@@ -1084,18 +1087,23 @@ pub(crate) fn build_detail_db_impl(
         }
         user_rows.sort_by_key(|u| u.uid);
         db_writer::detail_insert_users(&mut detail_handle, &user_rows)?;
+        drop(user_totals);
+        drop(user_dir_count);
+        drop(user_rows);
 
         // dir_user_size
         let dus_rows: Vec<DirUserSizeRow> = user_dir_size
-            .iter()
-            .map(|(&(uid, dir_id), &(size, files))| DirUserSizeRow {
+            .drain()
+            .map(|((uid, dir_id), (size, files))| DirUserSizeRow {
                 uid,
                 dir_id,
                 size,
                 files,
             })
             .collect();
+        drop(user_dir_size);
         db_writer::detail_insert_dir_user_size(&mut detail_handle, &dus_rows)?;
+        drop(dus_rows);
 
         // top_files
         let mut top_entries: Vec<(i64, Vec<(i64, i64)>)> = Vec::with_capacity(top_heaps.len());
@@ -1107,6 +1115,7 @@ pub(crate) fn build_detail_db_impl(
         }
         top_entries.sort_by_key(|(uid, _)| *uid);
         db_writer::detail_insert_top_files(&mut detail_handle, &top_entries)?;
+        drop(top_entries);
 
         // detail.db meta
         let detail_meta = vec![
