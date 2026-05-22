@@ -1117,6 +1117,16 @@ pub(crate) fn build_detail_db_impl(
         db_writer::detail_insert_top_files(&mut detail_handle, &top_entries)?;
         drop(top_entries);
 
+        #[cfg(target_os = "linux")]
+        {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> i32;
+            }
+            unsafe {
+                malloc_trim(0);
+            }
+        }
+
         // detail.db meta
         let detail_meta = vec![
             ("scan_root".to_string(), root.clone()),
