@@ -718,12 +718,21 @@ pub(crate) fn build_detail_db_impl(
                 file_names[idx] = entry.key().clone();
             }
         }
+        // Drop large DashMaps/Arcs now that we've converted them to owned
+        // collections (file_names, ext_id_of_lookup). This frees the
+        // basename/ext lookup tables from memory before the heavy streaming
+        // and insert phases that follow.
+        drop(file_name_id_of);
+        drop(next_name_id);
 
         let mut ext_id_of_lookup: HashMap<String, u16> = HashMap::new();
         for entry in ext_id_map.iter() {
             ext_id_of_lookup.insert(entry.key().clone(), *entry.value());
         }
+        // Drop ext map & its atomic counter as they're no longer needed.
+        drop(ext_id_map);
         let next_ext_id = next_ext_id_atomic.load(Ordering::Relaxed);
+        drop(next_ext_id_atomic);
 
         if debug {
             println!("[Phase 2] Re-encoded spills in {:.2}s ({} users, parallel)",
@@ -995,17 +1004,10 @@ pub(crate) fn build_detail_db_impl(
             db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
             chunk.clear();
         }
+        // Streaming pass is done — compact spill map can be dropped now.
+        drop(compact_row_spills);
         t_files_db = t_pipeline.elapsed().as_secs_f64();
 
-        // Streaming pass is done — drop two big lookup tables that are no
-        // longer needed. Verified: `file_name_id_of` is only used inside the
-        // stream loop (the dedup'd basenames live in `file_names: Vec`,
-        // which is consumed later by detail_insert_names). `dir_id_of` is
-        // only used in the stream loop to map parent_path → dir_id; the
-        // remaining stages key everything by dir_id directly.
-        // Saves ~1.5 GB (basename map) + ~1.5 GB (dir_id_of) at 75M-file
-        // / 15M-dir scale.
-        drop(file_name_id_of);
         // path_tree.dir_id_of already cleared earlier after re-encode
 
         // Recompute subtree_files bottom-up now that direct_file_count is final.
