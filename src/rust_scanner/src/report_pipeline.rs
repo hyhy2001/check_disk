@@ -178,32 +178,18 @@ fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
-// Helper: write compact spill rows (size:u64 LE, dir_id:u32 LE, name_id:u32 LE, ext_id:u16 LE)
-fn write_compact_spill(path: &Path, rows: &[(u64, u32, u32, u16)]) -> PyResult<()> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|e| PyRuntimeError::new_err(format!("write_compact_spill open {}: {}", path.display(), e)))?;
-    let mut writer = FrameEncoder::new(file);
-    for (i, &(size, dir_id, name_id, ext_id)) in rows.iter().enumerate() {
-        writer.write_all(&size.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
-            "write_compact_spill row {} in {}: {}", i, path.display(), e
-        )))?;
-        writer.write_all(&dir_id.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
-            "write_compact_spill row {} in {}: {}", i, path.display(), e
-        )))?;
-        writer.write_all(&name_id.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
-            "write_compact_spill row {} in {}: {}", i, path.display(), e
-        )))?;
-        writer.write_all(&ext_id.to_le_bytes()).map_err(|e| PyRuntimeError::new_err(format!(
-            "write_compact_spill row {} in {}: {}", i, path.display(), e
-        )))?;
-    }
-    writer.flush().map_err(|e| PyRuntimeError::new_err(format!(
-        "write_compact_spill flush {}: {}", path.display(), e
-    )))?;
+// Helper: write a single compact spill row (size:u64 LE, dir_id:u32 LE, name_id:u32 LE, ext_id:u16 LE)
+fn write_compact_row(
+    writer: &mut FrameEncoder<std::fs::File>,
+    size: u64,
+    dir_id: u32,
+    name_id: u32,
+    ext_id: u16,
+) -> std::io::Result<()> {
+    writer.write_all(&size.to_le_bytes())?;
+    writer.write_all(&dir_id.to_le_bytes())?;
+    writer.write_all(&name_id.to_le_bytes())?;
+    writer.write_all(&ext_id.to_le_bytes())?;
     Ok(())
 }
 
@@ -628,7 +614,19 @@ pub(crate) fn build_detail_db_impl(
                         Err(_) => continue,
                     };
                     let mut decoder = FrameDecoder::new(file);
-                    let mut compact_rows: Vec<(u64, u32, u32, u16)> = Vec::new();
+
+                    let id = spill_seq_compact.fetch_add(1, Ordering::Relaxed);
+                    let compact_path = spool_root.join(format!("{}_{}.rows.compact", safe, id));
+                    let compact_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&compact_path)
+                        .map_err(|e| PyRuntimeError::new_err(format!(
+                            "re-encode open compact {}: {}", compact_path.display(), e
+                        )))?;
+                    let mut compact_writer = FrameEncoder::new(compact_file);
+
                     let mut size_buf = [0u8; 8];
                     let mut plen_buf = [0u8; 4];
                     let mut elen_buf = [0u8; 2];
@@ -690,14 +688,17 @@ pub(crate) fn build_detail_db_impl(
                             *ext_id_map.entry(ext).or_insert(new_id)
                         };
 
-                        compact_rows.push((size, dir_id, name_id, ext_id));
+                        write_compact_row(&mut compact_writer, size, dir_id, name_id, ext_id)
+                            .map_err(|e| PyRuntimeError::new_err(format!(
+                                "re-encode write row {} to {}: {}", row_idx_local, compact_path.display(), e
+                            )))?;
                         row_idx_local += 1;
                     }
 
-                    // Write compact spill
-                    let id = spill_seq_compact.fetch_add(1, Ordering::Relaxed);
-                    let compact_path = spool_root.join(format!("{}_{}.rows.compact", safe, id));
-                    write_compact_spill(&compact_path, &compact_rows)?;
+                    compact_writer.flush().map_err(|e| PyRuntimeError::new_err(format!(
+                        "re-encode flush {}: {}", compact_path.display(), e
+                    )))?;
+
                     compact_paths.push(compact_path);
                     // Delete original full-path spill
                     let _ = fs::remove_file(spill_path);
