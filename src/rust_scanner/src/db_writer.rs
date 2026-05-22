@@ -149,12 +149,10 @@ CREATE INDEX ix_files_uid_size       ON files(uid, size DESC);
 -- Cover (uid, ext_id) lookups so ext-only filter — and ext + size combined —
 -- hits an index instead of scanning files. Critical at 75M-row scale: a full
 -- scan would be ~25s; this index makes ext filter ~ms regardless of size.
-CREATE INDEX ix_files_uid_ext_size   ON files(uid, ext_id, size DESC);
 -- Cover keyword search via LIKE-on-tm.names + name_id JOIN. The (name_id, uid)
 -- prefix is enough; the size column was dropped because keyword matches
 -- typically yield only hundreds–thousands of rows and the temp-B-tree sort on
 -- that small set takes microseconds.
-CREATE INDEX ix_files_name_uid       ON files(name_id, uid);
 CREATE INDEX ix_dus_uid_size         ON dir_user_size(uid, size DESC);
 ";
 

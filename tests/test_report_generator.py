@@ -145,10 +145,11 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
         }
         assert indexes >= {
             "ix_files_uid_size",
-            "ix_files_uid_ext_size",
-            "ix_files_name_uid",
             "ix_dus_uid_size",
         }
+        # ix_files_uid_ext_size and ix_files_name_uid dropped (no production callers).
+        assert "ix_files_uid_ext_size" not in indexes
+        assert "ix_files_name_uid" not in indexes
         # ix_files_dir_size was removed (no callers).
         assert "ix_files_dir_size" not in indexes
         # Old partial index replaced by full ix_files_uid_size.
