@@ -139,7 +139,7 @@ impl ThreadLocalState {
                 let fp = format!("{}/scan_t{}_b{}.bin", self.tmpdir, self.thread_id, bucket);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
                     let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
-                    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, f);
+                    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, f);
                     if write_header {
                         let _ = writer.write_all(&SCAN_EVENT_BIN_MAGIC_V1);
                     }
@@ -153,8 +153,8 @@ impl ThreadLocalState {
                 self.t_event_buf_records[bucket] = 0;
                 flushes += 1;
             }
-            if self.t_event_bin_bufs[bucket].capacity() > 128 * 1024 * 1024 {
-                self.t_event_bin_bufs[bucket].shrink_to(64 * 1024 * 1024);
+            if self.t_event_bin_bufs[bucket].capacity() > 4 * 1024 * 1024 {
+                self.t_event_bin_bufs[bucket].shrink_to(2 * 1024 * 1024);
             }
         }
         self.t_event_flush_count += flushes as u32;
@@ -204,7 +204,7 @@ impl ThreadLocalState {
             let fp = format!("{}/diragg_t{}.bin", self.tmpdir, self.thread_id);
             if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
                 let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
-                let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, f);
+                let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, f);
                 if write_header {
                     let _ = writer.write_all(&DIR_AGG_BIN_MAGIC_V1);
                 }
