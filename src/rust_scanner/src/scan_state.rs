@@ -150,7 +150,7 @@ impl ThreadLocalState {
                 let fp = format!("{}/scan_t{}_b{}.bin", self.tmpdir, self.thread_id, bucket);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
                     let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
-                    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, f);
+                    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, f);
                     if write_header {
                         let _ = writer.write_all(&SCAN_EVENT_BIN_MAGIC_V1);
                     }

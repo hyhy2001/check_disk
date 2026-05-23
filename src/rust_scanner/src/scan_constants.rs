@@ -9,7 +9,7 @@ pub(crate) const CRITICAL_SKIP_NAMES: &[&str] = &[
 ];
 
 pub(crate) const SCAN_EVENT_FLUSH_THRESHOLD: usize = 250_000;
-pub(crate) const SCAN_EVENT_FLUSH_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
+pub(crate) const SCAN_EVENT_FLUSH_BYTES_THRESHOLD: usize = 32 * 1024 * 1024;
 
 /// When a directory has more than this many entries, split into FileChunk tasks
 /// to enable parallel processing across workers. Smaller chunks = better load
