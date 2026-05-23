@@ -1,8 +1,8 @@
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
+use rayon::Scope;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -21,14 +21,181 @@ use crate::scan_utils::{
     error_code_from_message, format_num, format_rate, format_size, get_rss_mb,
 };
 
-enum ScanTask {
-    /// Process an entire directory: read entries, stat each, recurse into subdirs.
-    Dir(std::path::PathBuf),
-    /// Process a chunk of file entries from a parent directory (already read but not yet stat'd).
-    FileChunk {
-        parent: std::path::PathBuf,
-        files: Vec<std::ffi::OsString>,
-    },
+// Shared state accessible to all Rayon tasks.
+struct SharedScanState {
+    hardlinks: Arc<DashSet<(u64, u64)>>,
+    global_stats: Arc<Mutex<GlobalStats>>,
+    prog_files: Arc<AtomicU64>,
+    prog_dirs: Arc<AtomicU64>,
+    prog_size: Arc<AtomicU64>,
+    prof_metadata_ns: Arc<AtomicU64>,
+    prof_path_ns: Arc<AtomicU64>,
+    prof_flush_ns: Arc<AtomicU64>,
+    prof_flush_bytes: Arc<AtomicU64>,
+    prof_flush_count: Arc<AtomicU64>,
+    prof_hardlink_checks: Arc<AtomicU64>,
+    prof_max_event_buf_records: Arc<AtomicU64>,
+    prof_max_event_buf_bytes: Arc<AtomicU64>,
+    tmpdir: String,
+    target_uids: Option<HashSet<u32>>,
+    skips: Vec<String>,
+    root_dev: Option<u64>,
+    debug: bool,
+    registry: Arc<DashMap<usize, Arc<Mutex<ThreadLocalState>>>>,
+}
+
+thread_local! {
+    static WORKER_STATE: std::cell::RefCell<Option<Arc<Mutex<ThreadLocalState>>>> = std::cell::RefCell::new(None);
+}
+
+fn get_or_init_state(shared: &Arc<SharedScanState>) -> Arc<Mutex<ThreadLocalState>> {
+    WORKER_STATE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if let Some(s) = opt.as_ref() {
+            return Arc::clone(s);
+        }
+        let idx = rayon::current_thread_index().unwrap_or(usize::MAX);
+        let state = Arc::new(Mutex::new(ThreadLocalState {
+            t_files: 0,
+            t_dirs: 0,
+            t_inodes: 0,
+            t_size: 0,
+            t_uid_sizes: HashMap::new(),
+            t_uid_files: HashMap::new(),
+            t_dir_sizes: HashMap::new(),
+            t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
+                .map(|_| Vec::with_capacity(1024 * 1024))
+                .collect(),
+            t_event_buf_records: vec![0; ThreadLocalState::EVENT_BUCKETS],
+            t_event_flush_count: 0,
+            event_bin_writers: (0..ThreadLocalState::EVENT_BUCKETS)
+                .map(|_| None)
+                .collect(),
+            t_perm_issues: 0,
+            queue_full_fallbacks: 0,
+            idle_time_ns: 0,
+            active_time_ns: 0,
+            tasks_processed: 0,
+            global_stats: shared.global_stats.clone(),
+            prog_files: shared.prog_files.clone(),
+            prog_dirs: shared.prog_dirs.clone(),
+            prog_size: shared.prog_size.clone(),
+            pending_prog_files: 0,
+            pending_prog_dirs: 0,
+            pending_prog_size: 0,
+            tmpdir: shared.tmpdir.clone(),
+            target_uids: shared.target_uids.clone(),
+            thread_id: idx,
+            profile_enabled: shared.debug,
+            prof_metadata_ns: shared.prof_metadata_ns.clone(),
+            prof_path_ns: shared.prof_path_ns.clone(),
+            prof_flush_ns: shared.prof_flush_ns.clone(),
+            prof_flush_bytes: shared.prof_flush_bytes.clone(),
+            prof_flush_count: shared.prof_flush_count.clone(),
+            prof_hardlink_checks: shared.prof_hardlink_checks.clone(),
+            prof_max_event_buf_records: shared.prof_max_event_buf_records.clone(),
+            prof_max_event_buf_bytes: shared.prof_max_event_buf_bytes.clone(),
+            perm_writer: None,
+            dir_agg_writer: None,
+        }));
+        shared.registry.insert(idx, Arc::clone(&state));
+        *opt = Some(Arc::clone(&state));
+        Arc::clone(opt.as_ref().unwrap())
+    })
+}
+
+fn process_dir_rayon<'scope>(
+    dir: PathBuf,
+    scope: &Scope<'scope>,
+    shared: Arc<SharedScanState>,
+) {
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(err) => {
+            // log perm error to thread-local state
+            let state_arc = get_or_init_state(&shared);
+            let mut state = state_arc.lock().unwrap();
+            state.t_perm_issues += 1;
+            state.flush_permission_issue(&dir.to_string_lossy(), "directory", "EACCES");
+            return;
+        }
+    };
+
+    let mut subdirs = Vec::new();
+    let mut files = Vec::new();
+
+    'entry_collect: for entry_res in entries {
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        for s in &shared.skips {
+            if path.starts_with(s) {
+                continue 'entry_collect;
+            }
+        }
+        let ftype = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ftype.is_symlink() {
+            let state_arc = get_or_init_state(&shared);
+            let mut state = state_arc.lock().unwrap();
+            state.t_inodes += 1;
+            continue;
+        }
+        if ftype.is_dir() {
+            if let Some(name) = path.file_name() {
+                if CRITICAL_SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
+                    continue;
+                }
+            }
+            subdirs.push(path);
+        } else if ftype.is_file() {
+            if let Some(name) = path.file_name() {
+                files.push(name.to_os_string());
+            }
+        }
+    }
+
+    for subdir in subdirs {
+        let s = Arc::clone(&shared);
+        let sub = subdir.clone();
+        // update progress counts
+        let state_arc = get_or_init_state(&shared);
+        {
+            let mut state = state_arc.lock().unwrap();
+            state.t_dirs += 1;
+            state.t_inodes += 1;
+            state.add_progress(0, 1, 0);
+        }
+        scope.spawn(move |sco| process_dir_rayon(sub, sco, s));
+    }
+
+    let dir_arc = Arc::new(dir);
+    if files.len() <= DIR_CHUNK_THRESHOLD {
+        let state_arc = get_or_init_state(&shared);
+        let mut state = state_arc.lock().unwrap();
+        for name in files {
+            let path = dir_arc.join(&name);
+            process_file_entry(&path, &mut state, &shared.hardlinks, &shared.skips, shared.root_dev, shared.debug);
+        }
+    } else {
+        for chunk in files.chunks(DIR_CHUNK_SIZE) {
+            let chunk_vec: Vec<std::ffi::OsString> = chunk.to_vec();
+            let dir_clone = Arc::clone(&dir_arc);
+            let s = Arc::clone(&shared);
+            scope.spawn(move |_| {
+                let state_arc = get_or_init_state(&s);
+                let mut state = state_arc.lock().unwrap();
+                for name in chunk_vec {
+                    let path = dir_clone.join(&name);
+                    process_file_entry(&path, &mut state, &s.hardlinks, &s.skips, s.root_dev, s.debug);
+                }
+            });
+        }
+    }
 }
 
 pub(crate) fn run_scan_core(
@@ -45,7 +212,7 @@ pub(crate) fn run_scan_core(
         .tempdir()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let tmpdir_str = _tmpdir.path().to_string_lossy().to_string();
-    let _ = _tmpdir.keep(); // persist tmp dir; Python side cleans up later
+    let _ = _tmpdir.keep();
 
     let global_stats = Arc::new(Mutex::new(GlobalStats::new()));
     let prog_files = Arc::new(AtomicU64::new(0));
@@ -61,47 +228,42 @@ pub(crate) fn run_scan_core(
     let prof_max_event_buf_records = Arc::new(AtomicU64::new(0));
     let prof_max_event_buf_bytes = Arc::new(AtomicU64::new(0));
 
-    // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
-
-    let g_clone = global_stats.clone();
-    let pf_clone = prog_files.clone();
-    let pd_clone = prog_dirs.clone();
-    let ps_clone = prog_size.clone();
-    let d_clone = done.clone();
-    let dir_clone = directory.clone();
-    let skips = skip_dirs.clone();
-    let tmpdir_clone = tmpdir_str.clone();
-    let pm_clone = prof_metadata_ns.clone();
-    let pp_clone = prof_path_ns.clone();
-    let pfns_clone = prof_flush_ns.clone();
-    let pfb_clone = prof_flush_bytes.clone();
-    let pfc_clone = prof_flush_count.clone();
-    let ph_clone = prof_hardlink_checks.clone();
-    let pmaxr_clone = prof_max_event_buf_records.clone();
-    let pmaxb_clone = prof_max_event_buf_bytes.clone();
 
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    // Phase 1 is metadata-I/O-bound (lstat dominates wall time on NFS /
-    // large filesystems — production logs show ~25 threads blocked on
-    // metadata vs ~559s wall). cpus*4 lets the kernel keep more inflight
-    // requests per disk; clamp(4, 64) keeps small machines reasonable
-    // while not capping I/O-rich storage. CLI `--max-workers` overrides.
     let default_threads = (cpus * 4).clamp(4, 64);
     let threads_count = max_workers.unwrap_or(default_threads).max(1);
-    let thread_counter = Arc::new(AtomicUsize::new(0));
-    let target_uids_shared =
-        Arc::new(target_uids.map(|uids| uids.into_iter().collect::<HashSet<u32>>()));
-    // Shared cross-worker hard-link deduplication — DashSet avoids Mutex bottleneck
-    let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
-    let hardlink_inodes_profile = hardlink_inodes.clone();
+
+    let shared = Arc::new(SharedScanState {
+        hardlinks: Arc::new(DashSet::new()),
+        global_stats: global_stats.clone(),
+        prog_files: prog_files.clone(),
+        prog_dirs: prog_dirs.clone(),
+        prog_size: prog_size.clone(),
+        prof_metadata_ns: prof_metadata_ns.clone(),
+        prof_path_ns: prof_path_ns.clone(),
+        prof_flush_ns: prof_flush_ns.clone(),
+        prof_flush_bytes: prof_flush_bytes.clone(),
+        prof_flush_count: prof_flush_count.clone(),
+        prof_hardlink_checks: prof_hardlink_checks.clone(),
+        prof_max_event_buf_records: prof_max_event_buf_records.clone(),
+        prof_max_event_buf_bytes: prof_max_event_buf_bytes.clone(),
+        tmpdir: tmpdir_str.clone(),
+        target_uids: target_uids.map(|uids| uids.into_iter().collect::<HashSet<u32>>()),
+        skips: skip_dirs.clone(),
+        root_dev,
+        debug,
+        registry: Arc::new(DashMap::new()),
+    });
+    let hardlink_inodes_profile = shared.hardlinks.clone();
+
+    let d_clone = done.clone();
+    let dir_clone = directory.clone();
+    let shared_for_scan = Arc::clone(&shared);
 
     let _walk_thread = thread::spawn(move || {
-        // Ensure `done` flips to true even if the parallel walk panics —
-        // otherwise the main progress loop spins forever waiting on a flag
-        // that will never be set. RAII guard runs on every exit path.
         struct DoneGuard(Arc<AtomicBool>);
         impl Drop for DoneGuard {
             fn drop(&mut self) {
@@ -110,193 +272,51 @@ pub(crate) fn run_scan_core(
         }
         let _done_guard = DoneGuard(d_clone.clone());
 
-        // ─── Bounded-queue parallel walker ─────────────────────────
-        // Replaces ignore::WalkBuilder. Caps queue at 200K dirs to
-        // bound RAM (was ~6 GB unbounded internal queue -> ~40 MB now).
-        // Workers fall back to inline DFS via local Vec stack when
-        // the shared channel is full — no blocking, no deadlock.
-        const QUEUE_CAP: usize = 2_000_000;
-        let (tx, rx) = bounded::<ScanTask>(QUEUE_CAP);
-        let rx = Arc::new(rx);
-        let active_count = Arc::new(AtomicUsize::new(0));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let pool = match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads_count)
+            .build()
+        {
+            Ok(p) => p,
+            Err(_) => {
+                d_clone.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
 
-        // Seed root dir
-        let _ = tx.send(ScanTask::Dir(PathBuf::from(&dir_clone)));
+        let root_path = PathBuf::from(&dir_clone);
+        pool.scope(|scope| {
+            let s = Arc::clone(&shared_for_scan);
+            scope.spawn(move |sc| process_dir_rayon(root_path, sc, s));
+        });
 
-        let mut handles = Vec::with_capacity(threads_count);
-        for _ in 0..threads_count {
-            let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
-            let tx_w: Sender<ScanTask> = tx.clone();
-            let rx_w = Arc::clone(&rx);
-            let active_w = Arc::clone(&active_count);
-            let shutdown_w = Arc::clone(&shutdown);
+        let mut worker_states: Vec<Arc<Mutex<ThreadLocalState>>> = Vec::new();
+        for entry in shared_for_scan.registry.iter() {
+            worker_states.push(entry.value().clone());
+        }
 
-            // Per-worker Arc clones (same as WalkBuilder factory)
-            let g_w = g_clone.clone();
-            let pf_w = pf_clone.clone();
-            let pd_w = pd_clone.clone();
-            let ps_w = ps_clone.clone();
-            let tmpdir_w = tmpdir_clone.clone();
-            let target_uids_w = target_uids_shared.clone();
-            let pm_w = pm_clone.clone();
-            let pp_w = pp_clone.clone();
-            let pfns_w = pfns_clone.clone();
-            let pfb_w = pfb_clone.clone();
-            let pfc_w = pfc_clone.clone();
-            let ph_w = ph_clone.clone();
-            let pmaxr_w = pmaxr_clone.clone();
-            let pmaxb_w = pmaxb_clone.clone();
-            let skips_w = skips.clone();
-            let hardlinks_w = hardlink_inodes.clone();
-
-            handles.push(thread::spawn(move || {
-                let mut state = ThreadLocalState {
-                    t_files: 0,
-                    t_dirs: 0,
-                    t_inodes: 0,
-                    t_size: 0,
-                    t_uid_sizes: HashMap::new(),
-                    t_uid_files: HashMap::new(),
-                    t_dir_sizes: HashMap::new(),
-                    t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
-                        .map(|_| Vec::with_capacity(1024 * 1024))
-                        .collect(),
-                    t_event_buf_records: vec![0; ThreadLocalState::EVENT_BUCKETS],
-                    t_event_flush_count: 0,
-                    event_bin_writers: (0..ThreadLocalState::EVENT_BUCKETS)
-                        .map(|_| None)
-                        .collect(),
-                    t_perm_issues: 0,
-                    queue_full_fallbacks: 0,
-                    idle_time_ns: 0,
-                    active_time_ns: 0,
-                    tasks_processed: 0,
-                    global_stats: g_w,
-                    prog_files: pf_w,
-                    prog_dirs: pd_w,
-                    prog_size: ps_w,
-                    pending_prog_files: 0,
-                    pending_prog_dirs: 0,
-                    pending_prog_size: 0,
-                    tmpdir: tmpdir_w,
-                    target_uids: (*target_uids_w).clone(),
-                    thread_id: tid,
-                    profile_enabled: debug,
-                    prof_metadata_ns: pm_w,
-                    prof_path_ns: pp_w,
-                    prof_flush_ns: pfns_w,
-                    prof_flush_bytes: pfb_w,
-                    prof_flush_count: pfc_w,
-                    prof_hardlink_checks: ph_w,
-                    prof_max_event_buf_records: pmaxr_w,
-                    prof_max_event_buf_bytes: pmaxb_w,
-                    perm_writer: None,
-                    dir_agg_writer: None,
-                };
-
-                loop {
-                    if shutdown_w.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let idle_start = Instant::now();
-                    let task = match rx_w.recv_timeout(Duration::from_millis(5)) {
-                        Ok(t) => {
-                            state.idle_time_ns += idle_start.elapsed().as_nanos() as u64;
-                            t
-                        }
-                        Err(RecvTimeoutError::Timeout) => {
-                            state.idle_time_ns += idle_start.elapsed().as_nanos() as u64;
-                            continue;
-                        }
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    };
-
-                    active_w.fetch_add(1, Ordering::AcqRel);
-                    let active_start = Instant::now();
-                    match task {
-                        ScanTask::Dir(dir_path) => process_dir_inline(
-                            dir_path,
-                            &tx_w,
-                            &mut state,
-                            &hardlinks_w,
-                            &skips_w,
-                            root_dev,
-                            debug,
-                        ),
-                        ScanTask::FileChunk { parent, files } => process_file_chunk(
-                            parent,
-                            files,
-                            &mut state,
-                            &hardlinks_w,
-                            &skips_w,
-                            root_dev,
-                            debug,
-                        ),
-                    }
-                    state.active_time_ns += active_start.elapsed().as_nanos() as u64;
-                    state.tasks_processed += 1;
-                    let prev = active_w.fetch_sub(1, Ordering::AcqRel);
-
-                    // Termination protocol: last active worker drains
-                    // remaining items, then signals shutdown if empty.
-                    if prev == 1 {
-                        loop {
-                            match rx_w.try_recv() {
-                                Ok(extra) => {
-                                    active_w.fetch_add(1, Ordering::AcqRel);
-                                    let active_start = Instant::now();
-                                    match extra {
-                                        ScanTask::Dir(dir_path) => process_dir_inline(
-                                            dir_path,
-                                            &tx_w,
-                                            &mut state,
-                                            &hardlinks_w,
-                                            &skips_w,
-                                            root_dev,
-                                            debug,
-                                        ),
-                                        ScanTask::FileChunk { parent, files } => process_file_chunk(
-                                            parent,
-                                            files,
-                                            &mut state,
-                                            &hardlinks_w,
-                                            &skips_w,
-                                            root_dev,
-                                            debug,
-                                        ),
-                                    }
-                                    state.active_time_ns += active_start.elapsed().as_nanos() as u64;
-                                    state.tasks_processed += 1;
-                                    let p2 = active_w.fetch_sub(1, Ordering::AcqRel);
-                                    if p2 != 1 {
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    shutdown_w.store(true, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
-                        }
+        for state_arc in worker_states {
+            if let Ok(mut state) = state_arc.lock() {
+                state.flush_events();
+                state.flush_dir_aggregates();
+                state.flush_progress();
+                for writer in &mut state.event_bin_writers {
+                    if let Some(w) = writer.as_mut() {
+                        let _ = std::io::Write::flush(w);
                     }
                 }
-                // state drops here -> ThreadLocalState::drop() flushes all buffers
-            }));
+                if let Some(writer) = state.perm_writer.as_mut() {
+                    let _ = std::io::Write::flush(writer);
+                }
+                if let Some(writer) = state.dir_agg_writer.as_mut() {
+                    let _ = std::io::Write::flush(writer);
+                }
+                state.merge_into_global();
+            }
         }
-        drop(tx); // Main thread drops its sender
 
-        // Join all workers
-        for h in handles {
-            let _ = h.join();
-        }
-
-        // The DoneGuard above already flips `done` on drop; this explicit
-        // store is redundant but harmless and keeps the happy-path obvious.
         d_clone.store(true, Ordering::SeqCst);
     });
 
-    // --- Main thread: progress display + KeyboardInterrupt polling ---
     let start_time = Instant::now();
     let mut last_report = start_time;
     let mut last_files: u64 = 0;
@@ -316,17 +336,20 @@ pub(crate) fn run_scan_core(
             let mem_mb = get_rss_mb();
             println!(
                 "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s | Mem: {:.1} MB",
-                total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
-                format_num(total_files), format_num(total_dirs),
-                format_size(total_size), format_rate(rate), mem_mb
+                total_elapsed / 3600,
+                (total_elapsed % 3600) / 60,
+                total_elapsed % 60,
+                format_num(total_files),
+                format_num(total_dirs),
+                format_size(total_size),
+                format_rate(rate),
+                mem_mb
             );
             last_report = now;
             last_files = total_files;
         }
     }
-    // no trailing newline needed — println already adds one
 
-    // --- Build Python return dict ---
     let g = global_stats.lock().unwrap();
 
     let result = PyDict::new(py);
@@ -384,13 +407,12 @@ pub(crate) fn run_scan_core(
             format_num(max_buf_records),
             format_size(max_buf_bytes)
         );
+        println!("  Hardlink set size:  {}", format_num(hardlink_set_size as u64));
         println!(
-            "  Hardlink set size:  {}",
-            format_num(hardlink_set_size as u64)
+            "  Queue-full fallbacks: {}",
+            format_num(total_queue_full_fallbacks)
         );
-        println!("  Queue-full fallbacks: {}", format_num(total_queue_full_fallbacks));
 
-        // Worker utilization details
         if !g.worker_files.is_empty() {
             let n = g.worker_files.len();
             let min_files = *g.worker_files.iter().min().unwrap_or(&0);
@@ -414,7 +436,9 @@ pub(crate) fn run_scan_core(
             println!("  Worker utilization ({} workers):", n);
             println!(
                 "    Files processed:  min={}  max={}  avg={}",
-                format_num(min_files), format_num(max_files), format_num(avg_files)
+                format_num(min_files),
+                format_num(max_files),
+                format_num(avg_files)
             );
             println!(
                 "    Active time:      min={:.1}s   max={:.1}s       avg={:.1}s",
@@ -428,7 +452,12 @@ pub(crate) fn run_scan_core(
                 max_idle as f64 / 1e9,
                 avg_idle as f64 / 1e9
             );
-            println!("    Idle %:           min={}%     max={}%        avg={}%", 0, 0, avg_idle_pct);
+            println!(
+                "    Idle %:           min={}%     max={}%        avg={}%",
+                0,
+                0,
+                avg_idle_pct
+            );
         }
     }
 
@@ -558,146 +587,3 @@ fn process_file_entry(
     state.add_progress(1, 0, size);
 }
 
-fn process_file_chunk(
-    parent: std::path::PathBuf,
-    files: Vec<std::ffi::OsString>,
-    state: &mut ThreadLocalState,
-    hardlinks: &Arc<DashSet<(u64, u64)>>,
-    skips: &[String],
-    root_dev: Option<u64>,
-    debug: bool,
-) {
-    for name in files {
-        let path = parent.join(&name);
-        process_file_entry(&path, state, hardlinks, skips, root_dev, debug);
-    }
-}
-
-fn process_dir_inline(
-    root: std::path::PathBuf,
-    tx: &crossbeam_channel::Sender<ScanTask>,
-    state: &mut ThreadLocalState,
-    hardlinks: &Arc<DashSet<(u64, u64)>>,
-    skips: &[String],
-    root_dev: Option<u64>,
-    debug: bool,
-) {
-    let mut stack: Vec<std::path::PathBuf> = vec![root];
-    while let Some(dir_path) = stack.pop() {
-        let read_iter = match fs::read_dir(&dir_path) {
-            Ok(it) => it,
-            Err(e) => {
-                state.t_perm_issues += 1;
-                state.flush_permission_issue(
-                    &dir_path.to_string_lossy(),
-                    "directory",
-                    error_code_from_message(&e.to_string()),
-                );
-                continue;
-            }
-        };
-
-        // First, collect entries into vectors of names to allow chunking.
-        let mut file_names: Vec<std::ffi::OsString> = Vec::new();
-        let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
-
-        'entry_collect: for entry_res in read_iter {
-            let entry = match entry_res {
-                Ok(e) => e,
-                Err(e) => {
-                    state.t_perm_issues += 1;
-                    state.flush_permission_issue(
-                        &dir_path.to_string_lossy(),
-                        "directory",
-                        error_code_from_message(&e.to_string()),
-                    );
-                    continue;
-                }
-            };
-
-            let path = entry.path();
-
-            for s in skips {
-                if path.starts_with(s) {
-                    continue 'entry_collect;
-                }
-            }
-
-            let ft = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            if ft.is_symlink() {
-                state.t_inodes += 1;
-                continue;
-            }
-
-            if ft.is_dir() {
-                if let Some(name) = path.file_name() {
-                    if CRITICAL_SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
-                        continue;
-                    }
-                }
-                // Defer device check and metadata until worker processes dir.
-                subdirs.push(path);
-            } else if ft.is_file() {
-                if let Some(name) = path.file_name() {
-                    file_names.push(name.to_os_string());
-                }
-            }
-        }
-
-        // Enqueue subdirectories first.
-        for sub in subdirs {
-            state.t_dirs += 1;
-            state.t_inodes += 1;
-            state.add_progress(0, 1, 0);
-            match tx.try_send(ScanTask::Dir(sub.clone())) {
-                Ok(_) => {}
-                Err(_) => {
-                    stack.push(sub);
-                    state.queue_full_fallbacks += 1;
-                }
-            }
-        }
-
-        // Files: decide whether to chunk or process inline.
-        if file_names.len() > DIR_CHUNK_THRESHOLD {
-            // split into chunks
-            let mut i = 0usize;
-            while i < file_names.len() {
-                let end = (i + DIR_CHUNK_SIZE).min(file_names.len());
-                let chunk = file_names[i..end].to_vec();
-                match tx.try_send(ScanTask::FileChunk {
-                    parent: dir_path.clone(),
-                    files: chunk,
-                }) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        // fallback: process inline (to maintain forward progress)
-                        state.queue_full_fallbacks += 1;
-                        for name in file_names[i..end].iter() {
-                            let path = dir_path.join(name);
-                            process_file_entry(
-                                &path,
-                                state,
-                                hardlinks,
-                                skips,
-                                root_dev,
-                                debug,
-                            );
-                        }
-                    }
-                }
-                i = end;
-            }
-        } else {
-            // small dir: stat inline as before
-            for name in file_names {
-                let path = dir_path.join(name);
-                process_file_entry(&path, state, hardlinks, skips, root_dev, debug);
-            }
-        }
-    }
-}
