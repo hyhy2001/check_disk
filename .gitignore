@@ -52,4 +52,5 @@ output_txt/
 disk_checker_config.json
 docs/
 src/rust_scanner/target/
+src/rust_exporter/target/
 _demo_out/
