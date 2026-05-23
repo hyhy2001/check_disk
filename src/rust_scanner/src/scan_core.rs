@@ -2,6 +2,7 @@ use dashmap::{DashMap, DashSet};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rayon::prelude::*;
 use rayon::Scope;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -294,7 +295,10 @@ pub(crate) fn run_scan_core(
             worker_states.push(entry.value().clone());
         }
 
-        for state_arc in worker_states {
+        // Parallelize buffer flush — 64 workers each flush ~30MB to NFS.
+        // Sequential drain causes a multi-minute stall at end-of-scan.
+        // Use rayon to flush in parallel; merge_into_global serialized after.
+        worker_states.par_iter().for_each(|state_arc| {
             if let Ok(mut state) = state_arc.lock() {
                 state.flush_events();
                 state.flush_dir_aggregates();
@@ -310,6 +314,12 @@ pub(crate) fn run_scan_core(
                 if let Some(writer) = state.dir_agg_writer.as_mut() {
                     let _ = std::io::Write::flush(writer);
                 }
+            }
+        });
+
+        // merge_into_global must be serialized (locks shared GlobalStats).
+        for state_arc in &worker_states {
+            if let Ok(mut state) = state_arc.lock() {
                 state.merge_into_global();
             }
         }
