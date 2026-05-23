@@ -19,6 +19,94 @@ use crate::scan_utils::{
     error_code_from_message, format_num, format_rate, format_size, get_rss_mb,
 };
 
+#[cfg(target_os = "linux")]
+mod statx_helper {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const STATX_TYPE: u32 = 0x0001;
+    const STATX_MODE: u32 = 0x0002;
+    const STATX_NLINK: u32 = 0x0004;
+    const STATX_UID: u32 = 0x0008;
+    const STATX_INO: u32 = 0x0100;
+    const STATX_SIZE: u32 = 0x0200;
+    const STATX_MINIMAL: u32 =
+        STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_UID | STATX_INO | STATX_SIZE;
+
+    const AT_FDCWD: i32 = -100;
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_NO_AUTOMOUNT: i32 = 0x800;
+
+    pub(crate) struct StatxResult {
+        pub(crate) stx_mode: u16,
+        pub(crate) stx_nlink: u32,
+        pub(crate) stx_uid: u32,
+        pub(crate) stx_size: u64,
+        pub(crate) stx_ino: u64,
+        pub(crate) stx_dev_major: u32,
+        pub(crate) stx_dev_minor: u32,
+    }
+
+    impl StatxResult {
+        pub(crate) fn is_file(&self) -> bool {
+            (self.stx_mode & 0xf000) == 0x8000
+        }
+        pub(crate) fn is_dir(&self) -> bool {
+            (self.stx_mode & 0xf000) == 0x4000
+        }
+        pub(crate) fn is_symlink(&self) -> bool {
+            (self.stx_mode & 0xf000) == 0xa000
+        }
+        pub(crate) fn dev(&self) -> u64 {
+            ((self.stx_dev_major as u64) << 32) | (self.stx_dev_minor as u64)
+        }
+    }
+
+    pub(crate) fn statx_nofollow(path: &Path) -> Option<StatxResult> {
+        let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+
+        let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                AT_FDCWD,
+                cpath.as_ptr(),
+                AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+                STATX_MINIMAL,
+                buf.as_mut_ptr(),
+            )
+        };
+
+        if ret != 0 {
+            return None;
+        }
+
+        let s = unsafe { buf.assume_init() };
+        Some(StatxResult {
+            stx_mode: s.stx_mode,
+            stx_nlink: s.stx_nlink,
+            stx_uid: s.stx_uid,
+            stx_size: s.stx_size,
+            stx_ino: s.stx_ino,
+            stx_dev_major: s.stx_dev_major,
+            stx_dev_minor: s.stx_dev_minor,
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod statx_helper {
+    use std::path::Path;
+
+    pub(crate) struct StatxResult;
+
+    pub(crate) fn statx_nofollow(_path: &Path) -> Option<StatxResult> {
+        None
+    }
+}
+
 pub(crate) fn run_scan_core(
     py: Python,
     directory: String,
@@ -239,48 +327,98 @@ pub(crate) fn run_scan_core(
                         state.add_progress(0, 1, 0);
                     } else if ft.is_file() {
                         let meta_start = debug.then(Instant::now);
-                        let meta = match entry.metadata() {
-                            Ok(m) => {
-                                if let Some(start) = meta_start {
-                                    state.prof_metadata_ns.fetch_add(
-                                        start.elapsed().as_nanos() as u64,
-                                        Ordering::Relaxed,
+                        #[cfg(target_os = "linux")]
+                        let statx_res = statx_helper::statx_nofollow(path);
+                        #[cfg(target_os = "linux")]
+                        let (_file_type_is_file, _file_type_is_symlink, _file_type_is_dir, size, uid, nlink, ino, dev) =
+                            match statx_res {
+                                Some(s) => (
+                                    s.is_file(),
+                                    s.is_symlink(),
+                                    s.is_dir(),
+                                    s.stx_size,
+                                    s.stx_uid,
+                                    s.stx_nlink,
+                                    s.stx_ino,
+                                    s.dev(),
+                                ),
+                                None => match fs::symlink_metadata(path) {
+                                    Ok(m) => (
+                                        m.file_type().is_file(),
+                                        m.file_type().is_symlink(),
+                                        m.file_type().is_dir(),
+                                        m.size(),
+                                        m.uid(),
+                                        m.nlink() as u32,
+                                        m.ino(),
+                                        m.dev(),
+                                    ),
+                                    Err(e) => {
+                                        if let Some(start) = meta_start {
+                                            state.prof_metadata_ns.fetch_add(
+                                                start.elapsed().as_nanos() as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                        state.t_perm_issues += 1;
+                                        let path_str = path.to_string_lossy().into_owned();
+                                        state.flush_permission_issue(
+                                            &path_str,
+                                            "file",
+                                            error_code_from_message(&e.to_string()),
+                                        );
+                                        return WalkState::Continue;
+                                    }
+                                },
+                            };
+                        #[cfg(not(target_os = "linux"))]
+                        let (_file_type_is_file, _file_type_is_symlink, _file_type_is_dir, size, uid, nlink, ino, dev) =
+                            match fs::symlink_metadata(path) {
+                                Ok(m) => (
+                                    m.file_type().is_file(),
+                                    m.file_type().is_symlink(),
+                                    m.file_type().is_dir(),
+                                    m.size(),
+                                    m.uid(),
+                                    m.nlink() as u32,
+                                    m.ino(),
+                                    m.dev(),
+                                ),
+                                Err(e) => {
+                                    if let Some(start) = meta_start {
+                                        state.prof_metadata_ns.fetch_add(
+                                            start.elapsed().as_nanos() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    state.t_perm_issues += 1;
+                                    let path_str = path.to_string_lossy().into_owned();
+                                    state.flush_permission_issue(
+                                        &path_str,
+                                        "file",
+                                        error_code_from_message(&e.to_string()),
                                     );
+                                    return WalkState::Continue;
                                 }
-                                m
-                            }
-                            Err(e) => {
-                                if let Some(start) = meta_start {
-                                    state.prof_metadata_ns.fetch_add(
-                                        start.elapsed().as_nanos() as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                                state.t_perm_issues += 1;
-                                let path_str = path.to_string_lossy().into_owned();
-                                state.flush_permission_issue(
-                                    &path_str,
-                                    "file",
-                                    error_code_from_message(&e.to_string()),
-                                );
-                                return WalkState::Continue;
-                            }
-                        };
+                            };
+                        if let Some(start) = meta_start {
+                            state.prof_metadata_ns.fetch_add(
+                                start.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
 
                         // --- Hard-link deduplication ---
-                        if meta.nlink() > 1 {
+                        if nlink > 1 {
                             if debug {
                                 state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
                             }
-                            let key = (meta.ino(), meta.dev());
+                            let key = (ino, dev);
                             if !hardlinks_shared.insert(key) {
                                 return WalkState::Continue;
                             }
                         }
 
-                        // st_blocks * 512 = actual on-disk bytes, same as Python legacy
-                        let size = meta.blocks() * 512;
-                        let uid = meta.uid();
                         let is_target = match &state.target_uids {
                             Some(set) => set.contains(&uid),
                             None => true,

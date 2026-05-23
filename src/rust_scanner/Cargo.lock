@@ -185,6 +185,7 @@ dependencies = [
  "flate2",
  "glob",
  "ignore",
+ "libc",
  "lz4_flex",
  "pyo3",
  "rayon",
