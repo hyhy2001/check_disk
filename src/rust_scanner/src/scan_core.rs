@@ -47,16 +47,7 @@ pub(crate) fn run_scan_core(
     let tmpdir_str = _tmpdir.path().to_string_lossy().to_string();
     let _ = _tmpdir.keep(); // persist tmp dir; Python side cleans up later
 
-    let global_stats = Arc::new(Mutex::new(GlobalStats {
-        total_files: 0,
-        total_dirs: 0,
-        total_inodes: 0,
-        total_size: 0,
-        uid_sizes: HashMap::new(),
-        uid_files: HashMap::new(),
-        permission_issues_count: 0,
-        total_queue_full_fallbacks: 0,
-    }));
+    let global_stats = Arc::new(Mutex::new(GlobalStats::new()));
     let prog_files = Arc::new(AtomicU64::new(0));
     let prog_dirs = Arc::new(AtomicU64::new(0));
     let prog_size = Arc::new(AtomicU64::new(0));
@@ -178,6 +169,9 @@ pub(crate) fn run_scan_core(
                         .collect(),
                     t_perm_issues: 0,
                     queue_full_fallbacks: 0,
+                    idle_time_ns: 0,
+                    active_time_ns: 0,
+                    tasks_processed: 0,
                     global_stats: g_w,
                     prog_files: pf_w,
                     prog_dirs: pd_w,
@@ -205,13 +199,21 @@ pub(crate) fn run_scan_core(
                     if shutdown_w.load(Ordering::Relaxed) {
                         break;
                     }
+                    let idle_start = Instant::now();
                     let task = match rx_w.recv_timeout(Duration::from_millis(5)) {
-                        Ok(t) => t,
-                        Err(RecvTimeoutError::Timeout) => continue,
+                        Ok(t) => {
+                            state.idle_time_ns += idle_start.elapsed().as_nanos() as u64;
+                            t
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            state.idle_time_ns += idle_start.elapsed().as_nanos() as u64;
+                            continue;
+                        }
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
 
                     active_w.fetch_add(1, Ordering::AcqRel);
+                    let active_start = Instant::now();
                     match task {
                         ScanTask::Dir(dir_path) => process_dir_inline(
                             dir_path,
@@ -232,6 +234,8 @@ pub(crate) fn run_scan_core(
                             debug,
                         ),
                     }
+                    state.active_time_ns += active_start.elapsed().as_nanos() as u64;
+                    state.tasks_processed += 1;
                     let prev = active_w.fetch_sub(1, Ordering::AcqRel);
 
                     // Termination protocol: last active worker drains
@@ -241,6 +245,7 @@ pub(crate) fn run_scan_core(
                             match rx_w.try_recv() {
                                 Ok(extra) => {
                                     active_w.fetch_add(1, Ordering::AcqRel);
+                                    let active_start = Instant::now();
                                     match extra {
                                         ScanTask::Dir(dir_path) => process_dir_inline(
                                             dir_path,
@@ -261,6 +266,8 @@ pub(crate) fn run_scan_core(
                                             debug,
                                         ),
                                     }
+                                    state.active_time_ns += active_start.elapsed().as_nanos() as u64;
+                                    state.tasks_processed += 1;
                                     let p2 = active_w.fetch_sub(1, Ordering::AcqRel);
                                     if p2 != 1 {
                                         break;
@@ -382,6 +389,47 @@ pub(crate) fn run_scan_core(
             format_num(hardlink_set_size as u64)
         );
         println!("  Queue-full fallbacks: {}", format_num(total_queue_full_fallbacks));
+
+        // Worker utilization details
+        if !g.worker_files.is_empty() {
+            let n = g.worker_files.len();
+            let min_files = *g.worker_files.iter().min().unwrap_or(&0);
+            let max_files = *g.worker_files.iter().max().unwrap_or(&0);
+            let avg_files = g.worker_files.iter().sum::<u64>() / n as u64;
+
+            let min_active = *g.worker_active_ns.iter().min().unwrap_or(&0);
+            let max_active = *g.worker_active_ns.iter().max().unwrap_or(&0);
+            let avg_active = g.worker_active_ns.iter().sum::<u64>() / n as u64;
+
+            let min_idle = *g.worker_idle_ns.iter().min().unwrap_or(&0);
+            let max_idle = *g.worker_idle_ns.iter().max().unwrap_or(&0);
+            let avg_idle = g.worker_idle_ns.iter().sum::<u64>() / n as u64;
+
+            let avg_idle_pct = if avg_active + avg_idle > 0 {
+                (avg_idle * 100) / (avg_active + avg_idle)
+            } else {
+                0
+            };
+
+            println!("  Worker utilization ({} workers):", n);
+            println!(
+                "    Files processed:  min={}  max={}  avg={}",
+                format_num(min_files), format_num(max_files), format_num(avg_files)
+            );
+            println!(
+                "    Active time:      min={:.1}s   max={:.1}s       avg={:.1}s",
+                min_active as f64 / 1e9,
+                max_active as f64 / 1e9,
+                avg_active as f64 / 1e9
+            );
+            println!(
+                "    Idle time:        min={:.1}s   max={:.1}s       avg={:.1}s",
+                min_idle as f64 / 1e9,
+                max_idle as f64 / 1e9,
+                avg_idle as f64 / 1e9
+            );
+            println!("    Idle %:           min={}%     max={}%        avg={}%", 0, 0, avg_idle_pct);
+        }
     }
 
     Ok(result.into())
