@@ -16,37 +16,9 @@ pub(crate) struct GlobalStats {
     pub(crate) uid_sizes: HashMap<u32, u64>,
     pub(crate) uid_files: HashMap<u32, u64>,
     pub(crate) permission_issues_count: u64,
-    pub(crate) total_queue_full_fallbacks: u64,
-    pub(crate) worker_idle_ns: Vec<u64>,
-    pub(crate) worker_active_ns: Vec<u64>,
-    pub(crate) worker_tasks: Vec<u64>,
-    pub(crate) worker_files: Vec<u64>,
-}
-
-impl GlobalStats {
-    pub(crate) fn new() -> Self {
-        Self {
-            total_files: 0,
-            total_dirs: 0,
-            total_inodes: 0,
-            total_size: 0,
-            uid_sizes: HashMap::new(),
-            uid_files: HashMap::new(),
-            permission_issues_count: 0,
-            total_queue_full_fallbacks: 0,
-            worker_idle_ns: Vec::new(),
-            worker_active_ns: Vec::new(),
-            worker_tasks: Vec::new(),
-            worker_files: Vec::new(),
-        }
-    }
 }
 
 pub(crate) struct ThreadLocalState {
-    pub(crate) queue_full_fallbacks: u64,
-    pub(crate) idle_time_ns: u64,
-    pub(crate) active_time_ns: u64,
-    pub(crate) tasks_processed: u64,
     pub(crate) t_files: u64,
     pub(crate) t_dirs: u64,
     pub(crate) t_inodes: u64,
@@ -85,7 +57,7 @@ pub(crate) struct ThreadLocalState {
 impl ThreadLocalState {
     const PROGRESS_FLUSH_THRESHOLD: u64 = 4096;
     pub(crate) const EVENT_BUCKETS: usize = 3;
-    const DIR_SIZES_FLUSH_THRESHOLD: usize = 10_000;
+    const DIR_SIZES_FLUSH_THRESHOLD: usize = 50_000;
 
     fn bucket_for_uid(uid: u32) -> usize {
         (uid as usize) % Self::EVENT_BUCKETS
@@ -282,11 +254,6 @@ impl Drop for ThreadLocalState {
                 *g.uid_files.entry(*uid).or_insert(0) += files;
             }
             g.permission_issues_count += self.t_perm_issues;
-            g.total_queue_full_fallbacks += self.queue_full_fallbacks;
-            g.worker_idle_ns.push(self.idle_time_ns);
-            g.worker_active_ns.push(self.active_time_ns);
-            g.worker_tasks.push(self.tasks_processed);
-            g.worker_files.push(self.t_files);
         }
     }
 }
