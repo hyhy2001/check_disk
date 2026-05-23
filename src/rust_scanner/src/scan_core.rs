@@ -124,6 +124,8 @@ pub(crate) fn run_scan_core(
                     t_uid_sizes: HashMap::new(),
                     t_uid_files: HashMap::new(),
                     t_dir_sizes: HashMap::new(),
+                    parent_path_id_of: HashMap::new(),
+                    parent_paths: Vec::new(),
                     t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
                         .map(|_| Vec::with_capacity(1024 * 1024))
                         .collect(),
