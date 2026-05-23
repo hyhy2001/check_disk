@@ -59,7 +59,7 @@ pub(crate) struct ThreadLocalState {
 impl ThreadLocalState {
     const PROGRESS_FLUSH_THRESHOLD: u64 = 4096;
     pub(crate) const EVENT_BUCKETS: usize = 3;
-    const DIR_SIZES_FLUSH_THRESHOLD: usize = 50_000;
+    const DIR_SIZES_FLUSH_THRESHOLD: usize = 200_000;
 
     fn bucket_for_uid(uid: u32) -> usize {
         (uid as usize) % Self::EVENT_BUCKETS
@@ -150,7 +150,7 @@ impl ThreadLocalState {
                 let fp = format!("{}/scan_t{}_b{}.bin", self.tmpdir, self.thread_id, bucket);
                 if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
                     let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
-                    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, f);
+                    let mut writer = BufWriter::with_capacity(32 * 1024 * 1024, f);
                     if write_header {
                         let _ = writer.write_all(&SCAN_EVENT_BIN_MAGIC_V1);
                     }
