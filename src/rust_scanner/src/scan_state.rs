@@ -270,14 +270,6 @@ impl Drop for ThreadLocalState {
             let _ = writer.flush();
         }
 
-        // NOTE: Do not merge per-thread counters into global_stats in Drop.
-        // Merging will be done explicitly by the caller (e.g., after the
-        // Rayon scope completes) to avoid double-counting or race conditions.
-    }
-}
-
-impl ThreadLocalState {
-    pub(crate) fn merge_into_global(&mut self) {
         if let Ok(mut g) = self.global_stats.lock() {
             g.total_files += self.t_files;
             g.total_dirs += self.t_dirs;
