@@ -112,8 +112,7 @@ fn process_dir_rayon<'scope>(
 ) {
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(err) => {
-            // log perm error to thread-local state
+        Err(_) => {
             let state_arc = get_or_init_state(&shared);
             let mut state = state_arc.lock().unwrap();
             state.t_perm_issues += 1;
@@ -122,80 +121,91 @@ fn process_dir_rayon<'scope>(
         }
     };
 
-    let mut subdirs = Vec::new();
-    let mut files = Vec::new();
+    let dir_arc = Arc::new(dir);
+    let mut chunk: Vec<std::ffi::OsString> = Vec::with_capacity(DIR_CHUNK_SIZE);
 
-    'entry_collect: for entry_res in entries {
+    'entry_iter: for entry_res in entries {
         let entry = match entry_res {
             Ok(e) => e,
             Err(_) => continue,
         };
         let path = entry.path();
+
         for s in &shared.skips {
             if path.starts_with(s) {
-                continue 'entry_collect;
+                continue 'entry_iter;
             }
         }
+
         let ftype = match entry.file_type() {
             Ok(t) => t,
             Err(_) => continue,
         };
+
         if ftype.is_symlink() {
             let state_arc = get_or_init_state(&shared);
             let mut state = state_arc.lock().unwrap();
             state.t_inodes += 1;
             continue;
         }
+
         if ftype.is_dir() {
             if let Some(name) = path.file_name() {
                 if CRITICAL_SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
                     continue;
                 }
             }
-            subdirs.push(path);
+            if let Some(rdev) = shared.root_dev {
+                if let Ok(meta) = fs::metadata(&path) {
+                    if meta.dev() != rdev {
+                        continue;
+                    }
+                }
+            }
+
+            let s = Arc::clone(&shared);
+            let sub = path;
+            let state_arc = get_or_init_state(&shared);
+            {
+                let mut state = state_arc.lock().unwrap();
+                state.t_dirs += 1;
+                state.t_inodes += 1;
+                state.add_progress(0, 1, 0);
+            }
+            scope.spawn(move |sco| process_dir_rayon(sub, sco, s));
         } else if ftype.is_file() {
             if let Some(name) = path.file_name() {
-                files.push(name.to_os_string());
+                chunk.push(name.to_os_string());
+                if chunk.len() >= DIR_CHUNK_SIZE {
+                    let files = std::mem::take(&mut chunk);
+                    let dir_clone = Arc::clone(&dir_arc);
+                    let s = Arc::clone(&shared);
+                    scope.spawn(move |_| {
+                        let state_arc = get_or_init_state(&s);
+                        let mut state = state_arc.lock().unwrap();
+                        for name in files {
+                            let path = dir_clone.join(&name);
+                            process_file_entry(&path, &mut state, &s.hardlinks, &s.skips, s.root_dev, s.debug);
+                        }
+                    });
+                    chunk = Vec::with_capacity(DIR_CHUNK_SIZE);
+                }
             }
         }
     }
 
-    for subdir in subdirs {
+    if !chunk.is_empty() {
+        let files = chunk;
+        let dir_clone = Arc::clone(&dir_arc);
         let s = Arc::clone(&shared);
-        let sub = subdir.clone();
-        // update progress counts
-        let state_arc = get_or_init_state(&shared);
-        {
+        scope.spawn(move |_| {
+            let state_arc = get_or_init_state(&s);
             let mut state = state_arc.lock().unwrap();
-            state.t_dirs += 1;
-            state.t_inodes += 1;
-            state.add_progress(0, 1, 0);
-        }
-        scope.spawn(move |sco| process_dir_rayon(sub, sco, s));
-    }
-
-    let dir_arc = Arc::new(dir);
-    if files.len() <= DIR_CHUNK_THRESHOLD {
-        let state_arc = get_or_init_state(&shared);
-        let mut state = state_arc.lock().unwrap();
-        for name in files {
-            let path = dir_arc.join(&name);
-            process_file_entry(&path, &mut state, &shared.hardlinks, &shared.skips, shared.root_dev, shared.debug);
-        }
-    } else {
-        for chunk in files.chunks(DIR_CHUNK_SIZE) {
-            let chunk_vec: Vec<std::ffi::OsString> = chunk.to_vec();
-            let dir_clone = Arc::clone(&dir_arc);
-            let s = Arc::clone(&shared);
-            scope.spawn(move |_| {
-                let state_arc = get_or_init_state(&s);
-                let mut state = state_arc.lock().unwrap();
-                for name in chunk_vec {
-                    let path = dir_clone.join(&name);
-                    process_file_entry(&path, &mut state, &s.hardlinks, &s.skips, s.root_dev, s.debug);
-                }
-            });
-        }
+            for name in files {
+                let path = dir_clone.join(&name);
+                process_file_entry(&path, &mut state, &s.hardlinks, &s.skips, s.root_dev, s.debug);
+            }
+        });
     }
 }
 
