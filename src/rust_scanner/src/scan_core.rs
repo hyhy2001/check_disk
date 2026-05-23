@@ -155,13 +155,9 @@ fn process_dir_rayon<'scope>(
                     continue;
                 }
             }
-            if let Some(rdev) = shared.root_dev {
-                if let Ok(meta) = fs::metadata(&path) {
-                    if meta.dev() != rdev {
-                        continue;
-                    }
-                }
-            }
+            // Cross-device check is deferred to process_dir_rayon entry on the
+            // child task. Calling fs::metadata here would do an NFS RPC per
+            // subdir entry — 7.7M dirs = 7.7M extra RPCs, killing throughput.
 
             let s = Arc::clone(&shared);
             let sub = path;
@@ -536,7 +532,7 @@ fn process_file_entry(
     };
     record_metadata_ns(state, meta_start, debug);
 
-    if let Ok(ft) = path.symlink_metadata().and_then(|m| Ok(m.file_type())) {
+    if let Ok(ft) = Ok::<_, std::io::Error>(meta.file_type()) {
         if ft.is_dir() {
             if let Some(rdev) = root_dev {
                 if meta.dev() != rdev {
