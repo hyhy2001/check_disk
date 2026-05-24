@@ -25,9 +25,7 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_size: u64,
     pub(crate) t_uid_sizes: HashMap<u32, u64>,
     pub(crate) t_uid_files: HashMap<u32, u64>,
-    pub(crate) t_dir_sizes: HashMap<(u32, u32), i64>,
-    pub(crate) parent_path_id_of: HashMap<String, u32>,
-    pub(crate) parent_paths: Vec<String>,
+    pub(crate) t_dir_sizes: HashMap<(u32, String), i64>,
     pub(crate) t_event_bin_bufs: Vec<Vec<u8>>,
     pub(crate) t_event_buf_records: Vec<usize>,
     pub(crate) t_event_flush_count: u32,
@@ -113,18 +111,7 @@ impl ThreadLocalState {
             return;
         };
 
-        // Intern parent path: lookup or insert
-        let parent_id = if let Some(&id) = self.parent_path_id_of.get(parent) {
-            id
-        } else {
-            let id = self.parent_paths.len() as u32;
-            let parent_owned = parent.to_string();
-            self.parent_paths.push(parent_owned.clone());
-            self.parent_path_id_of.insert(parent_owned, id);
-            id
-        };
-
-        *self.t_dir_sizes.entry((uid, parent_id)).or_insert(0) += size as i64;
+        *self.t_dir_sizes.entry((uid, parent.to_string())).or_insert(0) += size as i64;
 
         // Flush dir aggregates early to bound per-thread memory.
         // At 7.67M dirs × 80 bytes/path = ~614 MB just for keys.
@@ -223,9 +210,8 @@ impl ThreadLocalState {
             }
         }
         if let Some(writer) = self.dir_agg_writer.as_mut() {
-            for ((uid, parent_id), size) in self.t_dir_sizes.drain() {
-                let parent = &self.parent_paths[parent_id as usize];
-                let path_bytes = parent.as_bytes();
+            for ((uid, path), size) in self.t_dir_sizes.drain() {
+                let path_bytes = path.as_bytes();
                 let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
                 let safe_len = usize::try_from(len).unwrap_or(path_bytes.len());
                 let _ = writer.write_all(&uid.to_le_bytes());
@@ -234,10 +220,6 @@ impl ThreadLocalState {
                 let _ = writer.write_all(&path_bytes[..safe_len.min(path_bytes.len())]);
             }
         }
-
-        // Clear interner to release memory after flushing aggregated records.
-        self.parent_path_id_of.clear();
-        self.parent_paths.clear();
     }
 }
 
