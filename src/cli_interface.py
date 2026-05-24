@@ -72,9 +72,9 @@ class CLIInterface:
         report_group.add_argument("--top", type=int, default=30,
                                 help="Top N rows to display for both directory and file breakdown in --detail (default: 30).")
         report_group.add_argument("--type", dest="type",
-                                choices=["report", "inode", "permission", "files", "dirs"],
+                                choices=["report", "inode", "inodes", "permission", "files", "dirs"],
                                 default="report",
-                                help="Section type for --detail: report (default), inode, permission, files, dirs.")
+                                help="Section type for --detail: report (default), inode/inodes, permission, files, dirs.")
         report_group.add_argument("--path", metavar="PATH", default="",
                                 help="For --tree-show: start tree from this path (default: scan root).")
         report_group.add_argument("--limit", type=int, default=20,

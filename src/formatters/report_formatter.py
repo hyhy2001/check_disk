@@ -265,10 +265,6 @@ class ReportFormatter(BaseFormatter):
                 title = f"Directory Breakdown (top {len(display_dirs)} of {total_dirs:,})"
                 table = self.table_formatter.format_table(headers, rows, title=title)
                 print("\n" + self._colorize_table(table, search))
-            else:
-                print("  (no directory data)")
-        else:
-            print("  (no directory data)")
 
         # --- File breakdown ---
         if file_report:
@@ -285,10 +281,6 @@ class ReportFormatter(BaseFormatter):
                 title = f"Largest Files (top {len(display)} of {total_files:,})"
                 table = self.table_formatter.format_table(headers, rows, title=title)
                 print("\n" + self._colorize_table(table, search))
-            else:
-                print("  (no file data)")
-        else:
-            print("  (no file data)")
 
     def display_user_detail_reports(
         self,
@@ -356,7 +348,7 @@ class ReportFormatter(BaseFormatter):
                     self._display_permission_section(user, perm, search=search)
                     continue
 
-                if type_filter == "inode":
+                if type_filter in ("inode", "inodes"):
                     inode = self._load_user_inodes(conn, user, top, search=search)
                     self._display_inode_section(user, inode, search=search)
                     continue
