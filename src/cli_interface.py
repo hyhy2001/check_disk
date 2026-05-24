@@ -74,7 +74,7 @@ class CLIInterface:
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s). Requires --files. Use with --user, --compare-by.")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
         report_group.add_argument("--detail", dest="detail", action="store_true",
-                                help="Display detail reports for user(s). Use with --user, --output-dir, --top, --type, --search.")
+                                help="Display detail reports for user(s). Use with --user, --output-dir, --top, --type, --search, --level, --limit, --path.")
         report_group.add_argument("--tree-show", dest="tree_show", action="store_true",
                                 help="Show ASCII directory tree. Use with --user, --output-dir, --level, --limit, --path, --search.")
 
