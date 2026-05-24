@@ -816,6 +816,11 @@ class ReportFormatter(BaseFormatter):
             print(f"Search: '{search}'")
         print(f"Depth: {max_depth}  |  Limit: {limit} per level\n")
 
+        # When search is active, render flat list of matching dirs for this user.
+        if search:
+            self._render_flat_search_user(conn, uid, search, limit)
+            return
+
         self._render_tree_node(
             conn, uid, start_id, "", 0, max_depth, limit, tw,
             search=search, visible_ids=visible_ids,
@@ -1041,10 +1046,102 @@ class ReportFormatter(BaseFormatter):
             print(f"Search: '{search}'")
         print(f"Depth: {level}  |  Limit: {limit} per level\n")
 
+        # When search is active, render flat list of matching dirs (sorted by
+        # size DESC). This avoids the noise of showing all ancestors when the
+        # keyword is common (e.g. 'config' has hundreds of matches).
+        if search:
+            self._render_flat_search(conn, search, limit)
+            return
+
         self._render_total_tree_node(
             conn, start_id, "", 0, level, limit, tw,
             search, visible_ids,
         )
+
+    def _render_flat_search(
+        self,
+        conn: sqlite3.Connection,
+        search: str,
+        limit: int,
+    ) -> None:
+        """Render a flat list of dirs whose name contains the keyword,
+        sorted by total_size DESC. Builds full paths via _build_path."""
+        kw = search.lower()
+        try:
+            rows = conn.execute(
+                "SELECT d.id, d.total_size, d.file_count "
+                "FROM tm.dirs d "
+                "JOIN tm.names n ON d.name_id = n.id "
+                "WHERE n.name LIKE ? COLLATE NOCASE "
+                "ORDER BY d.total_size DESC",
+                (f"%{kw}%",),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            print("  No directories found matching the keyword.")
+            return
+
+        if not rows:
+            print(f"  No directories found matching '{search}'.")
+            return
+
+        shown = 0
+        for did, size, file_count in rows:
+            if limit > 0 and shown >= limit:
+                break
+            path = self._build_path(conn, did)
+            print(
+                f"  {self._apply_search_highlight(path, search)}  "
+                f"[{format_size(int(size))}, {int(file_count):,} files]"
+            )
+            shown += 1
+
+        if len(rows) > shown:
+            print(f"\n  ... ({len(rows) - shown} more, increase --limit to see)")
+        else:
+            print(f"\n  Total: {len(rows)} matching directories")
+
+    def _render_flat_search_user(
+        self,
+        conn: sqlite3.Connection,
+        uid: int,
+        search: str,
+        limit: int,
+    ) -> None:
+        """Flat list of dirs matching keyword that have files owned by uid."""
+        kw = search.lower()
+        try:
+            rows = conn.execute(
+                "SELECT d.id, dus.size, dus.files "
+                "FROM tm.dirs d "
+                "JOIN tm.names n ON d.name_id = n.id "
+                "JOIN dir_user_size dus ON dus.dir_id = d.id AND dus.uid = ? "
+                "WHERE n.name LIKE ? COLLATE NOCASE "
+                "ORDER BY dus.size DESC",
+                (uid, f"%{kw}%"),
+            ).fetchall()
+        except Exception:
+            print("  No directories found matching the keyword.")
+            return
+
+        if not rows:
+            print(f"  No directories found matching '{search}'.")
+            return
+
+        shown = 0
+        for did, size, file_count in rows:
+            if limit > 0 and shown >= limit:
+                break
+            path = self._build_path(conn, did)
+            print(
+                f"  {self._apply_search_highlight(path, search)}  "
+                f"[{format_size(int(size))}, {int(file_count):,} files]"
+            )
+            shown += 1
+
+        if len(rows) > shown:
+            print(f"\n  ... ({len(rows) - shown} more, increase --limit to see)")
+        else:
+            print(f"\n  Total: {len(rows)} matching directories")
 
     def _render_total_tree_node(
         self,
