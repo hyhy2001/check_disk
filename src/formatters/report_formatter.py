@@ -490,8 +490,10 @@ class ReportFormatter(BaseFormatter):
 
         has_tm = self._has_treemap(conn)
         kw = search.lower() if search else ""
-        # Load more rows when searching so we can post-filter to top N
-        fetch_limit = top * 5 if kw else top
+        # Load more rows when searching so we can post-filter to top N.
+        # Use a large window (up to 5000) to find matches even when keyword
+        # doesn't appear in the top-N by size.
+        fetch_limit = min(top * 100, 5000) if kw else top
         dirs: List[Dict[str, Any]] = []
         cursor = conn.execute(
             "SELECT dir_id, size FROM dir_user_size "
@@ -533,7 +535,7 @@ class ReportFormatter(BaseFormatter):
         kw = search.lower() if search else ""
         # Top_files only stores top-K per user; if filtering, expand the
         # rank window so we still find matches further down.
-        rank_limit = top * 5 if kw else top
+        rank_limit = min(top * 100, 5000) if kw else top
         cursor = conn.execute(
             """
             SELECT f.dir_id, n.name, e.ext, t.size
@@ -591,7 +593,7 @@ class ReportFormatter(BaseFormatter):
         has_tm = self._has_treemap(conn)
 
         kw = search.lower() if search else ""
-        fetch_limit = top * 5 if kw else top
+        fetch_limit = min(top * 100, 5000) if kw else top
         dirs: List[Dict[str, Any]] = []
         cursor = conn.execute(
             "SELECT dir_id, files, size FROM dir_user_size "
