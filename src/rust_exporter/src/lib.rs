@@ -116,12 +116,27 @@ struct DirPathMap {
 
 impl DirPathMap {
     fn load(conn: &Connection) -> Result<Self, String> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT d.id, d.parent_id, n.name \
-                 FROM tm.dirs d JOIN tm.names n ON d.name_id = n.id \
-                 ORDER BY d.id",
+        let has_detail_dirs = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='dirs'",
+                [],
+                |r| r.get::<_, i64>(0),
             )
+            .unwrap_or(0)
+            > 0;
+
+        let query = if has_detail_dirs {
+            "SELECT d.id, d.parent_id, n.name \
+             FROM dirs d JOIN names n ON d.name_id = n.id \
+             ORDER BY d.id"
+        } else {
+            "SELECT d.id, d.parent_id, n.name \
+             FROM tm.dirs d JOIN tm.names n ON d.name_id = n.id \
+             ORDER BY d.id"
+        };
+
+        let mut stmt = conn
+            .prepare(query)
             .map_err(|e| format!("prepare dir path map: {}", e))?;
         let rows = stmt
             .query_map([], |r| {

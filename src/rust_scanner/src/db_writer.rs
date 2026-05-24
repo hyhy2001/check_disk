@@ -110,7 +110,14 @@ CREATE TABLE names (
   name TEXT    NOT NULL
 );
 
--- File rows. `dir_id` references tm.dirs.id (cross-database via ATTACH).
+CREATE TABLE IF NOT EXISTS dirs (
+  id        INTEGER PRIMARY KEY,
+  parent_id INTEGER,
+  name_id   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_dirs_parent ON dirs(parent_id);
+
+-- File rows. `dir_id` references directory ids shared across detail/treemap.
 -- `name_id` references THIS database's `names` table (file basenames).
 CREATE TABLE files (
   id      INTEGER PRIMARY KEY,
@@ -673,6 +680,28 @@ pub fn detail_insert_names(handle: &mut DetailBuildHandle, names: &[String]) -> 
         },
         "names",
     )
+}
+
+pub(crate) fn detail_insert_dirs(
+    handle: &mut DetailBuildHandle,
+    dirs: &[(i64, Option<i64>, i64)],
+) -> PyResult<()> {
+    let tx = handle
+        .conn
+        .transaction()
+        .map_err(|e| PyRuntimeError::new_err(format!("dirs tx: {}", e)))?;
+    {
+        let mut stmt = tx
+            .prepare_cached("INSERT OR IGNORE INTO dirs(id, parent_id, name_id) VALUES (?,?,?)")
+            .map_err(|e| PyRuntimeError::new_err(format!("dirs prepare: {}", e)))?;
+        for &(id, parent_id, name_id) in dirs {
+            stmt.execute(params![id, parent_id, name_id])
+                .map_err(|e| PyRuntimeError::new_err(format!("dirs insert: {}", e)))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| PyRuntimeError::new_err(format!("dirs commit: {}", e)))?;
+    Ok(())
 }
 
 pub fn detail_insert_files_chunk(
