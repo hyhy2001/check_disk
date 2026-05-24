@@ -96,7 +96,7 @@ python3 scripts/export_user_reports.py \
 
 ## Requirements
 
-- **Python**: 3.8+
+- **Python**: 3.6+ (per `pyproject.toml`)
 - **OS**: Linux x86_64
 - **glibc**: bundled `.so` targets glibc 2.17+ (CentOS 7, RHEL 7+, Debian 9+, Ubuntu 14.04+)
 - **SQLite**: 3.7.x+
@@ -295,7 +295,7 @@ Writes two `.txt` files per user:
 - `usage_dir_<user>.txt` — top directories by size
 - `usage_file_<user>.txt` — top files by size
 
-Both files contain full absolute paths. The exporter reads `data_detail.db` directly (no treemap dependency) using the `dirs` + `dir_names` tables for path reconstruction.
+Both files contain full absolute paths. The exporter reads `data_detail.db` directly using the `dirs` + `dir_names` tables for path reconstruction; `treemap.db` is optional and only used as a fallback by the Rust exporter.
 
 ---
 
@@ -305,7 +305,7 @@ Both files contain full absolute paths. The exporter reads `data_detail.db` dire
 <output_dir>/
 ├── disk_usage_report.json         # summary: general system + team + user usage
 ├── inode_usage_report.json        # inode counts per user
-├── permission_issues.db           # access-error log (indexed SQLite)
+├── permission_issues.db           # access-error log (indexed SQLite; produced by Phase 2)
 ├── scan_status.json               # heartbeat: stage, elapsed, running, message
 ├── detail_users/
 │   └── data_detail.db             # per-user files/dirs/exts, indexed
@@ -350,7 +350,7 @@ Indexes: `ix_files_uid_size`, `ix_dus_uid_size`, `ix_dirs_parent`.
 
 ```
 Phase 1: Rust scan (WalkBuilder, 64 workers)
-  → /tmp/checkdisk_rust_*/scan_t*_b*.bin  (lz4 binary events)
+  → /tmp/checkdisk_rust_*/scan_t*_b*.bin  (uncompressed binary events)
   → /tmp/.../perm_t*.tsv                  (permission errors)
   → /tmp/.../diragg_t*.bin                (dir aggregates)
          │
@@ -363,10 +363,10 @@ Phase 2: Rust detail pipeline (Rayon)
   → compact spill re-encoding (18 bytes/row)
   → path tree assembly
   → data_detail.db (files, dirs, dir_names, top_files, ...)
-  → persist treemap aggregates (aggregates.bin.zst)
+  → persist treemap aggregates (aggregates.bin.zst)  [only with --tree-map]
          │
          ▼
-Phase 3: Rust treemap pipeline
+Phase 3: Rust treemap pipeline  [only with --tree-map]
   → load aggregates.bin.zst
   → treemap.db (all dirs, no depth filter)
   → cleanup aggregates
@@ -380,7 +380,7 @@ Phase 4: drain sync + final heartbeat
 | Crate | Module | Purpose |
 |---|---|---|
 | `src/rust_scanner/` | `scan_core.rs` | Phase 1 WalkBuilder parallel walker |
-| | `scan_state.rs` | Per-thread buffers + lz4 spill writers |
+| | `scan_state.rs` | Per-thread buffers + uncompressed binary/TSV spill writers |
 | | `report_pipeline.rs` | Phase 2/3 ingest → detail.db + treemap.db |
 | | `db_writer.rs` | DDL, bulk insert, ANALYZE, atomic rename |
 | | `pipe_events.rs` | Binary spill format reader |
