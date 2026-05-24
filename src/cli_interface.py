@@ -43,13 +43,13 @@ class CLIInterface:
         filter_group = parser.add_argument_group('Report Filtering Options')
 
         # Configuration commands
-        config_group.add_argument("--init", action="store_true", help="Initialize configuration")
+        config_group.add_argument("--init", action="store_true", help="Initialize configuration. Use with --dir to set initial scan directory.")
         config_group.add_argument("--dir", help="Path to directory for scanning (changes directory in config)")
         config_group.add_argument("--add-team", metavar="TEAM", help="Add a new team")
-        config_group.add_argument("--add-user", metavar="USER", nargs="+", help="Add one or more users to a team")
-        config_group.add_argument("--team", metavar="TEAM", help="Team name")
+        config_group.add_argument("--add-user", metavar="USER", nargs="+", help="Add one or more users to a team. Requires --team.")
+        config_group.add_argument("--team", metavar="TEAM", help="Team name (used with --add-user, --list)")
         config_group.add_argument("--remove-user", metavar="USER", nargs="+", help="Remove one or more users")
-        config_group.add_argument("--list", action="store_true", help="List current configuration (grouped by team by default)")
+        config_group.add_argument("--list", action="store_true", help="List current configuration (use --team to filter by team).")
 
         # Scanning commands
         scan_group.add_argument("--run", action="store_true", help="Run disk usage check")
@@ -60,7 +60,7 @@ class CLIInterface:
         scan_group.add_argument("--output", metavar="FILE", help="Output file for report (full path including filename)")
         scan_group.add_argument("--output-dir", metavar="DIR", help="Directory to store output reports (will use default filename)")
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
-        scan_group.add_argument("--tree-map", action="store_true", help="Generate a TreeMap database for directory visualization")
+        scan_group.add_argument("--tree-map", action="store_true", help="Build TreeMap database (use with --run; tune depth via --level).")
         scan_group.add_argument("--level", type=int, default=3, help="Depth level for --tree-map or --tree-show (default: 3)")
 
         # Sync commands
@@ -71,12 +71,12 @@ class CLIInterface:
         sync_group.add_argument("--sync-pass", metavar="PASS", help="Optional SSH password (requires 'sshpass' installed)")
 
         # Report commands
-        report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
+        report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s). Requires --files. Use with --user, --compare-by.")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
         report_group.add_argument("--detail", dest="detail", action="store_true",
-                                help="Display detail reports for user(s) from data_detail.db (use --user USER... to specify).")
+                                help="Display detail reports for user(s). Use with --user, --output-dir, --top, --type, --search.")
         report_group.add_argument("--tree-show", dest="tree_show", action="store_true",
-                                help="Show ASCII directory tree (use --user, --search, --level, --limit, --path).")
+                                help="Show ASCII directory tree. Use with --user, --output-dir, --level, --limit, --path, --search.")
 
         # Detail options (for --detail)
         detail_group.add_argument("--top", type=int, default=30,
