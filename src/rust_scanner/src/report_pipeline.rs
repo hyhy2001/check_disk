@@ -1132,7 +1132,10 @@ pub(crate) fn build_detail_db_impl(
         db_writer::detail_insert_names(&mut detail_handle, &file_names)?;
         drop(file_names);
 
-        // Insert dirs for path reconstruction (makes detail.db self-sufficient)
+        // Insert dir name segments for path reconstruction.
+        db_writer::detail_insert_dir_names(&mut detail_handle, &path_tree.names)?;
+
+        // Insert dirs (references dir_names by name_id).
         let dir_rows: Vec<(i64, Option<i64>, i64)> = dirs_in_order_arc
             .iter()
             .map(|d| (d.id, d.parent_id, d.name_id))

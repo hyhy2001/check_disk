@@ -118,16 +118,16 @@ impl DirPathMap {
     fn load(conn: &Connection) -> Result<Self, String> {
         let has_detail_dirs = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='dirs'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('dirs','dir_names')",
                 [],
                 |r| r.get::<_, i64>(0),
             )
             .unwrap_or(0)
-            > 0;
+            >= 2;
 
         let query = if has_detail_dirs {
             "SELECT d.id, d.parent_id, n.name \
-             FROM dirs d JOIN names n ON d.name_id = n.id \
+             FROM dirs d JOIN dir_names n ON d.name_id = n.id \
              ORDER BY d.id"
         } else {
             "SELECT d.id, d.parent_id, n.name \

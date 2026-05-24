@@ -110,6 +110,10 @@ CREATE TABLE names (
   name TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dir_names (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dirs (
   id        INTEGER PRIMARY KEY,
   parent_id INTEGER,
@@ -680,6 +684,25 @@ pub fn detail_insert_names(handle: &mut DetailBuildHandle, names: &[String]) -> 
         },
         "names",
     )
+}
+
+pub(crate) fn detail_insert_dir_names(
+    handle: &mut DetailBuildHandle,
+    names: &[String],
+) -> PyResult<()> {
+    let tx = handle.conn.transaction()
+        .map_err(|e| PyRuntimeError::new_err(format!("dir_names tx: {}", e)))?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO dir_names(id, name) VALUES (?,?)"
+        ).map_err(|e| PyRuntimeError::new_err(format!("dir_names prepare: {}", e)))?;
+        for (id, name) in names.iter().enumerate() {
+            stmt.execute(params![id as i64, name])
+                .map_err(|e| PyRuntimeError::new_err(format!("dir_names insert: {}", e)))?;
+        }
+    }
+    tx.commit().map_err(|e| PyRuntimeError::new_err(format!("dir_names commit: {}", e)))?;
+    Ok(())
 }
 
 pub(crate) fn detail_insert_dirs(
