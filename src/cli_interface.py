@@ -38,7 +38,8 @@ class CLIInterface:
         scan_group = parser.add_argument_group('Scanning Commands')
         sync_group = parser.add_argument_group('Sync Commands')
         report_group = parser.add_argument_group('Report Commands')
-        detail_group = parser.add_argument_group('Detail & Tree Options')
+        detail_group = parser.add_argument_group('Detail Options (for --detail)')
+        tree_group = parser.add_argument_group('Tree Options (for --tree-show)')
         filter_group = parser.add_argument_group('Report Filtering Options')
 
         # Configuration commands
@@ -77,18 +78,22 @@ class CLIInterface:
         report_group.add_argument("--tree-show", dest="tree_show", action="store_true",
                                 help="Show ASCII directory tree (use --user, --search, --level, --limit, --path).")
 
-        # Detail & Tree options
+        # Detail options (for --detail)
         detail_group.add_argument("--top", type=int, default=30,
                                 help="Top N rows to display for --detail (default: 30).")
         detail_group.add_argument("--type", dest="type",
                                 choices=["report", "inode", "permission", "files", "dirs"],
                                 default="report",
                                 help="Section type for --detail: report (default), inode, permission, files, dirs.")
-        detail_group.add_argument("--path", metavar="PATH", default="",
+
+        # Tree options (for --tree-show)
+        tree_group.add_argument("--path", metavar="PATH", default="",
                                 help="For --tree-show: start tree from this path (default: scan root).")
-        detail_group.add_argument("--limit", type=int, default=20,
+        tree_group.add_argument("--limit", type=int, default=20,
                                 help="For --tree-show: max results per level (default: 20).")
-        detail_group.add_argument("--search", metavar="KEYWORD", default="",
+
+        # Shared search option (used by --detail and --tree-show)
+        report_group.add_argument("--search", metavar="KEYWORD", default="",
                                 help="Filter results by keyword. For --detail: filter dirs/files by path. For --tree-show: show only matching dirs.")
 
         # Report filtering options
