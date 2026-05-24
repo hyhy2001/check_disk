@@ -348,7 +348,7 @@ class ReportFormatter(BaseFormatter):
                     self._display_permission_section(user, perm, search=search)
                     continue
 
-                if type_filter in ("inode", "inodes"):
+                if type_filter == "inode":
                     inode = self._load_user_inodes(conn, user, top, search=search)
                     self._display_inode_section(user, inode, search=search)
                     continue
