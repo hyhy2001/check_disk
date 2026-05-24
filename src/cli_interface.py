@@ -36,7 +36,10 @@ class CLIInterface:
         # Create command groups for better organization
         config_group = parser.add_argument_group('Configuration Commands')
         scan_group = parser.add_argument_group('Scanning Commands')
+        sync_group = parser.add_argument_group('Sync Commands')
         report_group = parser.add_argument_group('Report Commands')
+        detail_group = parser.add_argument_group('Detail & Tree Options')
+        filter_group = parser.add_argument_group('Report Filtering Options')
 
         # Configuration commands
         config_group.add_argument("--init", action="store_true", help="Initialize configuration")
@@ -56,36 +59,39 @@ class CLIInterface:
         scan_group.add_argument("--output", metavar="FILE", help="Output file for report (full path including filename)")
         scan_group.add_argument("--output-dir", metavar="DIR", help="Directory to store output reports (will use default filename)")
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
-        scan_group.add_argument("--tree-map", action="store_true", help="Generate a TreeMap JSON for directory visualization")
-        scan_group.add_argument("--level", type=int, default=3, help="Maximum depth level for TreeMap generation (default: 3)")
-        # Report commands
-        report_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")
-        report_group.add_argument("--sync-user", metavar="USER", help="SSH username of the remote server")
-        report_group.add_argument("--sync-host", metavar="HOST", help="IP or hostname of the remote server")
-        report_group.add_argument("--sync-dest-dir", metavar="DIR", help="Destination directory on the remote server")
-        report_group.add_argument("--sync-pass", metavar="PASS", help="Optional SSH password (requires 'sshpass' installed)")
+        scan_group.add_argument("--tree-map", action="store_true", help="Generate a TreeMap database for directory visualization")
+        scan_group.add_argument("--level", type=int, default=3, help="Depth level for --tree-map or --tree-show (default: 3)")
 
+        # Sync commands
+        sync_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")
+        sync_group.add_argument("--sync-user", metavar="USER", help="SSH username of the remote server")
+        sync_group.add_argument("--sync-host", metavar="HOST", help="IP or hostname of the remote server")
+        sync_group.add_argument("--sync-dest-dir", metavar="DIR", help="Destination directory on the remote server")
+        sync_group.add_argument("--sync-pass", metavar="PASS", help="Optional SSH password (requires 'sshpass' installed)")
+
+        # Report commands
         report_group.add_argument("--show-report", action="store_true", help="Show disk usage report(s)")
         report_group.add_argument("--files", metavar="FILE", nargs="+", help="Report file(s) to display or compare (required with --show-report). Supports wildcards like *.json")
         report_group.add_argument("--detail", dest="detail", action="store_true",
                                 help="Display detail reports for user(s) from data_detail.db (use --user USER... to specify).")
-        report_group.add_argument("--top", type=int, default=30,
-                                help="Top N rows to display for both directory and file breakdown in --detail (default: 30).")
-        report_group.add_argument("--type", dest="type",
+        report_group.add_argument("--tree-show", dest="tree_show", action="store_true",
+                                help="Show ASCII directory tree (use --user, --search, --level, --limit, --path).")
+
+        # Detail & Tree options
+        detail_group.add_argument("--top", type=int, default=30,
+                                help="Top N rows to display for --detail (default: 30).")
+        detail_group.add_argument("--type", dest="type",
                                 choices=["report", "inode", "inodes", "permission", "files", "dirs"],
                                 default="report",
                                 help="Section type for --detail: report (default), inode/inodes, permission, files, dirs.")
-        report_group.add_argument("--path", metavar="PATH", default="",
+        detail_group.add_argument("--path", metavar="PATH", default="",
                                 help="For --tree-show: start tree from this path (default: scan root).")
-        report_group.add_argument("--limit", type=int, default=20,
-                                help="For --tree-show: max child folders per level (default: 20).")
-        report_group.add_argument("--tree-show", dest="tree_show", action="store_true",
-                                help="Show ASCII directory tree (use --user, --search, --level, --limit, --path).")
-        report_group.add_argument("--search", metavar="KEYWORD", default="",
-                                help="For --tree-show: highlight dirs whose name contains KEYWORD (case-insensitive).")
+        detail_group.add_argument("--limit", type=int, default=20,
+                                help="For --tree-show: max results per level (default: 20).")
+        detail_group.add_argument("--search", metavar="KEYWORD", default="",
+                                help="Filter results by keyword. For --detail: filter dirs/files by path. For --tree-show: show only matching dirs.")
 
         # Report filtering options
-        filter_group = parser.add_argument_group('Report Filtering Options')
         filter_group.add_argument("--user", metavar="USER", nargs="+", help="Filter report by specific user(s)")
         filter_group.add_argument("--compare-by", choices=["usage", "growth"], default="growth",
                                 help="Method for selecting top users when comparing multiple reports: 'usage' (total size) or 'growth' (growth rate) (default: growth)")
