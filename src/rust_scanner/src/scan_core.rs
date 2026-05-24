@@ -115,15 +115,15 @@ pub(crate) fn run_scan_core(
             .threads(threads_count)
             .build_parallel()
             .run(|| {
-                let tid = thread_counter.fetch_add(1, Ordering::SeqCst);
+                let tid = thread_counter.fetch_add(1, Ordering::Relaxed);
                 let mut state = ThreadLocalState {
                     t_files: 0,
                     t_dirs: 0,
                     t_inodes: 0,
                     t_size: 0,
-                    t_uid_sizes: HashMap::new(),
-                    t_uid_files: HashMap::new(),
-                    t_dir_sizes: HashMap::new(),
+                    t_uid_sizes: HashMap::with_capacity(256),
+                    t_uid_files: HashMap::with_capacity(256),
+                    t_dir_sizes: HashMap::with_capacity(50_000),
                     t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
                         .map(|_| Vec::with_capacity(1024 * 1024))
                         .collect(),
