@@ -63,16 +63,16 @@ python3 scripts/export_user_reports.py \
 - Skips critical pseudo-mounts (`proc`, `sys`, `dev`, `.snapshot`, `.zfs`, `.nfs`) automatically.
 - Cross-device check prevents descending into bind mounts or NFS sub-mounts.
 - Hard-link dedup (`DashSet<(ino, dev)>`) avoids double-counting cross-linked bytes.
-- Streams events to per-thread binary spill files (lz4-compressed) in a temp dir.
+- Streams events to per-thread binary `.bin` spill files (uncompressed, 16MB BufWriter) in a temp dir.
 - Panic-safe: `DoneGuard` RAII ensures the progress loop never spins forever.
-- `mallopt(M_MMAP_THRESHOLD=128KB)` reduces glibc heap fragmentation on large scans.
 
 ### Phase 2: Rust SQLite report pipeline (split into 2 phases)
 
 - **Phase 2 (detail)**: reads spill files via Rayon, builds `data_detail.db`:
   - Per-user file/dir breakdown, indexed for `ORDER BY size DESC` pagination.
   - `dirs` + `dir_names` tables for self-contained full path reconstruction.
-  - Compact spill re-encoding (18 bytes/row) eliminates path String allocations.
+  - Compact spill re-encoding (18 bytes/row, LZ4-compressed) eliminates path String allocations.
+  - `mallopt(M_MMAP_THRESHOLD=128KB)` reduces glibc heap fragmentation during build.
   - `malloc_trim(0)` after large drops returns freed heap pages to OS.
 - **Phase 3 (treemap)**: loads persisted aggregates, builds `tree_map_data/treemap.db`:
   - All dirs included (no depth filter) for complete path resolution.
@@ -421,16 +421,16 @@ Phase 4: drain sync + final heartbeat
 
 **Phase 1:**
 - `ignore::WalkBuilder` work-stealing (better than custom bounded queue for NFS)
-- `mallopt(M_MMAP_THRESHOLD=128KB)` reduces heap fragmentation
-- Per-thread lz4 spill files with 16MB BufWriter (1 NFS write per 32MB flush)
+- Per-thread event writers: 16MB BufWriter, uncompressed `.bin` files, flush at 32MB
+- 64 workers default (`cpus × 4` clamped to 64)
 
 **Phase 2:**
 - Phase 2/3 split: detail.db and treemap.db built independently → RAM freed between phases
-- Compact spill re-encoding: 18 bytes/row (was ~200 bytes with String paths)
+- Compact spill re-encoding: 18 bytes/row LZ4-compressed (was ~200 bytes with String paths)
 - Parallel re-encode pass (Rayon + DashMap) for 131-user workloads
-- `malloc_trim(0)` after large drops returns ~10GB heap to OS
+- `mallopt(M_MMAP_THRESHOLD=128KB)` + `malloc_trim(0)` returns ~10GB heap to OS after large drops
 - `PRAGMA optimize` instead of full `ANALYZE` (saves ~18s)
-- Dropped 2 unused indexes (`ix_files_uid_ext_size`, `ix_files_name_uid`) → -39% DB size
+- Dropped 2 unused indexes (`ix_files_uid_ext_size`, `ix_files_name_uid`) → -39% DB size on benchmark
 
 ---
 
