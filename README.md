@@ -152,13 +152,13 @@ bash src/rust_exporter/build.sh
 | Command | Description |
 |---|---|
 | `--run` | Run a full scan and generate reports. |
-| `--run --workers <N>` | Override worker count (default: auto, max 64). |
+| `--run --workers <N>` | Override worker count (default: `min(32, cpus × 2)`). |
 | `--run --debug` | Print Phase 1/2/3 timing + RSS diagnostics. |
 | `--run --output-dir <dir>` | Write all reports to a specific directory. |
 | `--run --prefix <name>` | Prefix generated report filenames. |
 | `--run --date` | Append `YYYYMMDD` to output filenames. |
-| `--run --tree-map` | Build `tree_map_data/treemap.db` (required for `--tree-show`). |
-| `--run --level <N>` | TreeMap depth (default: 3). Also used by `--tree-show`. |
+| `--run --tree-map` | Build `tree_map_data/treemap.db` (required for `--tree-show`). All dirs included regardless of `--level`. |
+| `--run --level <N>` | Display depth metadata stored in treemap.db (default: 3). For actual tree depth at view time, use `--tree-show --level`. |
 | `--run --webhook-url <URL>` | POST a Microsoft Teams summary on completion. |
 
 ### Sync Commands
@@ -207,7 +207,7 @@ python3 disk_checker.py --detail --user alice --output-dir /reports
 | `dirs` | Directory breakdown only (sorted by size) |
 | `files` | Largest files only |
 | `inode` | Directory breakdown sorted by file count |
-| `permission` | Permission errors from `permission_issues.db` |
+| `permission` | Permission errors from `<output-dir>/permission_issues.db` |
 
 **Examples:**
 
@@ -339,7 +339,7 @@ Indexes: `ix_files_uid_size`, `ix_dus_uid_size`, `ix_dirs_parent`.
 |---|---|
 | `meta` | scan_root, scan_timestamp, max_level, total_size, total_dirs |
 | `names` | directory segment dictionary |
-| `dirs` | id, parent_id, name_id, total_size, file_count, dir_count, owner_uid |
+| `dirs` | id, parent_id, name_id, total_size, file_count, dir_count, owner_uid, has_files |
 | `owners` | uid → username |
 
 ---
@@ -372,7 +372,7 @@ Phase 3: Rust treemap pipeline  [only with --tree-map]
   → cleanup aggregates
          │
          ▼
-Phase 4: drain sync + final heartbeat
+Phase 4: final heartbeat (drain sync if enabled)
 ```
 
 ### Rust crates
@@ -422,7 +422,7 @@ Phase 4: drain sync + final heartbeat
 **Phase 1:**
 - `ignore::WalkBuilder` work-stealing (better than custom bounded queue for NFS)
 - Per-thread event writers: 16MB BufWriter, uncompressed `.bin` files, flush at 32MB
-- 64 workers default (`cpus × 4` clamped to 64)
+- 64 workers default (Python layer: `min(32, cpus × 2)` when `--workers` not specified; Rust Phase 1 supports up to `cpus × 4` clamped to 64 if called directly)
 
 **Phase 2:**
 - Phase 2/3 split: detail.db and treemap.db built independently → RAM freed between phases
