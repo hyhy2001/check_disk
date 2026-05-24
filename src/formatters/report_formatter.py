@@ -490,16 +490,21 @@ class ReportFormatter(BaseFormatter):
 
         has_tm = self._has_treemap(conn)
         kw = search.lower() if search else ""
-        # Load more rows when searching so we can post-filter to top N.
-        # Use a large window (up to 5000) to find matches even when keyword
-        # doesn't appear in the top-N by size.
-        fetch_limit = min(top * 100, 5000) if kw else top
+        # When searching, scan all dirs (no LIMIT) to find all matches.
+        # Without search, use top-N for fast lookup.
         dirs: List[Dict[str, Any]] = []
-        cursor = conn.execute(
-            "SELECT dir_id, size FROM dir_user_size "
-            "WHERE uid = ? ORDER BY size DESC LIMIT ?",
-            (uid, fetch_limit),
-        )
+        if kw:
+            cursor = conn.execute(
+                "SELECT dir_id, size FROM dir_user_size "
+                "WHERE uid = ? ORDER BY size DESC",
+                (uid,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT dir_id, size FROM dir_user_size "
+                "WHERE uid = ? ORDER BY size DESC LIMIT ?",
+                (uid, top),
+            )
         for dir_id, size in cursor:
             path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
             if kw and kw not in path.lower():
@@ -533,29 +538,48 @@ class ReportFormatter(BaseFormatter):
         files: List[Dict[str, Any]] = []
         has_tm = self._has_treemap(conn)
         kw = search.lower() if search else ""
-        # Top_files only stores top-K per user; if filtering, expand the
-        # rank window so we still find matches further down.
-        rank_limit = min(top * 100, 5000) if kw else top
-        cursor = conn.execute(
-            """
-            SELECT f.dir_id, n.name, e.ext, t.size
-              FROM top_files t
-              JOIN files f ON f.id = t.file_id
-              JOIN names n ON f.name_id = n.id
-              JOIN exts e  ON f.ext_id = e.id
-             WHERE t.uid = ? AND t.rank <= ?
-             ORDER BY t.rank
-            """,
-            (uid, rank_limit),
-        )
-        for dir_id, basename, ext, size in cursor:
-            parent = self._build_path(conn, dir_id) if has_tm else ""
-            full_path = f"{parent.rstrip('/')}/{basename}" if parent else basename
-            if kw and kw not in full_path.lower():
-                continue
-            files.append({"path": full_path, "size": int(size), "ext": ext or ""})
-            if len(files) >= top:
-                break
+
+        if kw:
+            # When searching, query files table directly (not top_files which
+            # only stores top-K per user). This ensures all matching files are
+            # found regardless of rank. Filter by path after building full path.
+            cursor = conn.execute(
+                """
+                SELECT f.dir_id, n.name, e.ext, f.size
+                  FROM files f
+                  JOIN names n ON f.name_id = n.id
+                  JOIN exts e  ON f.ext_id = e.id
+                 WHERE f.uid = ?
+                 ORDER BY f.size DESC
+                """,
+                (uid,),
+            )
+            for dir_id, basename, ext, size in cursor:
+                parent = self._build_path(conn, dir_id) if has_tm else ""
+                full_path = f"{parent.rstrip('/')}/{basename}" if parent else basename
+                if kw not in full_path.lower():
+                    continue
+                files.append({"path": full_path, "size": int(size), "ext": ext or ""})
+                if len(files) >= top:
+                    break
+        else:
+            # No search: use top_files for fast top-N lookup
+            cursor = conn.execute(
+                """
+                SELECT f.dir_id, n.name, e.ext, t.size
+                  FROM top_files t
+                  JOIN files f ON f.id = t.file_id
+                  JOIN names n ON f.name_id = n.id
+                  JOIN exts e  ON f.ext_id = e.id
+                 WHERE t.uid = ? AND t.rank <= ?
+                 ORDER BY t.rank
+                """,
+                (uid, top),
+            )
+            for dir_id, basename, ext, size in cursor:
+                parent = self._build_path(conn, dir_id) if has_tm else ""
+                full_path = f"{parent.rstrip('/')}/{basename}" if parent else basename
+                files.append({"path": full_path, "size": int(size), "ext": ext or ""})
         return {
             "date": scan_ts,
             "user": user,
@@ -593,13 +617,19 @@ class ReportFormatter(BaseFormatter):
         has_tm = self._has_treemap(conn)
 
         kw = search.lower() if search else ""
-        fetch_limit = min(top * 100, 5000) if kw else top
         dirs: List[Dict[str, Any]] = []
-        cursor = conn.execute(
-            "SELECT dir_id, files, size FROM dir_user_size "
-            "WHERE uid = ? ORDER BY files DESC LIMIT ?",
-            (uid, fetch_limit),
-        )
+        if kw:
+            cursor = conn.execute(
+                "SELECT dir_id, files, size FROM dir_user_size "
+                "WHERE uid = ? ORDER BY files DESC",
+                (uid,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT dir_id, files, size FROM dir_user_size "
+                "WHERE uid = ? ORDER BY files DESC LIMIT ?",
+                (uid, top),
+            )
         for dir_id, files, size in cursor:
             path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
             if kw and kw not in path.lower():
