@@ -388,7 +388,7 @@ struct UserTotals {
 
 // ─── Main entry point ─────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 pub(crate) fn build_detail_db_impl(
     py: Python<'_>,
     tmpdir: String,
