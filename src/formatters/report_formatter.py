@@ -554,10 +554,10 @@ class ReportFormatter(BaseFormatter):
                 (uid,),
             )
             for dir_id, basename, ext, size in cursor:
+                if kw not in basename.lower():
+                    continue
                 parent = self._build_path(conn, dir_id) if has_tm else ""
                 full_path = f"{parent.rstrip('/')}/{basename}" if parent else basename
-                if kw not in full_path.lower():
-                    continue
                 files.append({"path": full_path, "size": int(size), "ext": ext or ""})
                 if len(files) >= top:
                     break
