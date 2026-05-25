@@ -1078,7 +1078,7 @@ class ReportFormatter(BaseFormatter):
         # size DESC). This avoids the noise of showing all ancestors when the
         # keyword is common (e.g. 'config' has hundreds of matches).
         if search:
-            self._render_flat_search(conn, search, limit)
+            self._render_flat_search(conn, search, limit, start_id=start_id)
             return
 
         self._render_total_tree_node(
@@ -1091,19 +1091,37 @@ class ReportFormatter(BaseFormatter):
         conn: sqlite3.Connection,
         search: str,
         limit: int,
+        start_id: Optional[int] = None,
     ) -> None:
         """Render a flat list of dirs whose name contains the keyword,
-        sorted by total_size DESC. Builds full paths via _build_path."""
+        sorted by total_size DESC. When start_id is given, only descendants
+        of that dir are included."""
         kw = search.lower()
         try:
-            rows = conn.execute(
-                "SELECT d.id, d.total_size, d.file_count "
-                "FROM tm.dirs d "
-                "JOIN tm.names n ON d.name_id = n.id "
-                "WHERE n.name LIKE ? COLLATE NOCASE "
-                "ORDER BY d.total_size DESC",
-                (f"%{kw}%",),
-            ).fetchall()
+            if start_id is not None and start_id != 0:
+                rows = conn.execute(
+                    "WITH RECURSIVE sub(id) AS ("
+                    "  SELECT id FROM tm.dirs WHERE parent_id = ? "
+                    "  UNION ALL "
+                    "  SELECT tm.dirs.id FROM tm.dirs JOIN sub ON tm.dirs.parent_id = sub.id"
+                    ") "
+                    "SELECT d.id, d.total_size, d.file_count "
+                    "FROM tm.dirs d "
+                    "JOIN tm.names n ON d.name_id = n.id "
+                    "WHERE d.id IN (SELECT id FROM sub) "
+                    "AND n.name LIKE ? COLLATE NOCASE "
+                    "ORDER BY d.total_size DESC",
+                    (start_id, f"%{kw}%"),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT d.id, d.total_size, d.file_count "
+                    "FROM tm.dirs d "
+                    "JOIN tm.names n ON d.name_id = n.id "
+                    "WHERE n.name LIKE ? COLLATE NOCASE "
+                    "ORDER BY d.total_size DESC",
+                    (f"%{kw}%",),
+                ).fetchall()
         except sqlite3.DatabaseError:
             print("  No directories found matching the keyword.")
             return
