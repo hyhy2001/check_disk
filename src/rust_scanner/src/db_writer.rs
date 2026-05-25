@@ -32,7 +32,6 @@ pub const SCHEMA_VERSION: i32 = 1;
 pub const PAGE_SIZE: i32 = 16384;
 
 pub const FILE_INSERT_CHUNK: usize = 200_000;
-pub const DEFAULT_TOP_K: usize = 1000;
 
 /// Rows packed into one `INSERT … VALUES (…),(…),…` statement.
 /// SQLite default binding cap is 32766; 100 rows × 9 cols = 900 binds is safe.
@@ -95,76 +94,69 @@ CREATE TABLE users (
   is_target         INTEGER NOT NULL DEFAULT 0
 );
 
--- Extension dictionary. Same dedupe-via-Rust rationale as `names`.
-CREATE TABLE exts (
-  id  INTEGER PRIMARY KEY,
-  ext TEXT    NOT NULL
-);
-
--- File basename dictionary. Lives in detail.db (not tm.names) because the
--- treemap UI only needs DIR segment names — file basenames here only matter
--- to detail-page consumers. Splitting keeps treemap.db ~50% smaller and
--- semantically tighter.
-CREATE TABLE names (
-  id   INTEGER PRIMARY KEY,
-  name TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS dir_names (
+-- File basename dictionary (unique basenames across all files).
+CREATE TABLE file_names (
   id   INTEGER PRIMARY KEY,
   name TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS dirs (
-  id        INTEGER PRIMARY KEY,
-  parent_id INTEGER,
-  name_id   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_dirs_parent ON dirs(parent_id);
 
--- File rows. `dir_id` references directory ids shared across detail/treemap.
--- `name_id` references THIS database's `names` table (file basenames).
+-- Dir segment dictionary (unique path segments e.g. 'var', 'log', 'apache2').
+CREATE TABLE dir_names (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+-- Directory table. One row per (dir entity, user) pair.
+-- id = dir entity id (same dir shared across users).
+-- uid = file owner who has files inside this dir.
+-- path = pre-computed full path e.g. '/var/log/apache2'.
+-- owner_uid = owner of the directory entry itself (from stat).
+-- size = total size of uid's files in this dir.
+-- files = count of uid's files in this dir.
+CREATE TABLE dirs (
+  id        INTEGER NOT NULL,
+  uid       INTEGER NOT NULL,
+  parent_id INTEGER,
+  path      TEXT    NOT NULL,
+  owner_uid INTEGER NOT NULL,
+  size      INTEGER NOT NULL,
+  files     INTEGER NOT NULL,
+  PRIMARY KEY (id, uid)
+);
+
+-- File rows. No surrogate id (nothing references files.id after top_files removed).
+-- ext stored inline (avoids JOIN with exts dictionary).
 CREATE TABLE files (
-  id      INTEGER PRIMARY KEY,
   dir_id  INTEGER NOT NULL,
   name_id INTEGER NOT NULL,
-  ext_id  INTEGER NOT NULL,
+  ext     TEXT    NOT NULL,
   uid     INTEGER NOT NULL,
   size    INTEGER NOT NULL
 );
 
-CREATE TABLE top_files (
-  uid     INTEGER NOT NULL,
-  rank    INTEGER NOT NULL,
-  file_id INTEGER NOT NULL,
-  size    INTEGER NOT NULL,
-  PRIMARY KEY (uid, rank)
-);
+-- FTS4 index on file basenames. rowid = file_names.id (1:1).
+-- Populated after file_names insert: INSERT INTO fts_file_names SELECT id, name FROM file_names.
+CREATE VIRTUAL TABLE fts_file_names USING fts4(name, tokenize=unicode61);
 
-CREATE TABLE dir_user_size (
-  uid    INTEGER NOT NULL,
-  dir_id INTEGER NOT NULL,
-  size   INTEGER NOT NULL,
-  files  INTEGER NOT NULL,
-  PRIMARY KEY (uid, dir_id)
-);
+-- FTS4 index on dir paths. rowid = dirs.id (unique dir entity id).
+-- Tokens = path split by '/' joined by space e.g. '/var/log' -> 'var log'.
+-- Populated after dirs insert.
+CREATE VIRTUAL TABLE fts_dir_paths USING fts4(tokens, tokenize=unicode61);
 ";
 
 const DETAIL_INDEX_DDL: &str = "
--- Full (uid, size DESC) index. Replaces the previous partial-on-1MB version
--- because the dashboard issues `ORDER BY size DESC` for arbitrary pages, and
--- the partial only covered ~5% of rows — leaving the rest to a temp B-tree
--- sort over every row of the user (~700k for `root` at demo scale -> 1+s
--- per page). Full index streams the result already-sorted: any page is
--- ~ms regardless of OFFSET, at the cost of ~10 MB demo / ~1.5 GB at 75M.
-CREATE INDEX ix_files_uid_size       ON files(uid, size DESC);
--- Cover (uid, ext_id) lookups so ext-only filter — and ext + size combined —
--- hits an index instead of scanning files. Critical at 75M-row scale: a full
--- scan would be ~25s; this index makes ext filter ~ms regardless of size.
--- Cover keyword search via LIKE-on-tm.names + name_id JOIN. The (name_id, uid)
--- prefix is enough; the size column was dropped because keyword matches
--- typically yield only hundreds–thousands of rows and the temp-B-tree sort on
--- that small set takes microseconds.
-CREATE INDEX ix_dus_uid_size         ON dir_user_size(uid, size DESC);
+-- Files: cover ORDER BY size DESC per user (no-filter pagination).
+CREATE INDEX ix_files_uid_size      ON files(uid, size DESC);
+-- Files: cover ext filter + size order (ext-only and ext+size combos).
+CREATE INDEX ix_files_uid_ext_size  ON files(uid, ext, size DESC);
+-- Files: cover name_id lookup for FTS-backed keyword search.
+CREATE INDEX ix_files_name_uid_size ON files(name_id, uid, size DESC);
+-- Dirs: cover ORDER BY size DESC per user (no-filter pagination).
+CREATE INDEX ix_dirs_uid_size       ON dirs(uid, size DESC);
+-- Dirs: cover dir entity id lookup (for FTS-backed keyword search).
+CREATE INDEX ix_dirs_id_uid_size    ON dirs(id, uid, size DESC);
+-- file_names: cover LIKE fallback for substring search.
+CREATE INDEX ix_file_names_name     ON file_names(name);
 ";
 
 // ─── PRAGMA / lifecycle helpers ───────────────────────────────────────
@@ -567,17 +559,11 @@ pub struct UserRow {
     pub is_target: i64,
 }
 
-pub struct DirUserSizeRow {
-    pub uid: i64,
-    pub dir_id: i64,
-    pub size: i64,
-    pub files: i64,
-}
 
 pub struct FileRow {
     pub dir_id: i64,
     pub name_id: i64,
-    pub ext_id: i64,
+    pub ext: String,
     pub uid: i64,
     pub size: i64,
 }
@@ -645,35 +631,16 @@ pub fn detail_insert_users(handle: &mut DetailBuildHandle, users: &[UserRow]) ->
     Ok(())
 }
 
-pub fn detail_insert_exts(handle: &mut DetailBuildHandle, exts: &[String]) -> PyResult<()> {
-    let tx = handle
-        .conn
-        .transaction()
-        .map_err(|e| PyRuntimeError::new_err(format!("tx exts: {}", e)))?;
-    {
-        let mut stmt = tx
-            .prepare("INSERT INTO exts(id, ext) VALUES (?, ?)")
-            .map_err(|e| PyRuntimeError::new_err(format!("prep exts: {}", e)))?;
-        for (id, ext) in exts.iter().enumerate() {
-            stmt.execute(params![id as i64, ext])
-                .map_err(|e| PyRuntimeError::new_err(format!("ins ext: {}", e)))?;
-        }
-    }
-    tx.commit()
-        .map_err(|e| PyRuntimeError::new_err(format!("commit exts: {}", e)))?;
-    Ok(())
-}
-
-/// Insert file basenames into detail.db's local `names` table.
+/// Insert file basenames into detail.db's local `file_names` table.
 /// Multi-row VALUES packing for fast bulk insert at scale.
-pub fn detail_insert_names(handle: &mut DetailBuildHandle, names: &[String]) -> PyResult<()> {
+pub fn detail_insert_file_names(handle: &mut DetailBuildHandle, names: &[String]) -> PyResult<()> {
     let len = names.len();
     if len == 0 {
         return Ok(());
     }
     packed_insert(
         &mut handle.conn,
-        "names",
+        "file_names",
         "id, name",
         2,
         len,
@@ -682,7 +649,7 @@ pub fn detail_insert_names(handle: &mut DetailBuildHandle, names: &[String]) -> 
             let name = names[i].clone();
             vec![Box::new(id), Box::new(name)]
         },
-        "names",
+        "file_names",
     )
 }
 
@@ -705,9 +672,42 @@ pub(crate) fn detail_insert_dir_names(
     Ok(())
 }
 
+pub(crate) fn detail_insert_fts_file_names(handle: &mut DetailBuildHandle) -> PyResult<()> {
+    let tx = handle.conn.transaction()
+        .map_err(|e| PyRuntimeError::new_err(format!("fts_file_names tx: {}", e)))?;
+    tx.execute_batch(
+        "INSERT INTO fts_file_names(rowid, name) SELECT id, name FROM file_names;"
+    ).map_err(|e| PyRuntimeError::new_err(format!("fts_file_names insert: {}", e)))?;
+    tx.commit()
+        .map_err(|e| PyRuntimeError::new_err(format!("fts_file_names commit: {}", e)))?;
+    Ok(())
+}
+
+pub(crate) fn detail_insert_fts_dir_paths(
+    handle: &mut DetailBuildHandle,
+    // (dir_id, tokens) — tokens = path split by '/' joined by space
+    entries: &[(i64, String)],
+) -> PyResult<()> {
+    let tx = handle.conn.transaction()
+        .map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths tx: {}", e)))?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO fts_dir_paths(rowid, tokens) VALUES (?,?)"
+        ).map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths prepare: {}", e)))?;
+        for (dir_id, tokens) in entries {
+            stmt.execute(rusqlite::params![dir_id, tokens])
+                .map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths insert: {}", e)))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths commit: {}", e)))?;
+    Ok(())
+}
+
 pub(crate) fn detail_insert_dirs(
     handle: &mut DetailBuildHandle,
-    dirs: &[(i64, Option<i64>, i64)],
+    // (id, uid, parent_id, path, owner_uid, size, files)
+    dirs: &[(i64, i64, Option<i64>, String, i64, i64, i64)],
 ) -> PyResult<()> {
     let tx = handle
         .conn
@@ -715,10 +715,10 @@ pub(crate) fn detail_insert_dirs(
         .map_err(|e| PyRuntimeError::new_err(format!("dirs tx: {}", e)))?;
     {
         let mut stmt = tx
-            .prepare_cached("INSERT OR IGNORE INTO dirs(id, parent_id, name_id) VALUES (?,?,?)")
+            .prepare_cached("INSERT INTO dirs(id, uid, parent_id, path, owner_uid, size, files) VALUES (?,?,?,?,?,?,?)")
             .map_err(|e| PyRuntimeError::new_err(format!("dirs prepare: {}", e)))?;
-        for &(id, parent_id, name_id) in dirs {
-            stmt.execute(params![id, parent_id, name_id])
+        for (id, uid, parent_id, path, owner_uid, size, files) in dirs {
+            stmt.execute(params![id, uid, parent_id, path, owner_uid, size, files])
                 .map_err(|e| PyRuntimeError::new_err(format!("dirs insert: {}", e)))?;
         }
     }
@@ -735,141 +735,25 @@ pub fn detail_insert_files_chunk(
     if len == 0 {
         return Ok(());
     }
-    // Fast path: files is the hot insert at 48M+ rows, all-i64. The generic
-    // `packed_insert` path goes through `Box<dyn ToSql>` per cell, which at
-    // 5 cols × 48M rows = 240M heap allocations alone. We instead bind a
-    // contiguous `&[i64]` per packed statement so each cell is a stack copy
-    // — same 100-row packing strategy, no boxing, no FnMut indirection.
-    let tx = handle
-        .conn
-        .transaction()
-        .map_err(|e| PyRuntimeError::new_err(format!("tx files: {}", e)))?;
-    {
-        const COLS: usize = 5;
-        let full_chunks = len / PACK_ROWS;
-        let tail = len % PACK_ROWS;
-
-        // Cached prepared statement for full PACK_ROWS chunks.
-        let mut full_stmt = if full_chunks > 0 {
-            let group = placeholder_group(COLS);
-            let mut full_sql = String::with_capacity(48 + group.len() * PACK_ROWS);
-            full_sql.push_str(
-                "INSERT INTO files(dir_id, name_id, ext_id, uid, size) VALUES ",
-            );
-            for i in 0..PACK_ROWS {
-                if i > 0 {
-                    full_sql.push(',');
-                }
-                full_sql.push_str(&group);
-            }
-            Some(
-                tx.prepare(&full_sql)
-                    .map_err(|e| PyRuntimeError::new_err(format!("prep files full: {}", e)))?,
-            )
-        } else {
-            None
-        };
-
-        let mut binds: Vec<i64> = Vec::with_capacity(PACK_ROWS * COLS);
-        let mut row_idx = 0usize;
-        if let Some(ref mut stmt) = full_stmt {
-            for _ in 0..full_chunks {
-                binds.clear();
-                for _ in 0..PACK_ROWS {
-                    let r = unsafe { rows.get_unchecked(row_idx) };
-                    binds.push(r.dir_id);
-                    binds.push(r.name_id);
-                    binds.push(r.ext_id);
-                    binds.push(r.uid);
-                    binds.push(r.size);
-                    row_idx += 1;
-                }
-                stmt.execute(params_from_iter(binds.iter()))
-                    .map_err(|e| PyRuntimeError::new_err(format!("ins files (packed): {}", e)))?;
-            }
-        }
-
-        if tail > 0 {
-            let group = placeholder_group(COLS);
-            let mut sql = String::with_capacity(48 + group.len() * tail);
-            sql.push_str("INSERT INTO files(dir_id, name_id, ext_id, uid, size) VALUES ");
-            for i in 0..tail {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push_str(&group);
-            }
-            let mut stmt = tx
-                .prepare(&sql)
-                .map_err(|e| PyRuntimeError::new_err(format!("prep files tail: {}", e)))?;
-            binds.clear();
-            for _ in 0..tail {
-                let r = unsafe { rows.get_unchecked(row_idx) };
-                binds.push(r.dir_id);
-                binds.push(r.name_id);
-                binds.push(r.ext_id);
-                binds.push(r.uid);
-                binds.push(r.size);
-                row_idx += 1;
-            }
-            stmt.execute(params_from_iter(binds.iter()))
-                .map_err(|e| PyRuntimeError::new_err(format!("ins files (tail): {}", e)))?;
-        }
-    }
-    tx.commit()
-        .map_err(|e| PyRuntimeError::new_err(format!("commit files: {}", e)))?;
-    handle.files_inserted += len as i64;
-    Ok(())
-}
-
-pub fn detail_insert_dir_user_size(
-    handle: &mut DetailBuildHandle,
-    rows: &[DirUserSizeRow],
-) -> PyResult<()> {
     packed_insert(
         &mut handle.conn,
-        "dir_user_size",
-        "uid, dir_id, size, files",
-        4,
-        rows.len(),
+        "files",
+        "dir_id, name_id, ext, uid, size",
+        5,
+        len,
         |i| {
             let r = &rows[i];
             vec![
-                Box::new(r.uid),
                 Box::new(r.dir_id),
+                Box::new(r.name_id),
+                Box::new(r.ext.clone()),
+                Box::new(r.uid),
                 Box::new(r.size),
-                Box::new(r.files),
             ]
         },
-        "dir_user_size",
-    )
-}
-
-/// `entries` = `[(uid, sorted_desc_by_size [(size, file_id), ...])]`. Rank starts at 1.
-pub fn detail_insert_top_files(
-    handle: &mut DetailBuildHandle,
-    entries: &[(i64, Vec<(i64, i64)>)],
-) -> PyResult<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let tx = handle
-        .conn
-        .transaction()
-        .map_err(|e| PyRuntimeError::new_err(format!("tx top_files: {}", e)))?;
-    {
-        let mut stmt = tx
-            .prepare("INSERT INTO top_files(uid, rank, file_id, size) VALUES (?, ?, ?, ?)")
-            .map_err(|e| PyRuntimeError::new_err(format!("prep top_files: {}", e)))?;
-        for (uid, sorted) in entries {
-            for (rank, (size, file_id)) in sorted.iter().enumerate() {
-                stmt.execute(params![uid, (rank + 1) as i64, file_id, size])
-                    .map_err(|e| PyRuntimeError::new_err(format!("ins top_file: {}", e)))?;
-            }
-        }
-    }
-    tx.commit()
-        .map_err(|e| PyRuntimeError::new_err(format!("commit top_files: {}", e)))?;
+        "files",
+    )?;
+    handle.files_inserted += len as i64;
     Ok(())
 }
 

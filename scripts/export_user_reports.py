@@ -52,8 +52,7 @@ def _resolve_db_paths(input_dir: str):
 
 
 def find_users(input_dir: str, prefix: str) -> list:
-    """Return sorted list of usernames in ``data_detail.db`` (excluding the
-    placeholder ``uid-N`` slots)."""
+    """Return sorted list of usernames in ``data_detail.db``."""
     _ = prefix
     detail_db, _tm = _resolve_db_paths(input_dir)
     if not detail_db:
@@ -62,8 +61,7 @@ def find_users(input_dir: str, prefix: str) -> list:
         conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
         try:
             rows = conn.execute(
-                "SELECT username FROM users WHERE username NOT LIKE 'uid-%' "
-                "ORDER BY username"
+                "SELECT username FROM users ORDER BY username"
             ).fetchall()
         finally:
             conn.close()

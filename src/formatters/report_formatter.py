@@ -495,13 +495,13 @@ class ReportFormatter(BaseFormatter):
         dirs: List[Dict[str, Any]] = []
         if kw:
             cursor = conn.execute(
-                "SELECT dir_id, size FROM dir_user_size "
+                "SELECT id, size FROM dirs "
                 "WHERE uid = ? ORDER BY size DESC",
                 (uid,),
             )
         else:
             cursor = conn.execute(
-                "SELECT dir_id, size FROM dir_user_size "
+                "SELECT id, size FROM dirs "
                 "WHERE uid = ? ORDER BY size DESC LIMIT ?",
                 (uid, top),
             )
@@ -540,15 +540,14 @@ class ReportFormatter(BaseFormatter):
         kw = search.lower() if search else ""
 
         if kw:
-            # When searching, query files table directly (not top_files which
-            # only stores top-K per user). This ensures all matching files are
+            # When searching, query files table directly without LIMIT.
+            # This ensures all matching files are
             # found regardless of rank. Filter by path after building full path.
             cursor = conn.execute(
                 """
-                SELECT f.dir_id, n.name, e.ext, f.size
+                SELECT f.dir_id, n.name, f.ext, f.size
                   FROM files f
-                  JOIN names n ON f.name_id = n.id
-                  JOIN exts e  ON f.ext_id = e.id
+                  JOIN file_names n ON f.name_id = n.id
                  WHERE f.uid = ?
                  ORDER BY f.size DESC
                 """,
@@ -563,16 +562,15 @@ class ReportFormatter(BaseFormatter):
                 if len(files) >= top:
                     break
         else:
-            # No search: use top_files for fast top-N lookup
+            # No search: use files table with LIMIT for fast top-N lookup
             cursor = conn.execute(
                 """
-                SELECT f.dir_id, n.name, e.ext, t.size
-                  FROM top_files t
-                  JOIN files f ON f.id = t.file_id
-                  JOIN names n ON f.name_id = n.id
-                  JOIN exts e  ON f.ext_id = e.id
-                 WHERE t.uid = ? AND t.rank <= ?
-                 ORDER BY t.rank
+                SELECT f.dir_id, n.name, f.ext, f.size
+                  FROM files f
+                  JOIN file_names n ON f.name_id = n.id
+                 WHERE f.uid = ?
+                 ORDER BY f.size DESC
+                 LIMIT ?
                 """,
                 (uid, top),
             )
@@ -620,13 +618,13 @@ class ReportFormatter(BaseFormatter):
         dirs: List[Dict[str, Any]] = []
         if kw:
             cursor = conn.execute(
-                "SELECT dir_id, files, size FROM dir_user_size "
+                "SELECT id, files, size FROM dirs "
                 "WHERE uid = ? ORDER BY files DESC",
                 (uid,),
             )
         else:
             cursor = conn.execute(
-                "SELECT dir_id, files, size FROM dir_user_size "
+                "SELECT id, files, size FROM dirs "
                 "WHERE uid = ? ORDER BY files DESC LIMIT ?",
                 (uid, top),
             )
@@ -826,7 +824,7 @@ class ReportFormatter(BaseFormatter):
             start_path_str = self._build_path(conn, start_id) or scan_root
 
         root_user = conn.execute(
-            "SELECT size, files FROM dir_user_size WHERE uid = ? AND dir_id = ?",
+            "SELECT size, files FROM dirs WHERE uid = ? AND id = ?",
             (uid, start_id),
         ).fetchone()
 
@@ -879,8 +877,8 @@ class ReportFormatter(BaseFormatter):
                    COALESCE(dus.files, 0) AS user_files
               FROM tm.dirs d
               JOIN tm.names n ON d.name_id = n.id
-              LEFT JOIN dir_user_size dus
-                     ON dus.dir_id = d.id AND dus.uid = ?
+              LEFT JOIN dirs dus
+                     ON dus.id = d.id AND dus.uid = ?
              WHERE d.parent_id = ?
                AND COALESCE(dus.size, 0) > 0
              ORDER BY COALESCE(dus.size, 0) DESC
@@ -984,14 +982,14 @@ class ReportFormatter(BaseFormatter):
         """Standalone entry point for --tree-show.
 
         - Without users: total dir tree from tm.dirs (all-user totals)
-        - With users:    separate tree per user from dir_user_size
+        - With users:    separate tree per user from dirs
         - With search:   only branches containing matching dirs are rendered
         """
         if not treemap_db or not os.path.isfile(treemap_db):
             print("  Tree-show requires treemap.db. Run scan with --tree-map flag.")
             return
 
-        # detail.db is required when filtering by user (dir_user_size lives there).
+        # detail.db is required when filtering by user (per-user aggregates now live in dirs).
         # Without users we can rely solely on treemap.db.
         if users and (not detail_db or not os.path.isfile(detail_db)):
             print("  Tree-show with --user requires data_detail.db. Run scan first.")
@@ -1144,7 +1142,7 @@ class ReportFormatter(BaseFormatter):
                 "SELECT d.id, dus.size, dus.files "
                 "FROM tm.dirs d "
                 "JOIN tm.names n ON d.name_id = n.id "
-                "JOIN dir_user_size dus ON dus.dir_id = d.id AND dus.uid = ? "
+                "JOIN dirs dus ON dus.id = d.id AND dus.uid = ? "
                 "WHERE n.name LIKE ? COLLATE NOCASE "
                 "ORDER BY dus.size DESC",
                 (uid, f"%{kw}%"),

@@ -60,184 +60,34 @@ fn open_detail(detail_db: &str, treemap_db: Option<&str>) -> Result<Connection, 
     Ok(conn)
 }
 
-/// Build full path string from a tm.dirs id by walking parent_id upward.
-fn build_path(conn: &Connection, dir_id: i64) -> String {
-    let mut stmt = match conn.prepare_cached(
-        "WITH RECURSIVE walk(id, parent_id, name_id, lvl) AS (\n\
-           SELECT id, parent_id, name_id, 0 FROM tm.dirs WHERE id = ?\n\
-           UNION ALL\n\
-           SELECT d.id, d.parent_id, d.name_id, w.lvl + 1\n\
-             FROM tm.dirs d JOIN walk w ON d.id = w.parent_id\n\
-         ) SELECT GROUP_CONCAT(name, '/') FROM (\n\
-           SELECT n.name AS name FROM walk w\n\
-             JOIN tm.names n ON w.name_id = n.id\n\
-             ORDER BY w.lvl DESC\n\
-         )",
-    ) {
-        Ok(s) => s,
-        Err(_) => return String::new(),
-    };
-    let row: Option<String> = stmt.query_row(params![dir_id], |r| r.get(0)).ok();
-    match row {
-        Some(joined) => {
-            let mut p = String::with_capacity(joined.len() + 1);
-            p.push('/');
-            // Strip the leading "/" segment from the root so we don't get "//foo".
-            p.push_str(joined.trim_start_matches('/'));
-            p
-        }
-        None => String::new(),
-    }
-}
 
 /// Pre-load every (dir_id → full path) into memory so per-row path lookup is
-/// O(1) instead of running a recursive CTE on each query result. With ~100k
-/// Compact dir → full-path resolver.
-///
-/// Instead of storing every full path string (~80 B/dir × 100k dirs ≈ 8 MB
-/// demo / ~1.2 GB at 75M-file scale), this stores the (parent_id, name) edge
-/// per dir and reconstructs paths on demand. A small LRU cache of recently
-/// reconstructed full paths keeps repeated lookups (very common — file rows
-/// share parents) at O(1).
-///
-/// Memory: ~24 B/dir for the edges (Vec<i64> + interned name index). Roughly
-/// 4× cheaper than caching every full path eagerly. The cache is bounded so
-/// peak RSS stays predictable regardless of dir count.
+/// O(1). New schema has dirs.path pre-computed by scanner.
 struct DirPathMap {
-    /// dir_id → (parent_id_or_neg1, name_index)
-    edges: HashMap<i64, (i64, u32)>,
-    /// Distinct path segments (interned).
-    names: Vec<String>,
-    name_index: HashMap<String, u32>,
-    /// Bounded materialization cache.
-    cache: std::cell::RefCell<HashMap<i64, String>>,
-    cache_cap: usize,
+    paths: HashMap<i64, String>,
 }
 
 impl DirPathMap {
     fn load(conn: &Connection) -> Result<Self, String> {
-        let has_detail_dirs = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('dirs','dir_names')",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            >= 2;
-
-        let query = if has_detail_dirs {
-            "SELECT d.id, d.parent_id, n.name \
-             FROM dirs d JOIN dir_names n ON d.name_id = n.id \
-             ORDER BY d.id"
-        } else {
-            "SELECT d.id, d.parent_id, n.name \
-             FROM tm.dirs d JOIN tm.names n ON d.name_id = n.id \
-             ORDER BY d.id"
-        };
-
         let mut stmt = conn
-            .prepare(query)
+            .prepare("SELECT DISTINCT id, path FROM dirs")
             .map_err(|e| format!("prepare dir path map: {}", e))?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<i64>>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(|e| format!("query dir path map: {}", e))?;
 
-        let mut edges: HashMap<i64, (i64, u32)> = HashMap::new();
-        let mut names: Vec<String> = Vec::new();
-        let mut name_index: HashMap<String, u32> = HashMap::new();
+        let mut paths: HashMap<i64, String> = HashMap::new();
         for row in rows {
-            let (id, parent_id, name) = row.map_err(|e| format!("row: {}", e))?;
-            let nidx = match name_index.get(&name) {
-                Some(i) => *i,
-                None => {
-                    let i = names.len() as u32;
-                    names.push(name.clone());
-                    name_index.insert(name, i);
-                    i
-                }
-            };
-            edges.insert(id, (parent_id.unwrap_or(-1), nidx));
+            let (id, path) = row.map_err(|e| format!("row: {}", e))?;
+            paths.insert(id, path);
         }
-        Ok(Self {
-            edges,
-            names,
-            name_index,
-            cache: std::cell::RefCell::new(HashMap::with_capacity(2048)),
-            cache_cap: 2048,
-        })
+        Ok(Self { paths })
     }
 
-    fn name_of(&self, idx: u32) -> &str {
-        self.names.get(idx as usize).map(|s| s.as_str()).unwrap_or("")
-    }
-
-    /// Resolve dir_id → full path. Walks parent chain at most once per
-    /// distinct dir_id (cached afterwards).
     fn get(&self, dir_id: i64) -> String {
-        if let Some(s) = self.cache.borrow().get(&dir_id) {
-            return s.clone();
-        }
-        // Walk up to root, collect segment indices.
-        let mut chain: Vec<u32> = Vec::new();
-        let mut cur = dir_id;
-        loop {
-            match self.edges.get(&cur) {
-                Some(&(parent, nidx)) => {
-                    chain.push(nidx);
-                    if parent < 0 {
-                        break;
-                    }
-                    cur = parent;
-                }
-                None => break,
-            }
-        }
-        // Build full path from collected segments (root first).
-        let total_len: usize = chain.iter().rev().enumerate().map(|(i, &nidx)| {
-            let n = self.name_of(nidx);
-            // Skip the first '/' for root, add separator for others.
-            if i == 0 {
-                if n == "/" || n.is_empty() { 1 } else { 1 + n.len() }
-            } else {
-                1 + n.len()
-            }
-        }).sum::<usize>().max(1);
-        let mut out = String::with_capacity(total_len);
-        for (i, &nidx) in chain.iter().rev().enumerate() {
-            let n = self.name_of(nidx);
-            if i == 0 {
-                if n == "/" || n.is_empty() {
-                    out.push('/');
-                } else {
-                    out.push('/');
-                    out.push_str(n);
-                }
-            } else {
-                if !out.ends_with('/') {
-                    out.push('/');
-                }
-                out.push_str(n);
-            }
-        }
-        // Bounded cache: drop oldest when full.
-        let mut cache = self.cache.borrow_mut();
-        if cache.len() >= self.cache_cap {
-            // Cheap eviction: clear half. Avoids LRU bookkeeping cost — these
-            // entries are also cheaply reconstructible.
-            let drop_n = cache.len() / 2;
-            let keys: Vec<i64> = cache.keys().take(drop_n).copied().collect();
-            for k in keys {
-                cache.remove(&k);
-            }
-        }
-        cache.insert(dir_id, out.clone());
-        out
+        self.paths.get(&dir_id).cloned().unwrap_or_default()
     }
 }
 
@@ -284,7 +134,7 @@ fn process_internal(
     if kind == "dir" {
         let mut stmt = conn
             .prepare(
-                "SELECT dir_id, size FROM dir_user_size \
+                "SELECT id, size FROM dirs \
                  WHERE uid = ? ORDER BY size DESC",
             )
             .map_err(|e| format!("prepare dir query: {}", e))?;
@@ -311,7 +161,7 @@ fn process_internal(
         let mut stmt = conn
             .prepare(
                 "SELECT f.dir_id, n.name, f.size \
-                 FROM files f JOIN names n ON f.name_id = n.id \
+                 FROM files f JOIN file_names n ON f.name_id = n.id \
                  WHERE f.uid = ? ORDER BY f.size DESC",
             )
             .map_err(|e| format!("prepare file query: {}", e))?;

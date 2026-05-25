@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::db_writer::{
-    self, DEFAULT_TOP_K, DirRow, DirUserSizeRow, FileRow, OwnerRow, TreemapInput, UserRow,
+    self, DirRow, FileRow, OwnerRow, TreemapInput, UserRow,
     FILE_INSERT_CHUNK,
 };
 use crate::pipe_events::{
@@ -973,18 +973,21 @@ pub(crate) fn build_detail_db_impl(
         let mut total_size: i64 = 0;
         let mut total_spill_read: u64 = 0;
 
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-        let mut next_file_id: i64 = 1;
+        // Reverse: ext_id (u16) -> ext String
+        let ext_string_by_id: Vec<String> = {
+            let mut v = vec![String::new(); next_ext_id as usize];
+            for (ext, id) in &ext_id_of_lookup {
+                if (*id as usize) < v.len() {
+                    v[*id as usize] = ext.clone();
+                }
+            }
+            v
+        };
+
         let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
 
         let mut sorted_users: Vec<String> = compact_row_spills.keys().cloned().collect();
         sorted_users.sort();
-
-        // Pre-size top_heaps with the exact user count so we don't pay the
-        // 7 grow-and-rehash cycles HashMap does from default capacity.
-        let mut top_heaps: HashMap<i64, BinaryHeap<Reverse<(i64, i64)>>> =
-            HashMap::with_capacity(sorted_users.len());
 
         let user_spill_paths: HashMap<String, Vec<PathBuf>> = compact_row_spills
             .iter()
@@ -1028,23 +1031,11 @@ pub(crate) fn build_detail_db_impl(
                     total_docs += 1;
                     total_size += size_i64;
 
-                    // Maintain top-K heap.
-                    let file_id = next_file_id;
-                    next_file_id += 1;
-                    let h = top_heaps.entry(uid).or_default();
-                    if h.len() < DEFAULT_TOP_K {
-                        h.push(Reverse((size_i64, file_id)));
-                    } else if let Some(&Reverse((min_size, _))) = h.peek() {
-                        if size_i64 > min_size {
-                            h.pop();
-                            h.push(Reverse((size_i64, file_id)));
-                        }
-                    }
-
+                    let ext_str = ext_string_by_id.get(ext_id as usize).cloned().unwrap_or_default();
                     chunk.push(FileRow {
                         dir_id,
                         name_id,
-                        ext_id,
+                        ext: ext_str,
                         uid,
                         size: size_i64,
                     });
@@ -1116,32 +1107,97 @@ pub(crate) fn build_detail_db_impl(
         let t3a = Instant::now();
 
         // ─── Insert dictionary + aggregate tables into detail.db ───
-        // exts: order by id ascending. (names live in tm.names, not detail.db.)
-        let mut ext_strings: Vec<String> = vec![String::new(); next_ext_id as usize];
-        for (ext, id) in &ext_id_of_lookup {
-            if (*id as usize) < ext_strings.len() {
-                ext_strings[*id as usize] = ext.clone();
-            }
-        }
-        db_writer::detail_insert_exts(&mut detail_handle, &ext_strings)?;
-        drop(ext_strings);
+        // ext_id_of_lookup no longer needed for db insert (ext is inline in files).
+        // Already converted to ext_string_by_id earlier; drop the Map here.
         drop(ext_id_of_lookup);
 
-        // File basenames (detail.db's local names table; tm.names holds dir
+        // File basenames (detail.db's local file_names table; tm.names holds dir
         // segments only).
-        db_writer::detail_insert_names(&mut detail_handle, &file_names)?;
+        db_writer::detail_insert_file_names(&mut detail_handle, &file_names)?;
         drop(file_names);
+
+        // Populate FTS index for file basenames (mirrors file_names table).
+        db_writer::detail_insert_fts_file_names(&mut detail_handle)?;
 
         // Insert dir name segments for path reconstruction.
         db_writer::detail_insert_dir_names(&mut detail_handle, &path_tree.names)?;
 
-        // Insert dirs (references dir_names by name_id).
-        let dir_rows: Vec<(i64, Option<i64>, i64)> = dirs_in_order_arc
-            .iter()
-            .map(|d| (d.id, d.parent_id, d.name_id))
-            .collect();
+        // Build dirs rows: one row per (dir_id, uid) pair, joining the dir entity
+        // info (id, parent_id, path, owner_uid) with the per-user aggregate
+        // (size, files) from user_dir_size.
+
+        // Build dir_id -> full path map (walks parent chain once, memoizes).
+        let mut path_by_dir_id: Vec<String> = vec![String::new(); dirs_in_order_arc.len()];
+        {
+            let dirs = &dirs_in_order_arc;
+            for d in dirs.iter() {
+                let idx = d.id as usize;
+                if idx >= path_by_dir_id.len() { continue; }
+                let segment = path_tree.names.get(d.name_id as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                let path_str = if let Some(parent) = d.parent_id {
+                    let pidx = parent as usize;
+                    if pidx < path_by_dir_id.len() && !path_by_dir_id[pidx].is_empty() {
+                        let parent_path = &path_by_dir_id[pidx];
+                        if parent_path == "/" {
+                            format!("/{}", segment)
+                        } else {
+                            format!("{}/{}", parent_path, segment)
+                        }
+                    } else {
+                        // Root or parent path not yet built (shouldn't happen with BFS order)
+                        segment.clone()
+                    }
+                } else {
+                    // Root dir — segment is typically "/"
+                    segment.clone()
+                };
+                path_by_dir_id[idx] = path_str;
+            }
+        }
+
+        // owner_uid map — placeholder. If the scanner tracks dir owner uid in
+        // PathTree or elsewhere, lookup here. For now use 0 (root) as placeholder.
+        let owner_uid_default: i64 = 0;
+
+        // Collect dir_id -> (parent_id, owner_uid) for fast lookup.
+        let mut dir_meta: HashMap<i64, (Option<i64>, i64)> = HashMap::with_capacity(dirs_in_order_arc.len());
+        for d in dirs_in_order_arc.iter() {
+            dir_meta.insert(d.id, (d.parent_id, owner_uid_default));
+        }
+
+        // Now build per-(dir_id, uid) rows from user_dir_size.
+        let mut dir_rows: Vec<(i64, i64, Option<i64>, String, i64, i64, i64)> =
+            Vec::with_capacity(user_dir_size.len());
+        for ((uid, dir_id), (size, files)) in user_dir_size.iter() {
+            let (parent_id, owner_uid) = dir_meta.get(dir_id)
+                .copied()
+                .unwrap_or((None, owner_uid_default));
+            let path = path_by_dir_id.get(*dir_id as usize)
+                .cloned()
+                .unwrap_or_default();
+            dir_rows.push((*dir_id, *uid, parent_id, path, owner_uid, *size, *files));
+        }
+        // Sort for consistent insert order (helps SQLite write performance).
+        dir_rows.sort_by_key(|r| (r.0, r.1));
         db_writer::detail_insert_dirs(&mut detail_handle, &dir_rows)?;
+
+        // Populate FTS index for dir paths. Tokens = path split by '/' joined by space.
+        let mut fts_entries: Vec<(i64, String)> = Vec::with_capacity(path_by_dir_id.len());
+        for (id, path) in path_by_dir_id.iter().enumerate() {
+            if path.is_empty() { continue; }
+            let tokens: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let token_str = tokens.join(" ");
+            if !token_str.is_empty() {
+                fts_entries.push((id as i64, token_str));
+            }
+        }
+        db_writer::detail_insert_fts_dir_paths(&mut detail_handle, &fts_entries)?;
+        drop(fts_entries);
         drop(dir_rows);
+        drop(path_by_dir_id);
+        drop(dir_meta);
 
         // users
         let mut user_rows: Vec<UserRow> = Vec::with_capacity(user_totals.len());
@@ -1169,31 +1225,9 @@ pub(crate) fn build_detail_db_impl(
         drop(user_dir_count);
         drop(user_rows);
 
-        // dir_user_size
-        let dus_rows: Vec<DirUserSizeRow> = user_dir_size
-            .drain()
-            .map(|((uid, dir_id), (size, files))| DirUserSizeRow {
-                uid,
-                dir_id,
-                size,
-                files,
-            })
-            .collect();
+        // dir_user_size has been merged into the dirs table above.
+        // top_files removed: no-filter pagination uses ix_files_uid_size index.
         drop(user_dir_size);
-        db_writer::detail_insert_dir_user_size(&mut detail_handle, &dus_rows)?;
-        drop(dus_rows);
-
-        // top_files
-        let mut top_entries: Vec<(i64, Vec<(i64, i64)>)> = Vec::with_capacity(top_heaps.len());
-        for (uid, heap) in top_heaps {
-            let mut sorted: Vec<(i64, i64)> =
-                heap.into_iter().map(|Reverse((sz, id))| (sz, id)).collect();
-            sorted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            top_entries.push((uid, sorted));
-        }
-        top_entries.sort_by_key(|(uid, _)| *uid);
-        db_writer::detail_insert_top_files(&mut detail_handle, &top_entries)?;
-        drop(top_entries);
 
         #[cfg(target_os = "linux")]
         {

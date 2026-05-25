@@ -135,8 +135,8 @@ def test_unified_db_outputs_multi_user_ext_and_paths(tmp_path):
 
         # alice has 3 files: 4096 (txt) + 2048 (log) + 512 (bin)
         rows = conn.execute(
-            "SELECT n.name, e.ext, f.size FROM files f "
-            "JOIN names n ON f.name_id=n.id JOIN exts e ON f.ext_id=e.id "
+            "SELECT n.name, f.ext, f.size FROM files f "
+            "JOIN file_names n ON f.name_id=n.id "
             "WHERE f.uid=(SELECT uid FROM users WHERE username='alice') "
             "ORDER BY f.size DESC"
         ).fetchall()
@@ -144,10 +144,10 @@ def test_unified_db_outputs_multi_user_ext_and_paths(tmp_path):
         assert [r for r in rows if r[1] == "log"] == [("shared.log", "log", 2048)]
         assert any(r[0] == "alpha.txt" for r in rows)
 
-        # bob's per-dir aggregate: dir_user_size has rows summing to bob's used
+        # bob's per-dir aggregate: dirs has rows summing to bob's used
         bob_dirs = conn.execute(
-            "SELECT size FROM dir_user_size dus "
-            "JOIN users u ON dus.uid=u.uid "
+            "SELECT size FROM dirs "
+            "JOIN users u ON dirs.uid=u.uid "
             "WHERE u.username='bob' ORDER BY size DESC"
         ).fetchall()
         assert sorted([r[0] for r in bob_dirs]) == [1024, 8192]

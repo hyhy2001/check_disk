@@ -129,14 +129,18 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
         assert tables >= {
             "meta",
             "users",
-            "exts",
-            "names",
+            "file_names",
+            "dir_names",
+            "dirs",
             "files",
-            "top_files",
-            "dir_user_size",
+            "fts_file_names",
+            "fts_dir_paths",
         }
         # user_ext_stats was removed (no consumers in dashboard or scripts).
         assert "user_ext_stats" not in tables
+        # top_files and dir_user_size removed in new schema.
+        assert "top_files" not in tables
+        assert "dir_user_size" not in tables
         indexes = {
             r[0]
             for r in conn.execute(
@@ -145,7 +149,6 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
         }
         assert indexes >= {
             "ix_files_uid_size",
-            "ix_dus_uid_size",
         }
         # ix_files_uid_ext_size and ix_files_name_uid dropped (no production callers).
         assert "ix_files_uid_ext_size" not in indexes
@@ -173,21 +176,22 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
         # files: basenames live in detail.db.names (file basenames),
         # NOT tm.names (which holds dir segments only).
         files = conn.execute(
-            "SELECT n.name, e.ext, f.size "
-            "FROM files f JOIN names n ON f.name_id=n.id "
-            "JOIN exts e ON f.ext_id=e.id ORDER BY f.size DESC"
+            "SELECT n.name, f.ext, f.size "
+            "FROM files f JOIN file_names n ON f.name_id=n.id "
+            "ORDER BY f.size DESC"
         ).fetchall()
         assert {(n, x, s) for (n, x, s) in files} == {
             ("alpha.txt", "txt", 4096),
             ("beta.log", "log", 2048),
         }
 
-        # top_files: rank=1 → 4096 bytes, rank=2 → 2048
+        # files ordered by size DESC (top_files table removed in new schema)
         top = conn.execute(
-            "SELECT rank, size FROM top_files WHERE uid="
-            "(SELECT uid FROM users WHERE username='alice') ORDER BY rank"
+            "SELECT f.size FROM files f "
+            "WHERE f.uid=(SELECT uid FROM users WHERE username='alice') "
+            "ORDER BY f.size DESC"
         ).fetchall()
-        assert top == [(1, 4096), (2, 2048)]
+        assert [r[0] for r in top] == [4096, 2048]
 
         # Full (uid, size DESC) index covers ORDER BY for any page.
         plan = conn.execute(
