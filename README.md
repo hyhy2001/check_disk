@@ -154,6 +154,7 @@ bash src/rust_exporter/build.sh
 | `--run --workers <N>` | Override worker count (default: `min(32, cpus × 2)`). |
 | `--run --debug` | Print Phase 1/2/3 timing + RSS diagnostics. |
 | `--run --output-dir <dir>` | Write all reports to a specific directory. |
+| `--run --output <path>` | Override full output file path for the summary report. |
 | `--run --prefix <name>` | Prefix generated report filenames. |
 | `--run --date` | Append `YYYYMMDD` to output filenames. |
 | `--run --tree-map` | Build `tree_map_data/treemap.db` (required for `--tree-show`). All dirs included regardless of `--level`. |
@@ -389,9 +390,12 @@ Phase 4: final heartbeat (drain sync if enabled)
 |---|---|---|
 | `src/rust_scanner/` | `scan_core.rs` | Phase 1 WalkBuilder parallel walker |
 | | `scan_state.rs` | Per-thread buffers + uncompressed binary/TSV spill writers |
+| | `scan_constants.rs` | Scan thresholds, buffer sizes, worker limits |
+| | `scan_utils.rs` | Shared scan utilities (path helpers, UID lookup) |
 | | `report_pipeline.rs` | Phase 2/3 ingest → detail.db + treemap.db |
 | | `db_writer.rs` | DDL, bulk insert, ANALYZE, atomic rename |
 | | `pipe_events.rs` | Binary spill format reader |
+| | `pipe_io.rs` | I/O helpers for spill file read/write |
 | | `pipe_permission.rs` | Permission TSV → permission_issues.db |
 | | `pipe_treemap.rs` | Path normalization helpers |
 | | `pipe_types.rs` | Shared types + extension/parent helpers |
@@ -410,6 +414,8 @@ Phase 4: final heartbeat (drain sync if enabled)
 | `src/scan_status.py` | Atomic `scan_status.json` + heartbeat thread |
 | `src/formatters/` | Terminal table rendering |
 | `src/constants.py` | Filenames, directory names, intervals |
+| `src/utils.py` | Shared utility functions |
+| `src/msteams_notifier.py` | Microsoft Teams webhook notifications |
 
 ---
 
