@@ -194,10 +194,7 @@ python3 disk_checker.py --detail --user alice --output-dir /reports
 | `--output-dir <dir>` | `.` | Directory containing `detail_users/data_detail.db`. |
 | `--type <choice>` | `report` | Section to display (see below). |
 | `--top <N>` | 30 | Max rows per table. |
-| `--search <keyword>` | (none) | Filter entries whose path contains keyword. |
-| `--level <N>` | 3 | Depth for inode tree view. |
-| `--limit <N>` | 20 | Max rows for inode tree view. |
-| `--path <PATH>` | scan root | Start path for inode tree view. |
+| `--search <keyword>` | (none) | Filter entries whose basename contains keyword. |
 
 **`--type` choices:**
 
