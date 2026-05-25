@@ -1116,9 +1116,6 @@ pub(crate) fn build_detail_db_impl(
         db_writer::detail_insert_file_names(&mut detail_handle, &file_names)?;
         drop(file_names);
 
-        // Populate FTS index for file basenames (mirrors file_names table).
-        db_writer::detail_insert_fts_file_names(&mut detail_handle)?;
-
         // Build dirs rows: one row per (dir_id, uid) pair, joining the dir entity
         // info (id, parent_id, path, owner_uid) with the per-user aggregate
         // (size, files) from user_dir_size.
@@ -1180,18 +1177,6 @@ pub(crate) fn build_detail_db_impl(
         dir_rows.sort_by_key(|r| (r.0, r.1));
         db_writer::detail_insert_dirs(&mut detail_handle, &dir_rows)?;
 
-        // Populate FTS index for dir paths. Tokens = path split by '/' joined by space.
-        let mut fts_entries: Vec<(i64, String)> = Vec::with_capacity(path_by_dir_id.len());
-        for (id, path) in path_by_dir_id.iter().enumerate() {
-            if path.is_empty() { continue; }
-            let tokens: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            let token_str = tokens.join(" ");
-            if !token_str.is_empty() {
-                fts_entries.push((id as i64, token_str));
-            }
-        }
-        db_writer::detail_insert_fts_dir_paths(&mut detail_handle, &fts_entries)?;
-        drop(fts_entries);
         drop(dir_rows);
         drop(path_by_dir_id);
         drop(dir_meta);

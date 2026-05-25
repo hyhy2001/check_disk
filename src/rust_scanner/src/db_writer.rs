@@ -127,30 +127,19 @@ CREATE TABLE files (
   uid     INTEGER NOT NULL,
   size    INTEGER NOT NULL
 );
-
--- FTS4 index on file basenames. rowid = file_names.id (1:1).
--- Populated after file_names insert: INSERT INTO fts_file_names SELECT id, name FROM file_names.
-CREATE VIRTUAL TABLE fts_file_names USING fts4(name, tokenize=unicode61);
-
--- FTS4 index on dir paths. rowid = dirs.id (unique dir entity id).
--- Tokens = path split by '/' joined by space e.g. '/var/log' -> 'var log'.
--- Populated after dirs insert.
-CREATE VIRTUAL TABLE fts_dir_paths USING fts4(tokens, tokenize=unicode61);
 ";
 
 const DETAIL_INDEX_DDL: &str = "
--- Files: cover ORDER BY size DESC per user (no-filter pagination).
-CREATE INDEX ix_files_uid_size      ON files(uid, size DESC);
--- Files: cover ext filter + size order (ext-only and ext+size combos).
-CREATE INDEX ix_files_uid_ext_size  ON files(uid, ext, size DESC);
--- Files: cover name_id lookup for FTS-backed keyword search.
-CREATE INDEX ix_files_name_uid_size ON files(name_id, uid, size DESC);
--- Dirs: cover ORDER BY size DESC per user (no-filter pagination).
-CREATE INDEX ix_dirs_uid_size       ON dirs(uid, size DESC);
--- Dirs: cover dir entity id lookup (for FTS-backed keyword search).
-CREATE INDEX ix_dirs_id_uid_size    ON dirs(id, uid, size DESC);
--- file_names: cover LIKE fallback for substring search.
-CREATE INDEX ix_file_names_name     ON file_names(name);
+-- Files: cover keyset pagination (uid, size DESC, dir_id ASC, name_id ASC).
+CREATE INDEX ix_files_uid_size_dir_name      ON files(uid, size DESC, dir_id ASC, name_id ASC);
+-- Files: cover ext filter + keyset pagination.
+CREATE INDEX ix_files_uid_ext_size_dir_name  ON files(uid, ext, size DESC, dir_id ASC, name_id ASC);
+-- Files: cover dir_id-anchored lookups (used when joining via dir_id).
+CREATE INDEX ix_files_dir_uid_ext_size_name  ON files(dir_id, uid, ext, size DESC, name_id ASC);
+-- Dirs: cover keyset pagination (uid, size DESC, id ASC).
+CREATE INDEX ix_dirs_uid_size_dir            ON dirs(uid, size DESC, id ASC);
+-- file_names: cover LIKE substring search.
+CREATE INDEX ix_file_names_name              ON file_names(name);
 ";
 
 // ─── PRAGMA / lifecycle helpers ───────────────────────────────────────
@@ -645,38 +634,6 @@ pub fn detail_insert_file_names(handle: &mut DetailBuildHandle, names: &[String]
         },
         "file_names",
     )
-}
-
-pub(crate) fn detail_insert_fts_file_names(handle: &mut DetailBuildHandle) -> PyResult<()> {
-    let tx = handle.conn.transaction()
-        .map_err(|e| PyRuntimeError::new_err(format!("fts_file_names tx: {}", e)))?;
-    tx.execute_batch(
-        "INSERT INTO fts_file_names(rowid, name) SELECT id, name FROM file_names;"
-    ).map_err(|e| PyRuntimeError::new_err(format!("fts_file_names insert: {}", e)))?;
-    tx.commit()
-        .map_err(|e| PyRuntimeError::new_err(format!("fts_file_names commit: {}", e)))?;
-    Ok(())
-}
-
-pub(crate) fn detail_insert_fts_dir_paths(
-    handle: &mut DetailBuildHandle,
-    // (dir_id, tokens) — tokens = path split by '/' joined by space
-    entries: &[(i64, String)],
-) -> PyResult<()> {
-    let tx = handle.conn.transaction()
-        .map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths tx: {}", e)))?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO fts_dir_paths(rowid, tokens) VALUES (?,?)"
-        ).map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths prepare: {}", e)))?;
-        for (dir_id, tokens) in entries {
-            stmt.execute(rusqlite::params![dir_id, tokens])
-                .map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths insert: {}", e)))?;
-        }
-    }
-    tx.commit()
-        .map_err(|e| PyRuntimeError::new_err(format!("fts_dir_paths commit: {}", e)))?;
-    Ok(())
 }
 
 pub(crate) fn detail_insert_dirs(
