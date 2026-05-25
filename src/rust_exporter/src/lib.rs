@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const IO_BUF_SIZE: usize = 8 * 1024 * 1024;
 
@@ -68,6 +69,10 @@ struct DirPathMap {
 }
 
 impl DirPathMap {
+    fn empty() -> Self {
+        Self { paths: HashMap::new() }
+    }
+
     fn load(conn: &Connection) -> Result<Self, String> {
         let mut stmt = conn
             .prepare("SELECT DISTINCT id, path FROM dirs")
@@ -104,6 +109,7 @@ fn process_internal(
     treemap_db: &str,
     out_path: &str,
     kind: &str, // "dir" or "file"
+    dir_paths: &DirPathMap,
 ) -> Result<String, String> {
     if !Path::new(detail_db).is_file() {
         return Ok(String::new());
@@ -113,7 +119,6 @@ fn process_internal(
         Some(u) => u,
         None => return Ok(String::new()),
     };
-    let dir_paths = DirPathMap::load(&conn)?;
 
     if let Some(parent) = Path::new(out_path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -220,6 +225,7 @@ fn process_user_job(
     treemap_db: &str,
     output_dir: &str,
     prefix: &str,
+    dir_paths: &DirPathMap,
 ) -> Result<Vec<String>, String> {
     if !Path::new(detail_db).is_file() {
         return Ok(Vec::new());
@@ -253,6 +259,7 @@ fn process_user_job(
         treemap_db,
         dir_path.to_string_lossy().as_ref(),
         "dir",
+        dir_paths,
     )?;
     if !dir_out.is_empty() {
         results.push(dir_out);
@@ -263,6 +270,7 @@ fn process_user_job(
         treemap_db,
         file_path.to_string_lossy().as_ref(),
         "file",
+        dir_paths,
     )?;
     if !file_out.is_empty() {
         results.push(file_out);
@@ -278,7 +286,10 @@ fn process(
     output_dir: String,
     prefix: String,
 ) -> PyResult<Vec<String>> {
-    process_user_job(&user, &detail_db, &treemap_db, &output_dir, &prefix)
+    let conn = open_detail(&detail_db, if treemap_db.is_empty() { None } else { Some(&treemap_db) })
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+    let dir_paths = DirPathMap::load(&conn).map_err(|e| PyRuntimeError::new_err(e))?;
+    process_user_job(&user, &detail_db, &treemap_db, &output_dir, &prefix, &dir_paths)
         .map_err(PyRuntimeError::new_err)
 }
 
@@ -293,10 +304,20 @@ fn process_jobs(
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("build thread pool: {}", e)))?;
 
+    let first_detail_db = jobs.first().map(|j| j.1.as_str()).unwrap_or("");
+    let first_treemap_db = jobs.first().map(|j| j.2.as_str()).unwrap_or("");
+    let dir_paths = if !first_detail_db.is_empty() && Path::new(first_detail_db).is_file() {
+        let conn = open_detail(first_detail_db, if first_treemap_db.is_empty() { None } else { Some(first_treemap_db) })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Arc::new(DirPathMap::load(&conn).map_err(|e| PyRuntimeError::new_err(e))?)
+    } else {
+        Arc::new(DirPathMap::empty())
+    };
+
     let per_job: Vec<Result<Vec<String>, String>> = pool.install(|| {
         jobs.par_iter()
             .map(|(user, detail_db, treemap_db, output_dir, prefix)| {
-                process_user_job(user, detail_db, treemap_db, output_dir, prefix)
+                process_user_job(user, detail_db, treemap_db, output_dir, prefix, &dir_paths)
             })
             .collect()
     });
