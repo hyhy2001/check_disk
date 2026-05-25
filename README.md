@@ -69,8 +69,7 @@ python3 scripts/export_user_reports.py \
 ### Phase 2: Rust SQLite report pipeline (split into 2 phases)
 
 - **Phase 2 (detail)**: reads spill files via Rayon, builds `data_detail.db`:
-  - Per-user file/dir breakdown, indexed for `ORDER BY size DESC` pagination.
-  - `dirs.path` stores pre-computed full absolute paths for self-contained detail queries.
+  - `data_detail.db`: 5 tables — `meta`, `users`, `file_names`, `dirs` (path pre-computed), `files` (ext inline). No FTS virtual tables. Keyset-pagination indexes for O(limit) cursor queries regardless of dataset size.
   - Compact spill re-encoding (18 bytes/row, LZ4-compressed) eliminates path String allocations.
   - `mallopt(M_MMAP_THRESHOLD=128KB)` reduces glibc heap fragmentation during build.
   - `malloc_trim(0)` after large drops returns freed heap pages to OS.
@@ -319,18 +318,28 @@ Both files contain full absolute paths. The exporter reads `data_detail.db` dire
 
 ### `data_detail.db` (application_id = `0xC0DD15D1`)
 
-| Table | Purpose |
-|---|---|
-| `meta` | scan_root, scan_timestamp, total_files, total_dirs, total_size |
-| `users` | uid, username, team_id, total_files, total_dirs, total_size |
-| `files` | dir_id, name_id, ext_id, uid, size |
-| `names` | file basename dictionary |
-| `exts` | extension dictionary |
-| `dir_user_size` | per-(uid, dir_id) size + file count |
-| `top_files` | top-K file ids per user, ranked by size |
-| `dirs` | id, parent_id, name_id — for full path reconstruction |
+5 tables only. No FTS. No ext dictionary. No top_files. No dir_user_size.
 
-Indexes: `ix_files_uid_size`, `ix_dus_uid_size`, `ix_dirs_parent`.
+```
+meta        — key/value: scan_root, scan_timestamp
+users       — uid, username, team_id, total_files, total_dirs, total_size, permission_issues, is_target
+file_names  — id, name (unique file basename dictionary)
+dirs        — id, uid, parent_id, path (pre-computed absolute), owner_uid, size, files
+              PRIMARY KEY (id, uid) — one row per (dir entity, user) pair
+files       — dir_id, name_id, ext (inline TEXT), uid, size
+              no surrogate id
+```
+
+Indexes (keyset pagination optimized):
+```
+ix_files_uid_size_dir_name      ON files(uid, size DESC, dir_id ASC, name_id ASC)
+ix_files_uid_ext_size_dir_name  ON files(uid, ext, size DESC, dir_id ASC, name_id ASC)
+ix_files_dir_uid_ext_size_name  ON files(dir_id, uid, ext, size DESC, name_id ASC)
+ix_dirs_uid_size_dir            ON dirs(uid, size DESC, id ASC)
+ix_file_names_name              ON file_names(name)
+```
+
+Cursor pagination: files cursor = `{size, dir_id, name_id}`, dirs cursor = `{size, id}`.
 
 ### `treemap.db` (application_id = `0xC0DD15C0`)
 
@@ -429,7 +438,7 @@ Phase 4: final heartbeat (drain sync if enabled)
 - Parallel re-encode pass (Rayon + DashMap) for 131-user workloads
 - `mallopt(M_MMAP_THRESHOLD=128KB)` + `malloc_trim(0)` returns ~10GB heap to OS after large drops
 - `PRAGMA optimize` instead of full `ANALYZE` (saves ~18s)
-- Dropped 2 unused indexes (`ix_files_uid_ext_size`, `ix_files_name_uid`) → -39% DB size on benchmark
+- Replaced FTS4 virtual tables with LIKE-based keyword search + covering keyset indexes → simpler schema, no FTS tokenizer overhead
 
 ---
 
@@ -465,4 +474,8 @@ python3 -m pytest tests/ -q
 # Rebuild Rust artifacts
 bash src/rust_scanner/build.sh
 bash src/rust_exporter/build.sh
+
+# Check SQLite schema of a generated detail DB
+sqlite3 /reports/detail_users/data_detail.db ".schema"
+sqlite3 /reports/detail_users/data_detail.db "SELECT * FROM meta"
 ```
