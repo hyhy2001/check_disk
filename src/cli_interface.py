@@ -301,7 +301,7 @@ class CLIInterface:
         """Render ASCII directory tree from treemap.db.
 
         Without `users`, shows total dir sizes (all-user totals).
-        With `users`, renders a separate tree per user using dir_user_size.
+        With `users`, renders a separate tree per user using per-(uid, dir) rows in dirs.
         With `search`, only shows branches that contain matching dirs.
         """
         from .constants import DETAIL_USERS_DB_FILENAME
