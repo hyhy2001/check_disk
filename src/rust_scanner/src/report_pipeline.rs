@@ -1119,9 +1119,6 @@ pub(crate) fn build_detail_db_impl(
         // Populate FTS index for file basenames (mirrors file_names table).
         db_writer::detail_insert_fts_file_names(&mut detail_handle)?;
 
-        // Insert dir name segments for path reconstruction.
-        db_writer::detail_insert_dir_names(&mut detail_handle, &path_tree.names)?;
-
         // Build dirs rows: one row per (dir_id, uid) pair, joining the dir entity
         // info (id, parent_id, path, owner_uid) with the per-user aggregate
         // (size, files) from user_dir_size.

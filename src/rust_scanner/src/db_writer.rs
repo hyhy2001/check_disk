@@ -100,12 +100,6 @@ CREATE TABLE file_names (
   name TEXT NOT NULL
 );
 
--- Dir segment dictionary (unique path segments e.g. 'var', 'log', 'apache2').
-CREATE TABLE dir_names (
-  id   INTEGER PRIMARY KEY,
-  name TEXT NOT NULL
-);
-
 -- Directory table. One row per (dir entity, user) pair.
 -- id = dir entity id (same dir shared across users).
 -- uid = file owner who has files inside this dir.
@@ -651,25 +645,6 @@ pub fn detail_insert_file_names(handle: &mut DetailBuildHandle, names: &[String]
         },
         "file_names",
     )
-}
-
-pub(crate) fn detail_insert_dir_names(
-    handle: &mut DetailBuildHandle,
-    names: &[String],
-) -> PyResult<()> {
-    let tx = handle.conn.transaction()
-        .map_err(|e| PyRuntimeError::new_err(format!("dir_names tx: {}", e)))?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO dir_names(id, name) VALUES (?,?)"
-        ).map_err(|e| PyRuntimeError::new_err(format!("dir_names prepare: {}", e)))?;
-        for (id, name) in names.iter().enumerate() {
-            stmt.execute(params![id as i64, name])
-                .map_err(|e| PyRuntimeError::new_err(format!("dir_names insert: {}", e)))?;
-        }
-    }
-    tx.commit().map_err(|e| PyRuntimeError::new_err(format!("dir_names commit: {}", e)))?;
-    Ok(())
 }
 
 pub(crate) fn detail_insert_fts_file_names(handle: &mut DetailBuildHandle) -> PyResult<()> {

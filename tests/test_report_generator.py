@@ -130,7 +130,6 @@ def test_generate_detail_reports_builds_unified_db_and_treemap(tmp_path):
             "meta",
             "users",
             "file_names",
-            "dir_names",
             "dirs",
             "files",
             "fts_file_names",

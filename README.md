@@ -70,7 +70,7 @@ python3 scripts/export_user_reports.py \
 
 - **Phase 2 (detail)**: reads spill files via Rayon, builds `data_detail.db`:
   - Per-user file/dir breakdown, indexed for `ORDER BY size DESC` pagination.
-  - `dirs` + `dir_names` tables for self-contained full path reconstruction.
+  - `dirs.path` stores pre-computed full absolute paths for self-contained detail queries.
   - Compact spill re-encoding (18 bytes/row, LZ4-compressed) eliminates path String allocations.
   - `mallopt(M_MMAP_THRESHOLD=128KB)` reduces glibc heap fragmentation during build.
   - `malloc_trim(0)` after large drops returns freed heap pages to OS.
@@ -295,7 +295,7 @@ Writes two `.txt` files per user:
 - `usage_dir_<user>.txt` — top directories by size
 - `usage_file_<user>.txt` — top files by size
 
-Both files contain full absolute paths. The exporter reads `data_detail.db` directly using the `dirs` + `dir_names` tables for path reconstruction; `treemap.db` is optional and only used as a fallback by the Rust exporter.
+Both files contain full absolute paths. The exporter reads `data_detail.db` directly from `dirs.path`; `treemap.db` is optional and only used as a fallback by the Rust exporter.
 
 ---
 
@@ -329,7 +329,6 @@ Both files contain full absolute paths. The exporter reads `data_detail.db` dire
 | `dir_user_size` | per-(uid, dir_id) size + file count |
 | `top_files` | top-K file ids per user, ranked by size |
 | `dirs` | id, parent_id, name_id — for full path reconstruction |
-| `dir_names` | directory segment dictionary (separate from file `names`) |
 
 Indexes: `ix_files_uid_size`, `ix_dus_uid_size`, `ix_dirs_parent`.
 
@@ -362,7 +361,7 @@ Python: write summary JSON reports
 Phase 2: Rust detail pipeline (Rayon)
   → compact spill re-encoding (18 bytes/row)
   → path tree assembly
-  → data_detail.db (files, dirs, dir_names, top_files, ...)
+  → data_detail.db (files, dirs[path pre-computed], top_files, ...)
   → persist treemap aggregates (aggregates.bin.zst)  [only with --tree-map]
          │
          ▼
