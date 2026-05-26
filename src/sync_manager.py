@@ -307,9 +307,21 @@ class ReportSyncer:
             f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && tar -xzOf - {q_basename} > {q_staging} && mv -f {q_staging} {q_basename}')}"
         ]
         tar_proc = None
+        snapshot_dir = None
         try:
+            # Snapshot the file to a temp location so atomic rewrites by other
+            # threads (e.g. heartbeat updating scan_status.json every 5s)
+            # don't corrupt the tar stream mid-read.
+            snapshot_dir = tempfile.mkdtemp(prefix="checkdisk_sync_")
+            snapshot_path = os.path.join(snapshot_dir, basename)
+            try:
+                shutil.copy2(file_abs, snapshot_path)
+            except Exception as e:
+                _sync_log(f"[SYNC ERROR] snapshot failed for {rel_path}: {e}")
+                return False
+
             tar_proc = subprocess.Popen(
-                ["tar", "-czf", "-", "-C", os.path.dirname(file_abs), os.path.basename(file_abs)],
+                ["tar", "-czf", "-", "-C", snapshot_dir, basename],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -353,6 +365,11 @@ class ReportSyncer:
             return False
         finally:
             _drain_tar_proc(tar_proc)
+            if snapshot_dir is not None:
+                try:
+                    shutil.rmtree(snapshot_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
     @staticmethod
     def sync_directory_to_remote(
