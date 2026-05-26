@@ -364,7 +364,8 @@ class ReportSyncer:
                 )
 
                 if rsync_proc.returncode == 0:
-                    _sync_log(f"[SYNC] Synced file: {rel_path} (rsync)")
+                    if "scan_status.json" not in rel_path:
+                        _sync_log(f"[SYNC] Synced file: {rel_path} (rsync)")
                     return True
                 _sync_log(f"[SYNC ERROR] rsync failed for {rel_path} (code {rsync_proc.returncode}).")
                 if rsync_proc.stderr:
@@ -389,7 +390,8 @@ class ReportSyncer:
             )
 
             if scp_proc.returncode == 0:
-                _sync_log(f"[SYNC] Synced file: {rel_path} (scp)")
+                if "scan_status.json" not in rel_path:
+                    _sync_log(f"[SYNC] Synced file: {rel_path} (scp)")
                 return True
             _sync_log(f"[SYNC ERROR] scp failed for {rel_path} (code {scp_proc.returncode}).")
             if scp_proc.stderr:
