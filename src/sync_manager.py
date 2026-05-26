@@ -304,14 +304,14 @@ class ReportSyncer:
         q_staging = shlex.quote(staging_name)
 
         extract_cmd = ssh_base + [
-            f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && tar -xzOf - > {q_staging} && mv -f {q_staging} {q_basename}')}"
+            f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && gunzip -c > {q_staging} && mv -f {q_staging} {q_basename}')}"
         ]
-        tar_proc = None
+        gz_proc = None
         snapshot_dir = None
         try:
             # Snapshot the file to a temp location so atomic rewrites by other
             # threads (e.g. heartbeat updating scan_status.json every 5s)
-            # don't corrupt the tar stream mid-read.
+            # don't corrupt the stream mid-read.
             snapshot_dir = tempfile.mkdtemp(prefix="checkdisk_sync_")
             snapshot_path = os.path.join(snapshot_dir, basename)
             try:
@@ -320,21 +320,23 @@ class ReportSyncer:
                 _sync_log(f"[SYNC ERROR] snapshot failed for {rel_path}: {e}")
                 return False
 
-            tar_proc = subprocess.Popen(
-                ["tar", "-czf", "-", "-C", snapshot_dir, basename],
+            gz_proc = subprocess.Popen(
+                ["gzip", "-c", snapshot_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
             ssh_proc = subprocess.run(
                 extract_cmd,
-                stdin=tar_proc.stdout,
+                stdin=gz_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
             )
-            _drain_tar_proc(tar_proc)
-            tar_proc = None
+            if gz_proc.stdout:
+                gz_proc.stdout.close()
+            gz_proc.wait()
+            gz_proc = None
 
             if ssh_proc.returncode == 0:
                 _sync_log(f"[SYNC] Synced file: {rel_path} (tar)")
@@ -358,13 +360,19 @@ class ReportSyncer:
                 pass
             return False
         except subprocess.TimeoutExpired:
-            _sync_log(f"[SYNC ERROR] tar stream timed out for {rel_path}.")
+            _sync_log(f"[SYNC ERROR] stream timed out for {rel_path}.")
             return False
         except Exception as e:
-            _sync_log(f"[SYNC EXCEPTION] tar stream failed for {rel_path}: {str(e)}")
+            _sync_log(f"[SYNC EXCEPTION] stream failed for {rel_path}: {str(e)}")
             return False
         finally:
-            _drain_tar_proc(tar_proc)
+            if gz_proc is not None:
+                try:
+                    if gz_proc.stdout:
+                        gz_proc.stdout.close()
+                    gz_proc.wait(timeout=5)
+                except Exception:
+                    pass
             if snapshot_dir is not None:
                 try:
                     shutil.rmtree(snapshot_dir, ignore_errors=True)
