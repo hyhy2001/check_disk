@@ -304,7 +304,7 @@ class ReportSyncer:
         q_staging = shlex.quote(staging_name)
 
         extract_cmd = ssh_base + [
-            f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && tar -xzOf - {q_basename} > {q_staging} && mv -f {q_staging} {q_basename}')}"
+            f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && tar -xzOf - > {q_staging} && mv -f {q_staging} {q_basename}')}"
         ]
         tar_proc = None
         snapshot_dir = None
