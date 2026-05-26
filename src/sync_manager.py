@@ -272,10 +272,11 @@ class ReportSyncer:
         password: str = None,
         _capability_cache: dict = None,
     ) -> bool:
-        """Atomically sync a single file to the remote server.
+        """Atomically sync a single file to the remote server using rsync.
 
-        Stream tar+gzip into a sibling staging file then ``mv -T`` into place
-        so a partial transfer never replaces the live file.
+        Uses a local snapshot to avoid races with heartbeat thread, then
+        rsync -az to transfer. rsync writes to a temp dotfile and renames
+        atomically on the remote side.
         """
         if not file_path or not os.path.isfile(file_path):
             return False
@@ -303,15 +304,11 @@ class ReportSyncer:
         q_basename = shlex.quote(basename)
         q_staging = shlex.quote(staging_name)
 
-        extract_cmd = ssh_base + [
-            f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && gunzip -c > {q_staging} && mv -f {q_staging} {q_basename}')}"
-        ]
-        gz_proc = None
         snapshot_dir = None
         try:
             # Snapshot the file to a temp location so atomic rewrites by other
             # threads (e.g. heartbeat updating scan_status.json every 5s)
-            # don't corrupt the stream mid-read.
+            # don't change the file mid-read.
             snapshot_dir = tempfile.mkdtemp(prefix="checkdisk_sync_")
             snapshot_path = os.path.join(snapshot_dir, basename)
             try:
@@ -320,59 +317,65 @@ class ReportSyncer:
                 _sync_log(f"[SYNC ERROR] snapshot failed for {rel_path}: {e}")
                 return False
 
-            gz_proc = subprocess.Popen(
-                ["gzip", "-c", snapshot_path],
-                stdout=subprocess.PIPE,
+            # Ensure remote dir exists
+            mkdir_cmd = ssh_base + [
+                f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir}')}"
+            ]
+            mkdir_proc = subprocess.run(
+                mkdir_cmd,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                text=True,
+                env=merged_env,
+                timeout=SSH_TIMEOUT,
             )
-            ssh_proc = subprocess.run(
-                extract_cmd,
-                stdin=gz_proc.stdout,
+            if mkdir_proc.returncode != 0:
+                _sync_log(f"[SYNC ERROR] mkdir failed for {remote_dir}: {mkdir_proc.stderr.strip()}")
+                return False
+
+            # Build rsync command. -a (archive), -z (compress), --inplace not used
+            # because rsync's default partial-file behavior writes to a temp dotfile
+            # and renames atomically — exactly what we want.
+            rsh_args = ["ssh"]
+            ctl_args = _ssh_control_args(control_socket)
+            rsh_args.extend(ctl_args)
+            rsh_args.extend(["-q"])
+            rsh_cmd = " ".join(shlex.quote(a) for a in rsh_args)
+
+            rsync_cmd = []
+            if password:
+                rsync_cmd.extend(["sshpass", "-e"])
+            rsync_cmd.extend([
+                "rsync",
+                "-az",
+                "--timeout=60",
+                "-e", rsh_cmd,
+                snapshot_path,
+                f"{user}@{host}:{remote_dir}/{basename}",
+            ])
+
+            rsync_proc = subprocess.run(
+                rsync_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
             )
-            if gz_proc.stdout:
-                gz_proc.stdout.close()
-            gz_proc.wait()
-            gz_proc = None
 
-            if ssh_proc.returncode == 0:
-                _sync_log(f"[SYNC] Synced file: {rel_path} (tar)")
+            if rsync_proc.returncode == 0:
+                _sync_log(f"[SYNC] Synced file: {rel_path} (rsync)")
                 return True
-            _sync_log(f"[SYNC ERROR] tar stream failed for {rel_path} (code {ssh_proc.returncode}).")
-            if ssh_proc.stderr:
-                _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
-            # Best-effort cleanup of the staging file on the remote.
-            try:
-                cleanup_cmd = ssh_base + [
-                    f"bash --noprofile --norc -lc {shlex.quote(f'rm -f {q_remote_dir}/{q_staging}')}"
-                ]
-                subprocess.run(
-                    cleanup_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=merged_env,
-                    timeout=SSH_TIMEOUT,
-                )
-            except Exception:
-                pass
+            _sync_log(f"[SYNC ERROR] rsync failed for {rel_path} (code {rsync_proc.returncode}).")
+            if rsync_proc.stderr:
+                _sync_log(f"[SYNC ERROR DETAILS]:\n{rsync_proc.stderr.strip()}")
             return False
         except subprocess.TimeoutExpired:
-            _sync_log(f"[SYNC ERROR] stream timed out for {rel_path}.")
+            _sync_log(f"[SYNC ERROR] rsync timed out for {rel_path}.")
             return False
         except Exception as e:
-            _sync_log(f"[SYNC EXCEPTION] stream failed for {rel_path}: {str(e)}")
+            _sync_log(f"[SYNC EXCEPTION] rsync failed for {rel_path}: {str(e)}")
             return False
         finally:
-            if gz_proc is not None:
-                try:
-                    if gz_proc.stdout:
-                        gz_proc.stdout.close()
-                    gz_proc.wait(timeout=5)
-                except Exception:
-                    pass
             if snapshot_dir is not None:
                 try:
                     shutil.rmtree(snapshot_dir, ignore_errors=True)
