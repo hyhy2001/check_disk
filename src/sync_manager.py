@@ -374,7 +374,7 @@ class ReportSyncer:
             # Fallback: raw stream via SSH (cat | ssh "cat > staging && mv")
             q_staging = shlex.quote(f".{basename}.__staging__.{os.getpid()}")
             extract_cmd = ssh_base + [
-                f"bash --noprofile --norc -lc {shlex.quote(f'cd {q_remote_dir} && rm -f {q_staging} && cat > {q_staging} && mv -f {q_staging} {q_basename}')}"
+                f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && cat > {q_staging} && mv -f {q_staging} {q_basename}')}"
             ]
             ssh_proc = subprocess.run(
                 extract_cmd,
