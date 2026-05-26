@@ -22,6 +22,7 @@ from src.constants import (
     DEFAULT_REPORT_FILENAME,
     DETAIL_USERS_DB_FILENAME,
     DETAIL_USERS_DIRNAME,
+    INODE_USAGE_REPORT_FILENAME,
     PERMISSION_ISSUES_DB_FILENAME,
     SIBLING_REPORT_FILENAMES,
     TREE_MAP_DATA_DIRNAME,
@@ -252,19 +253,33 @@ def _enqueue_directory(sync_pipeline, out_dir: str, dirname: str) -> None:
         sync_pipeline.enqueue_directory(dir_path)
 
 
+def _fmt_size(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    s = float(n)
+    i = 0
+    while s >= 1024 and i < len(units) - 1:
+        s /= 1024
+        i += 1
+    return f"{s:.1f} {units[i]}" if i > 0 else f"{int(s)} B"
+
+
 def _print_run_summary(out_dir: str, main_report_path: str, run_started_at: float) -> None:
     print("\n=== SCAN COMPLETED SUCCESSFULLY ===")
+
+    def _line(label: str, path: str) -> None:
+        if path and os.path.exists(path):
+            try:
+                size = os.path.getsize(path)
+                print(f"{label:<16}{path}  ({_fmt_size(size)})")
+            except OSError:
+                print(f"{label:<16}{path}")
+
     if main_report_path:
-        print(f"Summary report: {main_report_path}")
-    detail_db = os.path.join(out_dir, DETAIL_USERS_DIRNAME, DETAIL_USERS_DB_FILENAME)
-    if os.path.exists(detail_db):
-        print(f"Detail DB:      {detail_db}")
-    treemap_db = os.path.join(out_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
-    if os.path.exists(treemap_db):
-        print(f"TreeMap DB:     {treemap_db}")
-    perm_db = os.path.join(out_dir, PERMISSION_ISSUES_DB_FILENAME)
-    if os.path.exists(perm_db):
-        print(f"Permission DB:  {perm_db}")
+        _line("Summary report:", main_report_path)
+    _line("Inode report:", os.path.join(out_dir, INODE_USAGE_REPORT_FILENAME))
+    _line("Detail DB:", os.path.join(out_dir, DETAIL_USERS_DIRNAME, DETAIL_USERS_DB_FILENAME))
+    _line("TreeMap DB:", os.path.join(out_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME))
+    _line("Permission DB:", os.path.join(out_dir, PERMISSION_ISSUES_DB_FILENAME))
     total_elapsed = time.time() - run_started_at
     print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 
