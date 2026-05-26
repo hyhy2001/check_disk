@@ -371,32 +371,24 @@ class ReportSyncer:
                     _sync_log(f"[SYNC ERROR DETAILS]:\n{rsync_proc.stderr.strip()}")
                 return False
 
-            # Fallback: gzip stream via SSH
+            # Fallback: raw stream via SSH (cat | ssh "cat > staging && mv")
             q_staging = shlex.quote(f".{basename}.__staging__.{os.getpid()}")
             extract_cmd = ssh_base + [
-                f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && gunzip -c > {q_staging} && mv -f {q_staging} {q_basename}')}"
+                f"bash --noprofile --norc -lc {shlex.quote(f'cd {q_remote_dir} && rm -f {q_staging} && cat > {q_staging} && mv -f {q_staging} {q_basename}')}"
             ]
-            gz_proc = subprocess.Popen(
-                ["gzip", "-c", snapshot_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
             ssh_proc = subprocess.run(
                 extract_cmd,
-                stdin=gz_proc.stdout,
+                stdin=open(snapshot_path, "rb"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
             )
-            if gz_proc.stdout:
-                gz_proc.stdout.close()
-            gz_proc.wait()
 
             if ssh_proc.returncode == 0:
-                _sync_log(f"[SYNC] Synced file: {rel_path} (gzip stream)")
+                _sync_log(f"[SYNC] Synced file: {rel_path} (cat stream)")
                 return True
-            _sync_log(f"[SYNC ERROR] gzip stream failed for {rel_path} (code {ssh_proc.returncode}).")
+            _sync_log(f"[SYNC ERROR] cat stream failed for {rel_path} (code {ssh_proc.returncode}).")
             if ssh_proc.stderr:
                 _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
             return False
