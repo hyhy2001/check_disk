@@ -333,41 +333,72 @@ class ReportSyncer:
                 _sync_log(f"[SYNC ERROR] mkdir failed for {remote_dir}: {mkdir_proc.stderr.strip()}")
                 return False
 
-            # Build rsync command. -a (archive), -z (compress), --inplace not used
-            # because rsync's default partial-file behavior writes to a temp dotfile
-            # and renames atomically — exactly what we want.
-            rsh_args = ["ssh"]
-            ctl_args = _ssh_control_args(control_socket)
-            rsh_args.extend(ctl_args)
-            rsh_args.extend(["-q"])
-            rsh_cmd = " ".join(shlex.quote(a) for a in rsh_args)
+            # Use rsync if available (atomic, reliable), fall back to gzip stream.
+            has_rsync = shutil.which("rsync") is not None
 
-            rsync_cmd = []
-            if password:
-                rsync_cmd.extend(["sshpass", "-e"])
-            rsync_cmd.extend([
-                "rsync",
-                "-az",
-                "--timeout=60",
-                "-e", rsh_cmd,
-                snapshot_path,
-                f"{user}@{host}:{remote_dir}/{basename}",
-            ])
+            if has_rsync:
+                rsh_args = ["ssh"]
+                ctl_args = _ssh_control_args(control_socket)
+                rsh_args.extend(ctl_args)
+                rsh_args.extend(["-q"])
+                rsh_cmd = " ".join(shlex.quote(a) for a in rsh_args)
 
-            rsync_proc = subprocess.run(
-                rsync_cmd,
+                rsync_cmd = []
+                if password:
+                    rsync_cmd.extend(["sshpass", "-e"])
+                rsync_cmd.extend([
+                    "rsync",
+                    "-az",
+                    "--timeout=60",
+                    "-e", rsh_cmd,
+                    snapshot_path,
+                    f"{user}@{host}:{remote_dir}/{basename}",
+                ])
+
+                rsync_proc = subprocess.run(
+                    rsync_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=merged_env,
+                )
+
+                if rsync_proc.returncode == 0:
+                    _sync_log(f"[SYNC] Synced file: {rel_path} (rsync)")
+                    return True
+                _sync_log(f"[SYNC ERROR] rsync failed for {rel_path} (code {rsync_proc.returncode}).")
+                if rsync_proc.stderr:
+                    _sync_log(f"[SYNC ERROR DETAILS]:\n{rsync_proc.stderr.strip()}")
+                return False
+
+            # Fallback: gzip stream via SSH
+            q_staging = shlex.quote(f".{basename}.__staging__.{os.getpid()}")
+            extract_cmd = ssh_base + [
+                f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && gunzip -c > {q_staging} && mv -f {q_staging} {q_basename}')}"
+            ]
+            gz_proc = subprocess.Popen(
+                ["gzip", "-c", snapshot_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            ssh_proc = subprocess.run(
+                extract_cmd,
+                stdin=gz_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
             )
+            if gz_proc.stdout:
+                gz_proc.stdout.close()
+            gz_proc.wait()
 
-            if rsync_proc.returncode == 0:
-                _sync_log(f"[SYNC] Synced file: {rel_path} (rsync)")
+            if ssh_proc.returncode == 0:
+                _sync_log(f"[SYNC] Synced file: {rel_path} (gzip stream)")
                 return True
-            _sync_log(f"[SYNC ERROR] rsync failed for {rel_path} (code {rsync_proc.returncode}).")
-            if rsync_proc.stderr:
-                _sync_log(f"[SYNC ERROR DETAILS]:\n{rsync_proc.stderr.strip()}")
+            _sync_log(f"[SYNC ERROR] gzip stream failed for {rel_path} (code {ssh_proc.returncode}).")
+            if ssh_proc.stderr:
+                _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
             return False
         except subprocess.TimeoutExpired:
             _sync_log(f"[SYNC ERROR] rsync timed out for {rel_path}.")
