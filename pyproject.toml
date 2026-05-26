@@ -9,7 +9,7 @@ description = "High-performance disk usage monitoring CLI for Linux servers, pow
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Huy Nguyen" }]
-requires-python = ">=3.6"
+requires-python = ">=3.7"
 
 # No third-party runtime dependencies — all stdlib.
 # Rust .so binaries are precompiled and shipped in src/.
