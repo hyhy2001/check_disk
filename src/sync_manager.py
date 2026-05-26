@@ -371,26 +371,29 @@ class ReportSyncer:
                     _sync_log(f"[SYNC ERROR DETAILS]:\n{rsync_proc.stderr.strip()}")
                 return False
 
-            # Fallback: raw stream via SSH (cat | ssh "cat > staging && mv")
-            q_staging = shlex.quote(f".{basename}.__staging__.{os.getpid()}")
-            extract_cmd = ssh_base + [
-                f"bash --noprofile --norc -lc {shlex.quote(f'mkdir -p {q_remote_dir} && cd {q_remote_dir} && rm -f {q_staging} && cat > {q_staging} && mv -f {q_staging} {q_basename}')}"
-            ]
-            ssh_proc = subprocess.run(
-                extract_cmd,
-                stdin=open(snapshot_path, "rb"),
+            # Fallback: scp (no remote shell quoting issues)
+            scp_cmd = []
+            if password:
+                scp_cmd.extend(["sshpass", "-e"])
+            ctl_args = _ssh_control_args(control_socket)
+            scp_cmd.extend(["scp", "-q"] + ctl_args + [
+                snapshot_path,
+                f"{user}@{host}:{remote_dir}/{basename}",
+            ])
+            scp_proc = subprocess.run(
+                scp_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged_env,
             )
 
-            if ssh_proc.returncode == 0:
-                _sync_log(f"[SYNC] Synced file: {rel_path} (cat stream)")
+            if scp_proc.returncode == 0:
+                _sync_log(f"[SYNC] Synced file: {rel_path} (scp)")
                 return True
-            _sync_log(f"[SYNC ERROR] cat stream failed for {rel_path} (code {ssh_proc.returncode}).")
-            if ssh_proc.stderr:
-                _sync_log(f"[SYNC ERROR DETAILS]:\n{ssh_proc.stderr.strip()}")
+            _sync_log(f"[SYNC ERROR] scp failed for {rel_path} (code {scp_proc.returncode}).")
+            if scp_proc.stderr:
+                _sync_log(f"[SYNC ERROR DETAILS]:\n{scp_proc.stderr.strip()}")
             return False
         except subprocess.TimeoutExpired:
             _sync_log(f"[SYNC ERROR] rsync timed out for {rel_path}.")
