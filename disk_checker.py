@@ -22,6 +22,7 @@ from src.constants import (
     DEFAULT_REPORT_FILENAME,
     DETAIL_USERS_DB_FILENAME,
     DETAIL_USERS_DIRNAME,
+    PERMISSION_ISSUES_DB_FILENAME,
     SIBLING_REPORT_FILENAMES,
     TREE_MAP_DATA_DIRNAME,
     TREE_MAP_DB_FILENAME,
@@ -261,6 +262,9 @@ def _print_run_summary(out_dir: str, main_report_path: str, run_started_at: floa
     treemap_db = os.path.join(out_dir, TREE_MAP_DATA_DIRNAME, TREE_MAP_DB_FILENAME)
     if os.path.exists(treemap_db):
         print(f"TreeMap DB:     {treemap_db}")
+    perm_db = os.path.join(out_dir, PERMISSION_ISSUES_DB_FILENAME)
+    if os.path.exists(perm_db):
+        print(f"Permission DB:  {perm_db}")
     total_elapsed = time.time() - run_started_at
     print(f"Total pipeline elapsed (wall-clock): {total_elapsed:.2f}s")
 
