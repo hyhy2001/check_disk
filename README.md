@@ -74,28 +74,40 @@ python3 scripts/export_user_reports.py \
   - `mallopt(M_MMAP_THRESHOLD=128KB)` reduces glibc heap fragmentation during build.
   - `malloc_trim(0)` after large drops returns freed heap pages to OS.
 - **Phase 3 (treemap)**: loads persisted aggregates, builds `tree_map_data/treemap.db`:
-  - All dirs included (no depth filter) for complete path resolution.
+  - Filtered by `--level <N>` depth — dirs deeper than N are excluded from `treemap.db`.
   - Runs independently — can be skipped or rerun without re-scanning.
 - `permission_issues.db` — indexed access-error log.
 - All databases built with `journal_mode=OFF` and atomically renamed into place.
 
+### Scan completion summary
+
+- Prints final summary block with paths AND file sizes for each output:
+  - Summary report JSON
+  - Inode usage report JSON
+  - Detail DB
+  - TreeMap DB
+  - Permission DB
+- Total wall-clock pipeline elapsed time.
+
 ### Atomic remote sync
 
-- Streams artifacts over SSH using `tar | ssh tar` with SSH ControlMaster multiplexing.
-- Per-file atomicity: staging → `mv -f` into place.
-- Per-directory atomicity: staging dir → rotate old → promote new.
+- Single-file sync uses `rsync -az` when available (atomic temp-file + rename built-in), falls back to `scp` if rsync is missing.
+- Snapshots files to a temp dir before transfer to avoid races with concurrent writers (e.g. heartbeat updating `scan_status.json`).
+- Per-directory sync uses tar | ssh tar with SSH ControlMaster multiplexing, atomic staging dir + rotate old + promote new.
+- `scan_status.json` syncs immediately (bypasses queue) so the dashboard sees live progress without waiting for big files.
 - Ctrl+C drains subprocesses, sweeps remote staging artifacts, pushes final heartbeat.
 
 ### Heartbeat + status
 
 - `scan_status.json` updated atomically every 5s with stage, elapsed, running, message.
-- Enqueued every 30s (and on phase changes) when sync is enabled.
+- Synced to remote every 5s (and immediately on phase changes) when sync is enabled. Uses synchronous sync (bypass queue) so dashboard sees real-time progress.
+- Success log for `scan_status.json` is suppressed to reduce terminal noise; errors still printed.
 
 ---
 
 ## Requirements
 
-- **Python**: 3.6+ (per `pyproject.toml`)
+- **Python**: 3.7+ (uses dataclasses)
 - **OS**: Linux x86_64
 - **glibc**: bundled `.so` targets glibc 2.17+ (CentOS 7, RHEL 7+, Debian 9+, Ubuntu 14.04+)
 - **SQLite**: 3.7.x+
@@ -157,8 +169,8 @@ bash src/rust_exporter/build.sh
 | `--run --output <path>` | Override full output file path for the summary report. |
 | `--run --prefix <name>` | Prefix generated report filenames. |
 | `--run --date` | Append `YYYYMMDD` to output filenames. |
-| `--run --tree-map` | Build `tree_map_data/treemap.db` (required for `--tree-show`). All dirs included regardless of `--level`. |
-| `--run --level <N>` | Display depth metadata stored in treemap.db (default: 3). For actual tree depth at view time, use `--tree-show --level`. |
+| `--run --tree-map` | Build `tree_map_data/treemap.db` (required for `--tree-show`). |
+| `--run --level <N>` | Maximum directory depth stored in `treemap.db` (default: 3). Dirs deeper than N are excluded. |
 | `--run --webhook-url <URL>` | POST a Microsoft Teams summary on completion. |
 
 ### Sync Commands
@@ -374,7 +386,7 @@ Phase 2: Rust detail pipeline (Rayon)
          ▼
 Phase 3: Rust treemap pipeline  [only with --tree-map]
   → load aggregates.bin.zst
-  → treemap.db (all dirs, no depth filter)
+  → treemap.db (filtered by --level depth)
   → cleanup aggregates
          │
          ▼
