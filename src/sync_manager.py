@@ -559,6 +559,24 @@ class AsyncSyncPipeline:
 
         return cache
 
+    def sync_file_now(self, file_path: str) -> bool:
+        """Sync a single file immediately (bypass queue) — for time-sensitive
+        files like scan_status.json that must reach remote without delay."""
+        if not file_path:
+            return False
+        path = os.path.abspath(file_path)
+        if not os.path.isfile(path):
+            return False
+        return ReportSyncer.sync_file_to_remote(
+            file_path=path,
+            base_dir=self.base_dir,
+            user=self.user,
+            host=self.host,
+            dest_dir=self.dest_dir,
+            password=self.password,
+            _capability_cache=self._capability_cache,
+        )
+
     def enqueue_file(self, file_path: str):
         if not file_path:
             return

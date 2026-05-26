@@ -91,7 +91,12 @@ def update_status(
     )
     if status_path and pipeline:
         try:
-            pipeline.enqueue_file(status_path)
+            # Use sync_file_now to bypass queue — scan_status.json must reach
+            # remote immediately so dashboard shows live progress.
+            if hasattr(pipeline, 'sync_file_now'):
+                pipeline.sync_file_now(status_path)
+            else:
+                pipeline.enqueue_file(status_path)
         except Exception:
             pass
 
@@ -166,7 +171,10 @@ class ScanStatusHeartbeat:
                 and now - self._last_sync >= self.sync_interval
             ):
                 try:
-                    self.sync_pipeline.enqueue_file(status_path)
+                    if hasattr(self.sync_pipeline, 'sync_file_now'):
+                        self.sync_pipeline.sync_file_now(status_path)
+                    else:
+                        self.sync_pipeline.enqueue_file(status_path)
                     self._last_sync = now
                 except Exception:
                     pass
