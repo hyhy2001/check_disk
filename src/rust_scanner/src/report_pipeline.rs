@@ -1420,17 +1420,16 @@ pub(crate) fn build_treemap_db_impl(
     let t_owners_done = t_owners.elapsed();
 
     let t_filter = Instant::now();
-    // Include ALL dirs in treemap.db so consumers (export, CLI) can reconstruct
-    // full paths for any file_id from data_detail.db. max_level and
-    // min_size_bytes are display-only filters applied later by readers, not
-    // gates on what's persisted.
+    // Include dirs up to max_level depth. Root (id=0, depth=0) always included.
+    // min_size_bytes is still a display-only hint stored in meta only.
+    let _ = min_size_bytes;
     let mut included: HashSet<i64> = HashSet::new();
     for d in &agg.dirs_in_order {
-        included.insert(d.id);
+        if max_level == 0 || d.depth <= max_level as i64 {
+            included.insert(d.id);
+        }
     }
     included.insert(0);
-    let _ = max_level;
-    let _ = min_size_bytes;
     let t_filter_done = t_filter.elapsed();
 
     let t_dir_rows = Instant::now();
