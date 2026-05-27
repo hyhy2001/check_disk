@@ -74,6 +74,9 @@ impl DirPathMap {
     }
 
     fn load(conn: &Connection) -> Result<Self, String> {
+        let scan_root = read_scan_root(conn);
+        let root_basename = scan_root.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+
         let mut stmt = conn
             .prepare("SELECT DISTINCT id, path FROM dirs")
             .map_err(|e| format!("prepare dir path map: {}", e))?;
@@ -86,7 +89,22 @@ impl DirPathMap {
         let mut paths: HashMap<i64, String> = HashMap::new();
         for row in rows {
             let (id, path) = row.map_err(|e| format!("row: {}", e))?;
-            paths.insert(id, path);
+            let abs_path = if path.starts_with('/') {
+                path
+            } else if !root_basename.is_empty() && (path == root_basename || path.starts_with(&format!("{}/", root_basename))) {
+                let suffix = path.strip_prefix(&root_basename).unwrap_or(&path);
+                let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+                if suffix.is_empty() {
+                    scan_root.trim_end_matches('/').to_string()
+                } else {
+                    format!("{}/{}", scan_root.trim_end_matches('/'), suffix)
+                }
+            } else if !scan_root.is_empty() {
+                format!("{}/{}", scan_root.trim_end_matches('/'), path)
+            } else {
+                path
+            };
+            paths.insert(id, abs_path);
         }
         Ok(Self { paths })
     }
@@ -94,6 +112,14 @@ impl DirPathMap {
     fn get(&self, dir_id: i64) -> String {
         self.paths.get(&dir_id).cloned().unwrap_or_default()
     }
+}
+
+fn read_scan_root(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = 'scan_root'",
+        [],
+        |r| r.get::<_, String>(0),
+    ).unwrap_or_default()
 }
 
 fn lookup_user_uid(conn: &Connection, username: &str) -> Option<i64> {
