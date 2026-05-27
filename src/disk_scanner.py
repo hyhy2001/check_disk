@@ -163,6 +163,14 @@ class DiskScanner:
         if container_skips:
             skip_dirs = list(skip_dirs) + container_skips
 
+        # Auto-skip .snapshot dirs under scan root (NFS/NetApp snapshots)
+        import os
+        scan_root_abs = os.path.abspath(directory).rstrip("/") or "/"
+        snapshot_path = os.path.join(scan_root_abs, ".snapshot")
+        if os.path.isdir(snapshot_path):
+            skip_dirs = list(skip_dirs) + [snapshot_path]
+            print(f"[SCAN] Detected .snapshot dir — will skip: {snapshot_path}")
+
         # Auto-detect bind mounts under scan root to avoid double-counting
         bind_mounts = _detect_bind_mounts(directory)
         if bind_mounts:
