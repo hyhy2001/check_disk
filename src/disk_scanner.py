@@ -148,6 +148,21 @@ class DiskScanner:
         directory = self.config.get("directory", "/")
         skip_dirs = self.config.get("exclude_patterns", [])
 
+        # Auto-skip container overlay/snapshot dirs that duplicate host data
+        CONTAINER_SKIP_PREFIXES = [
+            "/var/lib/containerd/io.containerd.snapshotter",
+            "/var/lib/docker/overlay2",
+            "/var/lib/docker/aufs",
+            "/var/lib/lxc",
+            "/var/lib/lxd/storage-pools",
+        ]
+        container_skips = [
+            p for p in CONTAINER_SKIP_PREFIXES
+            if p.startswith(directory.rstrip("/")) or directory == "/"
+        ]
+        if container_skips:
+            skip_dirs = list(skip_dirs) + container_skips
+
         # Auto-detect bind mounts under scan root to avoid double-counting
         bind_mounts = _detect_bind_mounts(directory)
         if bind_mounts:
