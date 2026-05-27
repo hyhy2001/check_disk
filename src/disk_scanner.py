@@ -67,9 +67,11 @@ def _detect_bind_mounts(scan_root):
                     if bind_dest not in skip:
                         skip.append(bind_dest)
                 elif len(under_scan) == 1:
-                    # Only one is under scan root — but it duplicates a mount outside.
-                    # Skip the one under scan root since the data lives elsewhere.
-                    pass
+                    # One is under scan root, the other is outside.
+                    # The one under scan root is the bind dest — skip it.
+                    bind_dest = under_scan[0]
+                    if bind_dest not in skip:
+                        skip.append(bind_dest)
             else:
                 seen[key] = mp
     except (IOError, OSError):
