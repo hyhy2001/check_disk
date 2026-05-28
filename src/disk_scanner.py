@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
+from .scan_preflight import detect_skip_dirs
 from .utils import (
     ScanHelper,
     create_usage_bar,
@@ -24,59 +25,6 @@ except ImportError:
     _HAS_FAST_SCANNER = False
 
 
-def _detect_bind_mounts(scan_root):
-    """Detect bind mount destinations under scan_root by reading
-    /proc/self/mountinfo. Returns paths that should be skipped to avoid
-    double-counting (bind mounts share inodes with their source).
-    """
-    import os
-    skip = []
-    try:
-        # Track (dev, ino) of seen mount points. A duplicate means bind mount.
-        seen = {}  # (dev, ino) -> first_path_seen
-        with open("/proc/self/mountinfo", "r") as f:
-            mounts = []
-            for line in f:
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                # Field index 4 = mount point
-                mount_point = parts[4]
-                mounts.append(mount_point)
-
-        scan_root_abs = os.path.abspath(scan_root).rstrip("/") or "/"
-        for mp in mounts:
-            try:
-                st = os.stat(mp)
-            except OSError:
-                continue
-            key = (st.st_dev, st.st_ino)
-            if key in seen:
-                # Bind mount destination — skip whichever is under scan_root
-                # (or the longer path, since it's likely the bind dest).
-                first = seen[key]
-                # Pick the one that's UNDER scan_root and isn't the original
-                under_scan = []
-                if mp == scan_root_abs or mp.startswith(scan_root_abs + "/"):
-                    under_scan.append(mp)
-                if first == scan_root_abs or first.startswith(scan_root_abs + "/"):
-                    under_scan.append(first)
-                if len(under_scan) >= 2:
-                    # Both under scan root — skip the longer one (likely the bind dest)
-                    bind_dest = max(under_scan, key=len)
-                    if bind_dest not in skip:
-                        skip.append(bind_dest)
-                elif len(under_scan) == 1:
-                    # One is under scan root, the other is outside.
-                    # The one under scan root is the bind dest — skip it.
-                    bind_dest = under_scan[0]
-                    if bind_dest not in skip:
-                        skip.append(bind_dest)
-            else:
-                seen[key] = mp
-    except (IOError, OSError):
-        pass
-    return skip
 
 
 def _get_rss_mb() -> float:
@@ -148,56 +96,22 @@ class DiskScanner:
         directory = self.config.get("directory", "/")
         skip_dirs = self.config.get("exclude_patterns", [])
 
-        # Auto-skip container overlay/snapshot dirs that duplicate host data
-        CONTAINER_SKIP_PREFIXES = [
-            "/var/lib/containerd/io.containerd.snapshotter",
-            "/var/lib/docker/overlay2",
-            "/var/lib/docker/aufs",
-            "/var/lib/lxc",
-            "/var/lib/lxd/storage-pools",
-        ]
-        container_skips = [
-            p for p in CONTAINER_SKIP_PREFIXES
-            if p.startswith(directory.rstrip("/")) or directory == "/"
-        ]
-        if container_skips:
-            skip_dirs = list(skip_dirs) + container_skips
-
-        # Auto-skip .snapshot dirs under scan root (NFS/NetApp snapshots).
-        # NetApp creates .snapshot at every volume/qtree level, not just root.
-        # Find all .snapshot dirs (shallow search, max 3 levels) and add to skip_dirs
-        # as prefix match — more reliable than relying on WalkBuilder name check.
-        import os
-        import subprocess
-        scan_root_abs = os.path.abspath(directory).rstrip("/") or "/"
-        try:
-            find_proc = subprocess.run(
-                ["find", scan_root_abs, "-maxdepth", "4", "-type", "d", "-name", ".snapshot"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, timeout=30,
-            )
-            snapshot_dirs = [p.strip() for p in find_proc.stdout.splitlines() if p.strip()]
-            if snapshot_dirs:
-                skip_dirs = list(skip_dirs) + snapshot_dirs
-                print(f"[SCAN] Detected {len(snapshot_dirs)} .snapshot dir(s) — will skip:")
-                for sd in snapshot_dirs[:10]:
-                    print(f"  {sd}")
-                if len(snapshot_dirs) > 10:
-                    print(f"  ... and {len(snapshot_dirs) - 10} more")
-        except (subprocess.TimeoutExpired, OSError):
-            # Fallback: just check root level
-            snapshot_path = os.path.join(scan_root_abs, ".snapshot")
-            if os.path.isdir(snapshot_path):
-                skip_dirs = list(skip_dirs) + [snapshot_path]
-                print(f"[SCAN] Detected .snapshot dir — will skip: {snapshot_path}")
-
-        # Auto-detect bind mounts under scan root to avoid double-counting
-        bind_mounts = _detect_bind_mounts(directory)
-        if bind_mounts:
-            print(f"[SCAN] Detected {len(bind_mounts)} bind mount(s) — will skip:")
-            for bm in bind_mounts:
-                print(f"  {bm}")
-            skip_dirs = list(skip_dirs) + bind_mounts
+        # Detect dirs to skip (container overlays, NFS snapshots, bind mounts)
+        auto_skips = detect_skip_dirs(directory)
+        if auto_skips:
+            # Print summary grouped by type
+            snapshots = [p for p in auto_skips if ".snapshot" in p]
+            bind_mounts = [p for p in auto_skips if p not in snapshots and not any(p.startswith(c) for c in ["/var/lib/containerd", "/var/lib/docker", "/var/lib/lxc", "/var/lib/lxd"])]
+            containers = [p for p in auto_skips if p not in snapshots and p not in bind_mounts]
+            if snapshots:
+                print(f"[SCAN] Skipping {len(snapshots)} .snapshot dir(s)")
+            if containers:
+                print(f"[SCAN] Skipping {len(containers)} container overlay dir(s)")
+            if bind_mounts:
+                print(f"[SCAN] Skipping {len(bind_mounts)} bind mount(s):")
+                for bm in bind_mounts:
+                    print(f"  {bm}")
+            skip_dirs = list(skip_dirs) + auto_skips
 
         target_uids = self._resolve_target_uids()
 
