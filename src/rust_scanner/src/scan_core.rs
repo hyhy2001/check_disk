@@ -5,11 +5,44 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs as std_fs;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Read /proc/self/mountinfo and return a set of (dev, ino) for every
+/// mount point. The walker uses this to detect bind mounts that share
+/// the same dev/ino as another mount point (which would cause double-counting).
+fn build_mount_point_set() -> HashSet<(u64, u64)> {
+    let mut set: HashSet<(u64, u64)> = HashSet::new();
+    let content = match std_fs::read_to_string("/proc/self/mountinfo") {
+        Ok(s) => s,
+        Err(_) => return set,
+    };
+
+    // Track first-seen (dev, ino) → mark as duplicates if seen twice (= bind mount)
+    let mut seen: std::collections::HashMap<(u64, u64), bool> = std::collections::HashMap::new();
+    for line in content.lines() {
+        // mountinfo format: id parent_id major:minor root mount_point ...
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let mount_point = parts[4];
+        if let Ok(meta) = std_fs::metadata(mount_point) {
+            let key = (meta.dev(), meta.ino());
+            if seen.contains_key(&key) {
+                // Bind mount duplicate — add to skip set
+                set.insert(key);
+            } else {
+                seen.insert(key, true);
+            }
+        }
+    }
+    set
+}
 
 use crate::scan_constants::{
     CRITICAL_SKIP_NAMES, SCAN_EVENT_FLUSH_BYTES_THRESHOLD, SCAN_EVENT_FLUSH_THRESHOLD,
@@ -59,6 +92,17 @@ pub(crate) fn run_scan_core(
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
+    // Build set of (dev, ino) for bind-mount destinations. When walker hits
+    // a dir with matching (dev, ino), skip it — it's a bind mount of another
+    // dir on the same filesystem (du's di_mnt set approach).
+    let bind_mount_set: Arc<HashSet<(u64, u64)>> = Arc::new(build_mount_point_set());
+    let bind_mount_clone = bind_mount_set.clone();
+    if !bind_mount_set.is_empty() {
+        eprintln!(
+            "[SCAN] Detected {} bind mount destination(s) (will skip duplicates)",
+            bind_mount_set.len()
+        );
+    }
 
     let g_clone = global_stats.clone();
     let pf_clone = prog_files.clone();
@@ -155,6 +199,7 @@ pub(crate) fn run_scan_core(
                 };
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
+                let bind_mount = bind_mount_clone.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -221,6 +266,12 @@ pub(crate) fn run_scan_core(
                                     start.elapsed().as_nanos() as u64,
                                     Ordering::Relaxed,
                                 );
+                            }
+                            // Bind mount detection: skip dirs whose (dev, ino)
+                            // matches a known bind mount destination.
+                            let key = (meta.dev(), meta.ino());
+                            if bind_mount.contains(&key) {
+                                return WalkState::Skip;
                             }
                             if let Some(rdev) = root_dev {
                                 if meta.dev() != rdev {
