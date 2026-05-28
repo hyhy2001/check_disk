@@ -163,13 +163,33 @@ class DiskScanner:
         if container_skips:
             skip_dirs = list(skip_dirs) + container_skips
 
-        # Auto-skip .snapshot dirs under scan root (NFS/NetApp snapshots)
+        # Auto-skip .snapshot dirs under scan root (NFS/NetApp snapshots).
+        # NetApp creates .snapshot at every volume/qtree level, not just root.
+        # Find all .snapshot dirs (shallow search, max 3 levels) and add to skip_dirs
+        # as prefix match — more reliable than relying on WalkBuilder name check.
         import os
+        import subprocess
         scan_root_abs = os.path.abspath(directory).rstrip("/") or "/"
-        snapshot_path = os.path.join(scan_root_abs, ".snapshot")
-        if os.path.isdir(snapshot_path):
-            skip_dirs = list(skip_dirs) + [snapshot_path]
-            print(f"[SCAN] Detected .snapshot dir — will skip: {snapshot_path}")
+        try:
+            find_proc = subprocess.run(
+                ["find", scan_root_abs, "-maxdepth", "4", "-type", "d", "-name", ".snapshot"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=30,
+            )
+            snapshot_dirs = [p.strip() for p in find_proc.stdout.splitlines() if p.strip()]
+            if snapshot_dirs:
+                skip_dirs = list(skip_dirs) + snapshot_dirs
+                print(f"[SCAN] Detected {len(snapshot_dirs)} .snapshot dir(s) — will skip:")
+                for sd in snapshot_dirs[:10]:
+                    print(f"  {sd}")
+                if len(snapshot_dirs) > 10:
+                    print(f"  ... and {len(snapshot_dirs) - 10} more")
+        except (subprocess.TimeoutExpired, OSError):
+            # Fallback: just check root level
+            snapshot_path = os.path.join(scan_root_abs, ".snapshot")
+            if os.path.isdir(snapshot_path):
+                skip_dirs = list(skip_dirs) + [snapshot_path]
+                print(f"[SCAN] Detected .snapshot dir — will skip: {snapshot_path}")
 
         # Auto-detect bind mounts under scan root to avoid double-counting
         bind_mounts = _detect_bind_mounts(directory)
