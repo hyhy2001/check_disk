@@ -7,7 +7,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
-from .scan_preflight import detect_skip_dirs
 from .utils import (
     ScanHelper,
     create_usage_bar,
@@ -95,23 +94,6 @@ class DiskScanner:
 
         directory = self.config.get("directory", "/")
         skip_dirs = self.config.get("exclude_patterns", [])
-
-        # Detect dirs to skip (container overlays, NFS snapshots, bind mounts)
-        auto_skips = detect_skip_dirs(directory)
-        if auto_skips:
-            # Print summary grouped by type
-            snapshots = [p for p in auto_skips if ".snapshot" in p]
-            bind_mounts = [p for p in auto_skips if p not in snapshots and not any(p.startswith(c) for c in ["/var/lib/containerd", "/var/lib/docker", "/var/lib/lxc", "/var/lib/lxd"])]
-            containers = [p for p in auto_skips if p not in snapshots and p not in bind_mounts]
-            if snapshots:
-                print(f"[SCAN] Skipping {len(snapshots)} .snapshot dir(s)")
-            if containers:
-                print(f"[SCAN] Skipping {len(containers)} container overlay dir(s)")
-            if bind_mounts:
-                print(f"[SCAN] Skipping {len(bind_mounts)} bind mount(s):")
-                for bm in bind_mounts:
-                    print(f"  {bm}")
-            skip_dirs = list(skip_dirs) + auto_skips
 
         target_uids = self._resolve_target_uids()
 
