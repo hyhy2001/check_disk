@@ -23,5 +23,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
 bincode = "1.3"
 zstd = "0.13"
+libc = "0.2"
 
 unicode-normalization = "0.1"

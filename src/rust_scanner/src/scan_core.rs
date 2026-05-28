@@ -12,36 +12,75 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Read /proc/self/mountinfo and return a set of (dev, ino) for every
-/// mount point. The walker uses this to detect bind mounts that share
-/// the same dev/ino as another mount point (which would cause double-counting).
-fn build_mount_point_set() -> HashSet<(u64, u64)> {
-    let mut set: HashSet<(u64, u64)> = HashSet::new();
+/// Filesystem magic numbers for pseudo/virtual filesystems (ncdu exclude_kernfs approach).
+const KERNFS_MAGIC: &[i64] = &[
+    0x9fa0,      // proc
+    0x62656572,  // sysfs
+    0x64626720,  // debugfs
+    0x01021994,  // tmpfs
+    0x1cd1,      // devpts
+    0x42494e4d,  // binfmtfs
+    0x27e0eb,    // cgroup
+    0x63677270,  // cgroup2
+    0x794c7630,  // overlayfs
+    0x858458f6,  // ramfs
+    0x73636673,  // securityfs
+    0x67596969,  // tracefs
+];
+
+fn is_kernfs_path(path: &std::path::Path) -> bool {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    unsafe {
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return false;
+        }
+        let fs = buf.assume_init();
+        KERNFS_MAGIC.contains(&(fs.f_type as i64))
+    }
+}
+
+/// Read /proc/self/mountinfo and return:
+/// 1. Set of (dev, ino) for bind-mount duplicates
+/// 2. Set of mount-point paths on pseudo/virtual filesystems
+fn build_mount_skip_sets() -> (HashSet<(u64, u64)>, HashSet<String>) {
+    let mut bind_set: HashSet<(u64, u64)> = HashSet::new();
+    let mut kernfs_set: HashSet<String> = HashSet::new();
+
     let content = match std_fs::read_to_string("/proc/self/mountinfo") {
         Ok(s) => s,
-        Err(_) => return set,
+        Err(_) => return (bind_set, kernfs_set),
     };
 
-    // Track first-seen (dev, ino) → mark as duplicates if seen twice (= bind mount)
     let mut seen: std::collections::HashMap<(u64, u64), bool> = std::collections::HashMap::new();
+
     for line in content.lines() {
-        // mountinfo format: id parent_id major:minor root mount_point ...
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
+        if parts.len() < 5 { continue; }
+        let mp = parts[4];
+        let path = std::path::Path::new(mp);
+
+        if is_kernfs_path(path) {
+            kernfs_set.insert(mp.to_string());
         }
-        let mount_point = parts[4];
-        if let Ok(meta) = std_fs::metadata(mount_point) {
+
+        if let Ok(meta) = std_fs::metadata(mp) {
             let key = (meta.dev(), meta.ino());
             if seen.contains_key(&key) {
-                // Bind mount duplicate — add to skip set
-                set.insert(key);
+                bind_set.insert(key);
             } else {
                 seen.insert(key, true);
             }
         }
     }
-    set
+
+    (bind_set, kernfs_set)
 }
 
 use crate::scan_constants::{
@@ -92,17 +131,23 @@ pub(crate) fn run_scan_core(
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
-    // Build set of (dev, ino) for bind-mount destinations. When walker hits
-    // a dir with matching (dev, ino), skip it — it's a bind mount of another
-    // dir on the same filesystem (du's di_mnt set approach).
-    let bind_mount_set: Arc<HashSet<(u64, u64)>> = Arc::new(build_mount_point_set());
-    let bind_mount_clone = bind_mount_set.clone();
-    if !bind_mount_set.is_empty() {
+    let (bind_raw, kernfs_raw) = build_mount_skip_sets();
+    if !bind_raw.is_empty() {
         eprintln!(
             "[SCAN] Detected {} bind mount destination(s) (will skip duplicates)",
-            bind_mount_set.len()
+            bind_raw.len()
         );
     }
+    if !kernfs_raw.is_empty() {
+        eprintln!(
+            "[SCAN] Detected {} kernel/virtual FS mount(s) (will skip)",
+            kernfs_raw.len()
+        );
+    }
+    let bind_mount_set: Arc<HashSet<(u64, u64)>> = Arc::new(bind_raw);
+    let kernfs_set: Arc<HashSet<String>> = Arc::new(kernfs_raw);
+    let bind_mount_clone = bind_mount_set.clone();
+    let kernfs_clone = kernfs_set.clone();
 
     let g_clone = global_stats.clone();
     let pf_clone = prog_files.clone();
@@ -200,6 +245,7 @@ pub(crate) fn run_scan_core(
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
                 let bind_mount = bind_mount_clone.clone();
+                let kernfs = kernfs_clone.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -272,6 +318,12 @@ pub(crate) fn run_scan_core(
                             let key = (meta.dev(), meta.ino());
                             if bind_mount.contains(&key) {
                                 return WalkState::Skip;
+                            }
+                            // Skip kernel/pseudo filesystem mount points (ncdu exclude_kernfs)
+                            if let Some(path_str) = path.to_str() {
+                                if kernfs.contains(path_str) {
+                                    return WalkState::Skip;
+                                }
                             }
                             if let Some(rdev) = root_dev {
                                 if meta.dev() != rdev {
