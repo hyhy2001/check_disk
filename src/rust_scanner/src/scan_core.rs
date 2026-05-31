@@ -182,6 +182,13 @@ pub(crate) fn run_scan_core(
     // Shared cross-worker hard-link deduplication — DashSet avoids Mutex bottleneck
     let hardlink_inodes: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let hardlink_inodes_profile = hardlink_inodes.clone();
+    // Track visited (dev, ino) pairs for dirs to detect bind mount loops at
+    // runtime. Catches loops that mountinfo parsing misses (e.g. container
+    // bind mounts not in host mountinfo, NFS re-exports). Memory: ~32 bytes
+    // × N dirs = ~250MB at 7.7M-dir scale.
+    let visited_dirs: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
+    let visited_dirs_profile = visited_dirs.clone();
+    let visited_dirs_clone = visited_dirs.clone();
 
     let _walk_thread = thread::spawn(move || {
         // Ensure `done` flips to true even if the parallel walk panics —
@@ -246,6 +253,7 @@ pub(crate) fn run_scan_core(
                 let hardlinks_shared = hardlink_inodes.clone();
                 let bind_mount = bind_mount_clone.clone();
                 let kernfs = kernfs_clone.clone();
+                let visited_dirs = visited_dirs_clone.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -329,6 +337,12 @@ pub(crate) fn run_scan_core(
                                 if meta.dev() != rdev {
                                     return WalkState::Skip;
                                 }
+                            }
+                            // Runtime bind mount loop detection: skip if we've already visited
+                            // this (dev, ino) pair via another path. Catches loops not in
+                            // /proc/self/mountinfo.
+                            if !visited_dirs.insert(key) {
+                                return WalkState::Skip;
                             }
                         } else if let Some(start) = meta_start {
                             state.prof_metadata_ns.fetch_add(
@@ -507,6 +521,7 @@ pub(crate) fn run_scan_core(
         let max_buf_records = prof_max_event_buf_records.load(Ordering::Relaxed);
         let max_buf_bytes = prof_max_event_buf_bytes.load(Ordering::Relaxed);
         let hardlink_set_size = hardlink_inodes_profile.len();
+        let visited_dirs_size = visited_dirs_profile.len();
         println!("\n[Phase 1 Profile]");
         println!("  Wall time:          {:.2}s", elapsed);
         println!(
@@ -527,6 +542,10 @@ pub(crate) fn run_scan_core(
         println!(
             "  Hardlink set size:  {}",
             format_num(hardlink_set_size as u64)
+        );
+        println!(
+            "  Visited dirs set:   {}",
+            format_num(visited_dirs_size as u64)
         );
     }
 
