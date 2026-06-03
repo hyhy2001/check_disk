@@ -127,14 +127,21 @@ fn mount_is_under_root(mp: &str, root_norm: &str) -> bool {
 
 /// Pure mountinfo analysis: given the raw `/proc/self/mountinfo` text and the
 /// scan root, return the set of mount points STRICTLY under the root that are
-/// bind-mount duplicates of an already-seen source `(major:minor, fs_root)`.
-/// These must be skipped so their bytes are counted exactly once. Kept pure
-/// (no syscalls) so it is unit-testable from fixture strings.
+/// bind-mount duplicates of a source `(major:minor, fs_root)` ALREADY counted
+/// within this scan. Kept pure (no syscalls) so it is unit-testable.
+///
+/// Correctness rule (important): we only skip an in-root mount point when the
+/// *first* mount of the same source bytes is also under the scan root — i.e.
+/// those bytes are genuinely reached and counted elsewhere in this walk.
+/// If the first/source mount lies OUTSIDE the scan root, the in-root mount is
+/// the only reachable copy and must NOT be skipped, or the scan undercounts.
 fn child_bind_dups_to_skip(mountinfo: &str, scan_root: &str) -> HashSet<String> {
     let root_norm = scan_root.trim_end_matches('/');
     let mut skip: HashSet<String> = HashSet::new();
-    // (major:minor, fs_root_subpath) -> first mount point that exposed it.
-    let mut origin: std::collections::HashMap<(String, String), String> =
+    // (major:minor, fs_root_subpath) -> was the first mount of this source
+    // located *under the scan root*? Only then are its bytes already counted,
+    // making later in-root copies safe to skip.
+    let mut origin_under_root: std::collections::HashMap<(String, String), bool> =
         std::collections::HashMap::new();
 
     for line in mountinfo.lines() {
@@ -146,13 +153,20 @@ fn child_bind_dups_to_skip(mountinfo: &str, scan_root: &str) -> HashSet<String> 
         }
         let origin_key = (parts[2].to_string(), parts[3].to_string());
         let mp = parts[4];
-        if origin.contains_key(&origin_key) {
-            // Second+ mount point of the same source bytes: a bind duplicate.
-            if mount_is_under_root(mp, root_norm) && mp != root_norm {
-                skip.insert(mp.to_string());
+        let under_root = mount_is_under_root(mp, root_norm);
+        match origin_under_root.get(&origin_key) {
+            Some(&first_under_root) => {
+                // A later mount of the same source. Skip it only if it is under
+                // the root (so the walk would otherwise reach it) AND the first
+                // copy was already under the root (so the bytes are counted).
+                if under_root && mp != root_norm && first_under_root {
+                    skip.insert(mp.to_string());
+                }
             }
-        } else {
-            origin.insert(origin_key, mp.to_string());
+            None => {
+                // Remember where the FIRST copy of this source lives.
+                origin_under_root.insert(origin_key, under_root);
+            }
         }
     }
     skip
@@ -248,6 +262,39 @@ mod mount_skip_tests {
     fn unrelated_root_skips_nothing() {
         let skip = child_bind_dups_to_skip(FIXTURE, "/data/other");
         assert!(skip.is_empty());
+    }
+
+    // Regression (Codex P1): if the FIRST mount of a source is OUTSIDE the scan
+    // root, the in-root bind copy is the only reachable instance and must NOT be
+    // skipped — otherwise the scan undercounts those bytes.
+    const FIXTURE_ORIGIN_OUTSIDE: &str = "\
+30 2 0:40 / /data/project rw shared:9 - ext4 /dev/sdc rw
+31 2 0:40 / /scan/project rw shared:9 - ext4 /dev/sdc rw
+32 2 0:40 / /scan rw shared:1 - ext4 /dev/sda rw";
+
+    #[test]
+    fn keeps_in_root_copy_when_origin_is_outside_root() {
+        // Scanning /scan: source first seen at /data/project (outside /scan),
+        // then bind-mounted at /scan/project (inside). /scan/project is the only
+        // copy the walk reaches, so it must be KEPT (not skipped).
+        let skip = child_bind_dups_to_skip(FIXTURE_ORIGIN_OUTSIDE, "/scan");
+        assert!(
+            !skip.contains("/scan/project"),
+            "in-root bind copy wrongly skipped though its source is outside the scan"
+        );
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn skips_second_in_root_copy_when_first_is_in_root() {
+        // Two in-root copies of the same source: first /scan/a (counted),
+        // second /scan/b (duplicate) -> only /scan/b is skipped.
+        let mi = "\
+40 2 0:50 / /scan/a rw shared:5 - ext4 /dev/sdd rw
+41 2 0:50 / /scan/b rw shared:5 - ext4 /dev/sdd rw";
+        let skip = child_bind_dups_to_skip(mi, "/scan");
+        assert!(skip.contains("/scan/b"));
+        assert!(!skip.contains("/scan/a"));
     }
 
     #[test]
