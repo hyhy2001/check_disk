@@ -393,7 +393,7 @@ pub(crate) fn run_scan_core(
         );
     }
     eprintln!(
-        "[SCAN] Size mode: min(st_size, st_blocks*512) — real usage, \
+        "[SCAN] Size mode: on-disk blocks (st_blocks*512, like du); \
          dedup applied to every file"
     );
     let (bind_raw, kernfs_raw, child_mount_raw) = build_mount_skip_sets(&directory);
@@ -701,18 +701,11 @@ pub(crate) fn run_scan_core(
                             return WalkState::Continue;
                         }
 
-                        // Size = min(apparent, allocated):
-                        //  - st_size      = logical file content (apparent)
-                        //  - st_blocks*512 = on-disk allocated bytes
-                        // Taking the smaller of the two:
-                        //  - sparse files (st_size >> allocated) count only the
-                        //    blocks actually on disk, not the nominal size;
-                        //  - normal files with slack (allocated > st_size) count
-                        //    real content, not rounded-up block allocation that
-                        //    NFS/large-block filesystems inflate.
-                        // This is what `du` effectively reports as real usage and
-                        // keeps the total close to actual data on disk.
-                        let size = std::cmp::min(meta.size(), meta.blocks() * 512);
+                        // st_blocks * 512 = actual on-disk bytes consumed
+                        // (allocated blocks, like `du`). This is the real disk
+                        // usage of the file, including filesystem slack — the
+                        // same number `du` and df-level accounting use.
+                        let size = meta.blocks() * 512;
                         let uid = meta.uid();
                         let is_target = match &state.target_uids {
                             Some(set) => set.contains(&uid),
