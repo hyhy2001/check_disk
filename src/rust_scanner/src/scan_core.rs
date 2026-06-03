@@ -116,6 +116,55 @@ fn hardlink_key(path: &std::path::Path, ino: u64, dev: u64, use_statx: bool) -> 
     }
 }
 
+/// Lightweight statx result for the NFS hot-path: one syscall yields the
+/// inode identity (stx_ino + stx_mnt_id) AND the disk-usage fields
+/// (stx_blocks, stx_uid, stx_nlink) so we can avoid a separate entry.metadata() call.
+struct StatxLite {
+    ino: u64,
+    mnt_id: u64,
+    blocks: u64,
+    uid: u32,
+    nlink: u64,
+}
+
+/// Call statx() with STATX_INO|STATX_MNT_ID|STATX_BLOCKS|STATX_UID|STATX_NLINK.
+/// Returns None if the syscall fails or the kernel didn't populate the
+/// required fields — callers must fall back to entry.metadata() in that case.
+fn statx_lite(path: &std::path::Path) -> Option<StatxLite> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    unsafe {
+        let mut stx = MaybeUninit::<libc::statx>::uninit();
+        let mask = (libc::STATX_INO | libc::STATX_MNT_ID | libc::STATX_BLOCKS | libc::STATX_UID | libc::STATX_NLINK) as u32;
+        let rc = libc::statx(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC,
+            mask,
+            stx.as_mut_ptr(),
+        );
+        if rc != 0 {
+            return None;
+        }
+        let s = stx.assume_init();
+        // All required fields must be confirmed present in stx_mask.
+        let required = libc::STATX_INO | libc::STATX_MNT_ID | libc::STATX_BLOCKS | libc::STATX_UID | libc::STATX_NLINK;
+        if (s.stx_mask & required as u32) != required as u32 {
+            return None;
+        }
+        Some(StatxLite {
+            ino: s.stx_ino,
+            mnt_id: s.stx_mnt_id,
+            // stx_blocks is in 512-byte units, identical semantics to st_blocks
+            blocks: s.stx_blocks,
+            uid: s.stx_uid,
+            nlink: s.stx_nlink as u64,
+        })
+    }
+}
+
 /// True if `mp` is the scan root itself or a descendant path of it.
 /// Scanning "/" treats every mount as a descendant.
 fn mount_is_under_root(mp: &str, root_norm: &str) -> bool {
@@ -376,12 +425,10 @@ pub(crate) fn run_scan_core(
     let prof_flush_ns = Arc::new(AtomicU64::new(0));
     let prof_flush_bytes = Arc::new(AtomicU64::new(0));
     let prof_flush_count = Arc::new(AtomicU64::new(0));
-    let prof_hardlink_checks = Arc::new(AtomicU64::new(0));
+    let prof_dedup_checks = Arc::new(AtomicU64::new(0));
     let prof_max_event_buf_records = Arc::new(AtomicU64::new(0));
     let prof_max_event_buf_bytes = Arc::new(AtomicU64::new(0));
 
-    // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
-    let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
     // On NFS, st_dev is unstable, so hardlink dedup keyed on (ino, dev) leaks
     // and inflates total size. Detect NFS once here and switch dedup to a
     // statx-based key for the whole scan.
@@ -392,9 +439,18 @@ pub(crate) fn run_scan_core(
              dedup (st_dev is unstable on NFS)"
         );
     }
+    // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
+    let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
+    // On NFS, identify the scan root's mount by stx_mnt_id (st_dev is unstable).
+    // Used for du -x style filesystem-boundary skipping on both dirs and files.
+    let root_mnt_id: Option<u64> = if use_statx_dedup {
+        statx_lite(std::path::Path::new(&directory)).map(|sx| sx.mnt_id)
+    } else {
+        None
+    };
     eprintln!(
         "[SCAN] Size mode: on-disk blocks (st_blocks*512, like du); \
-         dedup applied to every file"
+         dedup applied to files with nlink>1 only"
     );
     let (bind_raw, kernfs_raw, child_mount_raw) = build_mount_skip_sets(&directory);
     if !bind_raw.is_empty() {
@@ -440,7 +496,7 @@ pub(crate) fn run_scan_core(
     let pfns_clone = prof_flush_ns.clone();
     let pfb_clone = prof_flush_bytes.clone();
     let pfc_clone = prof_flush_count.clone();
-    let ph_clone = prof_hardlink_checks.clone();
+    let ph_clone = prof_dedup_checks.clone();
     let pmaxr_clone = prof_max_event_buf_records.clone();
     let pmaxb_clone = prof_max_event_buf_bytes.clone();
 
@@ -467,6 +523,9 @@ pub(crate) fn run_scan_core(
     let visited_dirs: Arc<DashSet<(u64, u64)>> = Arc::new(DashSet::new());
     let visited_dirs_profile = visited_dirs.clone();
     let visited_dirs_clone = visited_dirs.clone();
+    // Dedupe log lines for foreign-mount skips (one eprintln per unique mnt_id).
+    let foreign_mnt_logged: Arc<DashSet<u64>> = Arc::new(DashSet::new());
+    let foreign_mnt_logged_clone = foreign_mnt_logged.clone();
 
     let _walk_thread = thread::spawn(move || {
         // Ensure `done` flips to true even if the parallel walk panics —
@@ -521,7 +580,7 @@ pub(crate) fn run_scan_core(
                     prof_flush_ns: pfns_clone.clone(),
                     prof_flush_bytes: pfb_clone.clone(),
                     prof_flush_count: pfc_clone.clone(),
-                    prof_hardlink_checks: ph_clone.clone(),
+                    prof_dedup_checks: ph_clone.clone(),
                     prof_max_event_buf_records: pmaxr_clone.clone(),
                     prof_max_event_buf_bytes: pmaxb_clone.clone(),
                     perm_writer: None,
@@ -533,6 +592,7 @@ pub(crate) fn run_scan_core(
                 let kernfs = kernfs_clone.clone();
                 let child_mount = child_mount_clone.clone();
                 let visited_dirs = visited_dirs_clone.clone();
+                let foreign_mnt_logged = foreign_mnt_logged_clone.clone();
 
                 Box::new(move |entry_res| {
                     // --- Error entry: record as permission issue ---
@@ -600,13 +660,9 @@ pub(crate) fn run_scan_core(
                         }
 
                         // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
-                        // We previously also kept a DashSet<(ino, dev)> of every
-                        // visited dir to break loops, but at 7M+ entries it cost
-                        // ~25% wall time to cache-miss into and only ever fired
-                        // once per scan in practice (POSIX forbids same-device
-                        // hardlinked dirs; ignore::WalkBuilder doesn't follow
-                        // symlinks by default; bind-mounts cross devices and
-                        // are already caught below).
+                        // visited_dirs is kept for runtime bind-mount loop detection:
+                        // catches loops not in /proc/self/mountinfo (e.g. container
+                        // bind mounts). Keyed by statx identity (ino, mnt_id) on NFS.
                         let meta_start = debug.then(Instant::now);
                         if let Ok(meta) = entry.metadata() {
                             if let Some(start) = meta_start {
@@ -627,15 +683,31 @@ pub(crate) fn run_scan_core(
                                     return WalkState::Skip;
                                 }
                             }
-                            if let Some(rdev) = root_dev {
+                            // --- Filesystem boundary (du -x): skip dirs on a different mount than root ---
+                            if use_statx_dedup {
+                                // NFS: compare stx_mnt_id (st_dev unreliable). hardlink_key returns
+                                // (ino, mnt_id) on NFS, so reuse it for the mount id.
+                                if let Some(root_m) = root_mnt_id {
+                                    let (_dino, dmnt) = hardlink_key(path, meta.ino(), meta.dev(), true);
+                                    if dmnt != root_m {
+                                        if foreign_mnt_logged.insert(dmnt) {
+                                            eprintln!("[SCAN] skip foreign mount: {} (mnt_id {} != root {})",
+                                                path.display(), dmnt, root_m);
+                                        }
+                                        return WalkState::Skip;
+                                    }
+                                }
+                            } else if let Some(rdev) = root_dev {
                                 if meta.dev() != rdev {
                                     return WalkState::Skip;
                                 }
                             }
                             // Runtime bind mount loop detection: skip if we've already visited
-                            // this (dev, ino) pair via another path. Catches loops not in
-                            // /proc/self/mountinfo.
-                            if !visited_dirs.insert(key) {
+                            // this identity via another path. On NFS use statx-stable
+                            // (ino, mnt_id) so the key is consistent across paths.
+                            let dir_dedup_key =
+                                hardlink_key(path, meta.ino(), meta.dev(), use_statx_dedup);
+                            if !visited_dirs.insert(dir_dedup_key) {
                                 return WalkState::Skip;
                             }
                         } else if let Some(start) = meta_start {
@@ -649,64 +721,124 @@ pub(crate) fn run_scan_core(
                         state.t_inodes += 1;
                         state.add_progress(0, 1, 0);
                     } else if ft.is_file() {
-                        let meta_start = debug.then(Instant::now);
-                        let meta = match entry.metadata() {
-                            Ok(m) => {
-                                if let Some(start) = meta_start {
-                                    state.prof_metadata_ns.fetch_add(
-                                        start.elapsed().as_nanos() as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                                m
-                            }
-                            Err(e) => {
-                                if let Some(start) = meta_start {
-                                    state.prof_metadata_ns.fetch_add(
-                                        start.elapsed().as_nanos() as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                                state.t_perm_issues += 1;
-                                let path_str = path.to_string_lossy().into_owned();
-                                state.flush_permission_issue(
-                                    &path_str,
-                                    "file",
-                                    error_code_from_message(&e.to_string()),
+                        // --- NFS fast path: one statx() yields ino+mnt_id+blocks+uid+nlink ---
+                        // On NFS every entry.metadata() is a remote lstat RPC; hardlink_key()
+                        // then issues a second statx() for the dedup key. statx_lite() fuses
+                        // both into a single syscall. Falls back to the standard path if
+                        // statx_lite() returns None (old kernel, CString error, etc.).
+                        let (size, uid, nlink, dedup_key) = if use_statx_dedup {
+                            let meta_start = debug.then(Instant::now);
+                            let sx = statx_lite(path);
+                            if let Some(start) = meta_start {
+                                state.prof_metadata_ns.fetch_add(
+                                    start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
                                 );
-                                return WalkState::Continue;
                             }
+                            if let Some(sx) = sx {
+                                (sx.blocks * 512, sx.uid, sx.nlink, (sx.ino, sx.mnt_id))
+                            } else {
+                                // statx_lite failed — fall back to the standard path
+                                let meta_start = debug.then(Instant::now);
+                                let meta = match entry.metadata() {
+                                    Ok(m) => {
+                                        if let Some(start) = meta_start {
+                                            state.prof_metadata_ns.fetch_add(
+                                                start.elapsed().as_nanos() as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                        m
+                                    }
+                                    Err(e) => {
+                                        if let Some(start) = meta_start {
+                                            state.prof_metadata_ns.fetch_add(
+                                                start.elapsed().as_nanos() as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                        state.t_perm_issues += 1;
+                                        let path_str = path.to_string_lossy().into_owned();
+                                        state.flush_permission_issue(
+                                            &path_str,
+                                            "file",
+                                            error_code_from_message(&e.to_string()),
+                                        );
+                                        return WalkState::Continue;
+                                    }
+                                };
+                                let dk = hardlink_key(path, meta.ino(), meta.dev(), true);
+                                (meta.blocks() * 512, meta.uid(), meta.nlink(), dk)
+                            }
+                        } else {
+                            // Non-NFS: standard entry.metadata() + (ino, dev) key
+                            let meta_start = debug.then(Instant::now);
+                            let meta = match entry.metadata() {
+                                Ok(m) => {
+                                    if let Some(start) = meta_start {
+                                        state.prof_metadata_ns.fetch_add(
+                                            start.elapsed().as_nanos() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    m
+                                }
+                                Err(e) => {
+                                    if let Some(start) = meta_start {
+                                        state.prof_metadata_ns.fetch_add(
+                                            start.elapsed().as_nanos() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    state.t_perm_issues += 1;
+                                    let path_str = path.to_string_lossy().into_owned();
+                                    state.flush_permission_issue(
+                                        &path_str,
+                                        "file",
+                                        error_code_from_message(&e.to_string()),
+                                    );
+                                    return WalkState::Continue;
+                                }
+                            };
+                            let dk = hardlink_key(path, meta.ino(), meta.dev(), false);
+                            (meta.blocks() * 512, meta.uid(), meta.nlink(), dk)
                         };
 
-                        // --- Deduplication (every regular file) ---
-                        // We dedup ALL files by identity, not just nlink>1.
-                        // Reasons:
-                        //  - NFS can report nlink==1 for files that are in fact
-                        //    reachable via multiple paths (re-export, snapshots),
-                        //    so an nlink>1 gate misses real duplicates.
-                        //  - The same inode reached twice via a duplicate mount /
-                        //    bind / re-export must be counted once.
-                        // Key: (ino, dev) on local FS; (stx_ino, stx_mnt_id) on
-                        // NFS where st_dev is unstable (see hardlink_key).
-                        // Cost: the dedup set holds one entry per unique file —
-                        // ~16 bytes each, so tens of millions of files use
-                        // several GB of RAM. This is the intended trade-off to
-                        // make totals match reality on NFS.
-                        if debug {
-                            state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
+                        // --- du -x: skip files on a different mount than the scan root ---
+                        // dedup_key.1 is mnt_id on NFS (all sub-paths) and dev on local FS,
+                        // which is exactly the mount identity we need for boundary checks.
+                        if use_statx_dedup {
+                            if let Some(root_m) = root_mnt_id {
+                                if dedup_key.1 != root_m {
+                                    return WalkState::Continue;
+                                }
+                            }
+                        } else if let Some(rdev) = root_dev {
+                            if dedup_key.1 != rdev {
+                                return WalkState::Continue;
+                            }
                         }
-                        let dedup_key =
-                            hardlink_key(path, meta.ino(), meta.dev(), use_statx_dedup);
-                        if !hardlinks_shared.insert(dedup_key) {
-                            return WalkState::Continue;
+
+                        // --- Deduplication (files with multiple hardlinks only) ---
+                        // Gate the (memory-heavy) dedup set on nlink>1: single-link files
+                        // cannot be double-counted, so skipping the insert saves both RAM
+                        // and a concurrent DashSet write for the common case.
+                        // Key: (ino, dev) on local FS; (stx_ino, stx_mnt_id) on NFS where
+                        // st_dev is unstable (see hardlink_key). On NFS we still dedup
+                        // nlink>1 files to handle re-exports / snapshots where nlink is reliable.
+                        if nlink > 1 {
+                            if debug {
+                                state.prof_dedup_checks.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if !hardlinks_shared.insert(dedup_key) {
+                                return WalkState::Continue;
+                            }
                         }
 
                         // st_blocks * 512 = actual on-disk bytes consumed
                         // (allocated blocks, like `du`). This is the real disk
                         // usage of the file, including filesystem slack — the
                         // same number `du` and df-level accounting use.
-                        let size = meta.blocks() * 512;
-                        let uid = meta.uid();
                         let is_target = match &state.target_uids {
                             Some(set) => set.contains(&uid),
                             None => true,
@@ -754,10 +886,6 @@ pub(crate) fn run_scan_core(
                     WalkState::Continue
                 })
             });
-
-        // The DoneGuard above already flips `done` on drop; this explicit
-        // store is redundant but harmless and keeps the happy-path obvious.
-        d_clone.store(true, Ordering::SeqCst);
     });
 
     // --- Main thread: progress display + KeyboardInterrupt polling ---
@@ -826,7 +954,7 @@ pub(crate) fn run_scan_core(
         let flush_s = prof_flush_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
         let flush_bytes = prof_flush_bytes.load(Ordering::Relaxed);
         let flush_count = prof_flush_count.load(Ordering::Relaxed);
-        let hardlink_checks = prof_hardlink_checks.load(Ordering::Relaxed);
+        let dedup_checks = prof_dedup_checks.load(Ordering::Relaxed);
         let max_buf_records = prof_max_event_buf_records.load(Ordering::Relaxed);
         let max_buf_bytes = prof_max_event_buf_bytes.load(Ordering::Relaxed);
         let hardlink_set_size = hardlink_inodes_profile.len();
@@ -842,7 +970,7 @@ pub(crate) fn run_scan_core(
         println!("  TSV flush time:     {:.2}s aggregate", flush_s);
         println!("  TSV flushes:        {}", format_num(flush_count));
         println!("  TSV bytes approx:   {}", format_size(flush_bytes));
-        println!("  Hardlink checks:    {}", format_num(hardlink_checks));
+        println!("  Dedup checks:       {}", format_num(dedup_checks));
         println!(
             "  Max event buffer:   {} records / {}",
             format_num(max_buf_records),

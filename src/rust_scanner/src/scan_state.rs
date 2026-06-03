@@ -47,7 +47,7 @@ pub(crate) struct ThreadLocalState {
     pub(crate) prof_flush_ns: Arc<AtomicU64>,
     pub(crate) prof_flush_bytes: Arc<AtomicU64>,
     pub(crate) prof_flush_count: Arc<AtomicU64>,
-    pub(crate) prof_hardlink_checks: Arc<AtomicU64>,
+    pub(crate) prof_dedup_checks: Arc<AtomicU64>,
     pub(crate) prof_max_event_buf_records: Arc<AtomicU64>,
     pub(crate) prof_max_event_buf_bytes: Arc<AtomicU64>,
     pub(crate) perm_writer: Option<BufWriter<fs::File>>,
