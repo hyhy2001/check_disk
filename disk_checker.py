@@ -199,6 +199,7 @@ def _prepare_run_config(args, config_manager: ConfigManager) -> dict:
     config["output_prefix"] = output_prefix
     config["output_date_suffix"] = output_date
     config["debug"] = getattr(args, "debug", False)
+    config["apparent_size"] = getattr(args, "apparent_size", False)
 
     if getattr(args, "dir", None):
         config["directory"] = args.dir

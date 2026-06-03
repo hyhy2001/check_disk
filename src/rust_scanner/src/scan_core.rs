@@ -350,6 +350,7 @@ pub(crate) fn run_scan_core(
     max_workers: Option<usize>,
     debug: bool,
     engine: &str,
+    apparent_size: bool,
 ) -> PyResult<PyObject> {
     let _tmpdir = tempfile::Builder::new()
         .prefix("checkdisk_rust_")
@@ -391,6 +392,14 @@ pub(crate) fn run_scan_core(
             "[SCAN] Scan root is on NFS — using statx(ino, mnt_id) for hardlink \
              dedup (st_dev is unstable on NFS)"
         );
+    }
+    if apparent_size {
+        eprintln!(
+            "[SCAN] Size mode: apparent size (st_size, file content bytes) — \
+             ignoring on-disk slack space"
+        );
+    } else {
+        eprintln!("[SCAN] Size mode: on-disk blocks (st_blocks*512, like du)");
     }
     let (bind_raw, kernfs_raw, child_mount_raw) = build_mount_skip_sets(&directory);
     if !bind_raw.is_empty() {
@@ -688,8 +697,18 @@ pub(crate) fn run_scan_core(
                             }
                         }
 
-                        // st_blocks * 512 = actual on-disk bytes, same as Python legacy
-                        let size = meta.blocks() * 512;
+                        // Size accounting mode:
+                        //  - default: st_blocks * 512 = actual on-disk bytes
+                        //    (allocated blocks, like `du`). On filesystems with
+                        //    large block sizes + many tiny files this includes
+                        //    slack space and can far exceed file contents.
+                        //  - apparent_size: st_size = logical file content bytes
+                        //    (like `du --apparent-size`), ignoring slack.
+                        let size = if apparent_size {
+                            meta.size()
+                        } else {
+                            meta.blocks() * 512
+                        };
                         let uid = meta.uid();
                         let is_target = match &state.target_uids {
                             Some(set) => set.contains(&uid),

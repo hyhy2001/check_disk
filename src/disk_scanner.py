@@ -157,8 +157,9 @@ class DiskScanner:
         """Call into the Rust extension and return (result_dict, duration_seconds)."""
         print("Calling fast_scanner.scan_disk()...")
         start = time.time()
+        apparent_size = bool(self.config.get("apparent_size", False))
         result = fast_scanner.scan_disk(
-            directory, skip_dirs, target_uids, self.max_workers, self.debug
+            directory, skip_dirs, target_uids, self.max_workers, self.debug, apparent_size
         )
         return result, time.time() - start
 

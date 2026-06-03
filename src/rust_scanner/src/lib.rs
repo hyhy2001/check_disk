@@ -27,7 +27,7 @@ pub(crate) fn sanitise_path(raw: &str) -> String {
         .collect()
 }
 
-#[pyfunction(signature = (directory, skip_dirs, target_uids, max_workers=None, debug=false))]
+#[pyfunction(signature = (directory, skip_dirs, target_uids, max_workers=None, debug=false, apparent_size=false))]
 fn scan_disk(
     py: Python,
     directory: String,
@@ -35,6 +35,7 @@ fn scan_disk(
     target_uids: Option<Vec<u32>>,
     max_workers: Option<usize>,
     debug: bool,
+    apparent_size: bool,
 ) -> PyResult<PyObject> {
     scan_core::run_scan_core(
         py,
@@ -44,6 +45,7 @@ fn scan_disk(
         max_workers,
         debug,
         "production",
+        apparent_size,
     )
 }
 
