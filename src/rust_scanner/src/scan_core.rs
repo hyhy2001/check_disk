@@ -298,6 +298,22 @@ mod mount_skip_tests {
     }
 
     #[test]
+    fn deep_source_and_deep_bind_both_in_root() {
+        // The case the user asked about: the SOURCE lives deep inside the scan
+        // (/scan/a/source) and is bind-mounted to another deep location inside
+        // the same scan (/scan/b/mirror). mountinfo field 4 (fs_root) is the
+        // in-filesystem sub-path, identical for source and its bind mount.
+        // Expected: count the source once, skip the mirror. Net total correct.
+        let mi = "\
+50 2 0:60 /a/source /scan/a/source rw shared:7 - ext4 /dev/sde rw
+51 2 0:60 /a/source /scan/b/mirror rw shared:7 - ext4 /dev/sde rw";
+        let skip = child_bind_dups_to_skip(mi, "/scan");
+        assert!(skip.contains("/scan/b/mirror"), "duplicate mirror must be skipped");
+        assert!(!skip.contains("/scan/a/source"), "the source copy must be kept");
+        assert_eq!(skip.len(), 1);
+    }
+
+    #[test]
     fn under_root_matches_only_path_boundary() {
         // "/projects/big" must NOT match "/projects/big_sumo_disk".
         assert!(!mount_is_under_root("/projects/big_sumo_disk", "/projects/big"));
