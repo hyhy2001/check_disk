@@ -46,21 +46,84 @@ fn is_kernfs_path(path: &std::path::Path) -> bool {
     }
 }
 
+/// True if `mp` is the scan root itself or a descendant path of it.
+/// Scanning "/" treats every mount as a descendant.
+fn mount_is_under_root(mp: &str, root_norm: &str) -> bool {
+    if root_norm.is_empty() || root_norm == "/" {
+        return true;
+    }
+    mp == root_norm || mp.starts_with(&format!("{}/", root_norm))
+}
+
+/// Pure mountinfo analysis: given the raw `/proc/self/mountinfo` text and the
+/// scan root, return the set of mount points STRICTLY under the root that are
+/// bind-mount duplicates of an already-seen source `(major:minor, fs_root)`.
+/// These must be skipped so their bytes are counted exactly once. Kept pure
+/// (no syscalls) so it is unit-testable from fixture strings.
+fn child_bind_dups_to_skip(mountinfo: &str, scan_root: &str) -> HashSet<String> {
+    let root_norm = scan_root.trim_end_matches('/');
+    let mut skip: HashSet<String> = HashSet::new();
+    // (major:minor, fs_root_subpath) -> first mount point that exposed it.
+    let mut origin: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+
+    for line in mountinfo.lines() {
+        // mountinfo: id pid major:minor root mount_point options...
+        //            [0] [1]   [2]       [3]  [4]
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let origin_key = (parts[2].to_string(), parts[3].to_string());
+        let mp = parts[4];
+        if origin.contains_key(&origin_key) {
+            // Second+ mount point of the same source bytes: a bind duplicate.
+            if mount_is_under_root(mp, root_norm) && mp != root_norm {
+                skip.insert(mp.to_string());
+            }
+        } else {
+            origin.insert(origin_key, mp.to_string());
+        }
+    }
+    skip
+}
+
 /// Read /proc/self/mountinfo and return:
 /// 1. Set of (dev, ino) for bind-mount duplicates
 /// 2. Set of mount-point paths on pseudo/virtual filesystems
-fn build_mount_skip_sets() -> (HashSet<(u64, u64)>, HashSet<String>) {
+/// 3. Set of mount-point paths strictly under `scan_root` that must be
+///    skipped outright to avoid double-counting. This covers bind mounts of
+///    a source tree that is already reachable elsewhere in the scan (same
+///    `major:minor` + filesystem-root sub-path seen at >1 mount point — the
+///    authoritative bind signal from mountinfo fields 3 and 4), as well as
+///    tmpfs/overlay/kernfs mounts that hang off the scan root. Without this,
+///    a source bind-mounted at N places is walked N times → N× inflated size.
+///
+/// `scan_root` is the directory being scanned; only mounts whose mount point
+/// is the root itself or a descendant of it are eligible for child-skip, so
+/// unrelated bind mounts elsewhere on the host never affect this scan.
+fn build_mount_skip_sets(
+    scan_root: &str,
+) -> (HashSet<(u64, u64)>, HashSet<String>, HashSet<String>) {
     let mut bind_set: HashSet<(u64, u64)> = HashSet::new();
     let mut kernfs_set: HashSet<String> = HashSet::new();
+    let mut child_mount_skip: HashSet<String> = HashSet::new();
 
     let content = match std_fs::read_to_string("/proc/self/mountinfo") {
         Ok(s) => s,
-        Err(_) => return (bind_set, kernfs_set),
+        Err(_) => return (bind_set, kernfs_set, child_mount_skip),
     };
+
+    let root_norm = scan_root.trim_end_matches('/');
+
+    // Bind-duplicate child mounts (pure analysis of the mountinfo text).
+    child_mount_skip = child_bind_dups_to_skip(&content, scan_root);
 
     let mut seen: std::collections::HashMap<(u64, u64), bool> = std::collections::HashMap::new();
 
     for line in content.lines() {
+        // mountinfo: id pid major:minor root mount_point options...
+        //            [0] [1]   [2]       [3]  [4]
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 5 { continue; }
         let mp = parts[4];
@@ -68,6 +131,11 @@ fn build_mount_skip_sets() -> (HashSet<(u64, u64)>, HashSet<String>) {
 
         if is_kernfs_path(path) {
             kernfs_set.insert(mp.to_string());
+            // A tmpfs/overlay/proc mount sitting *inside* the scan root is not
+            // real disk usage of this filesystem — skip its whole subtree.
+            if mount_is_under_root(mp, root_norm) && mp != root_norm {
+                child_mount_skip.insert(mp.to_string());
+            }
         }
 
         if let Ok(meta) = std_fs::metadata(mp) {
@@ -80,8 +148,49 @@ fn build_mount_skip_sets() -> (HashSet<(u64, u64)>, HashSet<String>) {
         }
     }
 
-    (bind_set, kernfs_set)
+    (bind_set, kernfs_set, child_mount_skip)
 }
+
+#[cfg(test)]
+mod mount_skip_tests {
+    use super::*;
+
+    // Minimal mountinfo lines: "id pid major:minor root mount_point opts fstype..."
+    // Only fields 3 (major:minor), 4 (root), 5 (mount_point) matter here.
+    const FIXTURE: &str = "\
+21 20 0:20 / /projects/big_sumo_disk rw shared:1 - ext4 /dev/sdb rw
+22 21 0:20 / /projects/big_sumo_disk/portal rw shared:1 - ext4 /dev/sdb rw
+23 21 0:20 / /none rw shared:1 - ext4 /dev/sdb rw
+24 21 0:99 / /projects/big_sumo_disk/cache rw - tmpfs tmpfs rw";
+
+    #[test]
+    fn skips_bind_duplicate_under_root_keeps_first() {
+        let skip = child_bind_dups_to_skip(FIXTURE, "/projects/big_sumo_disk");
+        // The bind duplicate of the same source under the root is skipped...
+        assert!(skip.contains("/projects/big_sumo_disk/portal"));
+        // ...the first/source mount (the root itself) is NOT skipped...
+        assert!(!skip.contains("/projects/big_sumo_disk"));
+        // ...and a duplicate mounted OUTSIDE the scan root is ignored.
+        assert!(!skip.contains("/none"));
+    }
+
+    #[test]
+    fn unrelated_root_skips_nothing() {
+        let skip = child_bind_dups_to_skip(FIXTURE, "/data/other");
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn under_root_matches_only_path_boundary() {
+        // "/projects/big" must NOT match "/projects/big_sumo_disk".
+        assert!(!mount_is_under_root("/projects/big_sumo_disk", "/projects/big"));
+        assert!(mount_is_under_root("/projects/big_sumo_disk/x", "/projects/big_sumo_disk"));
+        assert!(mount_is_under_root("/projects/big_sumo_disk", "/projects/big_sumo_disk"));
+        // Scanning "/" makes everything a descendant.
+        assert!(mount_is_under_root("/anything", "/"));
+    }
+}
+
 
 use crate::scan_constants::{
     CRITICAL_SKIP_NAMES, SCAN_EVENT_FLUSH_BYTES_THRESHOLD, SCAN_EVENT_FLUSH_THRESHOLD,
@@ -131,12 +240,23 @@ pub(crate) fn run_scan_core(
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
-    let (bind_raw, kernfs_raw) = build_mount_skip_sets();
+    let (bind_raw, kernfs_raw, child_mount_raw) = build_mount_skip_sets(&directory);
     if !bind_raw.is_empty() {
         eprintln!(
             "[SCAN] Detected {} bind mount destination(s) (will skip duplicates)",
             bind_raw.len()
         );
+    }
+    if !child_mount_raw.is_empty() {
+        eprintln!(
+            "[SCAN] Detected {} nested mount(s) under scan root (will skip to avoid double-counting):",
+            child_mount_raw.len()
+        );
+        let mut sorted: Vec<&String> = child_mount_raw.iter().collect();
+        sorted.sort();
+        for mp in sorted {
+            eprintln!("[SCAN]   skip nested mount: {}", mp);
+        }
     }
     if !kernfs_raw.is_empty() {
         eprintln!(
@@ -146,8 +266,10 @@ pub(crate) fn run_scan_core(
     }
     let bind_mount_set: Arc<HashSet<(u64, u64)>> = Arc::new(bind_raw);
     let kernfs_set: Arc<HashSet<String>> = Arc::new(kernfs_raw);
+    let child_mount_set: Arc<HashSet<String>> = Arc::new(child_mount_raw);
     let bind_mount_clone = bind_mount_set.clone();
     let kernfs_clone = kernfs_set.clone();
+    let child_mount_clone = child_mount_set.clone();
 
     let g_clone = global_stats.clone();
     let pf_clone = prog_files.clone();
@@ -253,6 +375,7 @@ pub(crate) fn run_scan_core(
                 let hardlinks_shared = hardlink_inodes.clone();
                 let bind_mount = bind_mount_clone.clone();
                 let kernfs = kernfs_clone.clone();
+                let child_mount = child_mount_clone.clone();
                 let visited_dirs = visited_dirs_clone.clone();
 
                 Box::new(move |entry_res| {
@@ -283,6 +406,21 @@ pub(crate) fn run_scan_core(
                     for s in &skips {
                         if path.starts_with(s) {
                             return WalkState::Skip;
+                        }
+                    }
+
+                    // --- Nested-mount skip (bind/tmpfs/overlay duplicates) ---
+                    // A source tree bind-mounted at multiple points under the
+                    // scan root would otherwise be walked once per mount point,
+                    // inflating total size by N×. `child_mount` holds the
+                    // duplicate mount points (computed from /proc/self/mountinfo)
+                    // whose bytes are already counted via their first mount.
+                    // Prune the whole subtree here, before any metadata work.
+                    if !child_mount.is_empty() {
+                        if let Some(path_str) = path.to_str() {
+                            if child_mount.contains(path_str) {
+                                return WalkState::Skip;
+                            }
                         }
                     }
 
