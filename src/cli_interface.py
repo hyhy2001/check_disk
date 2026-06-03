@@ -62,7 +62,6 @@ class CLIInterface:
         scan_group.add_argument("--webhook-url", metavar="URL", help="MS Teams Workflow Webhook URL to send a notification after scanning")
         scan_group.add_argument("--tree-map", action="store_true", help="Build TreeMap database (use with --run; tune depth via --level).")
         scan_group.add_argument("--level", type=int, default=3, help="Depth level for --tree-map or --tree-show (default: 3)")
-        scan_group.add_argument("--apparent-size", action="store_true", help="Measure file content size (st_size) instead of on-disk blocks (st_blocks*512). Ignores filesystem slack space; useful on NFS/large-block filesystems where allocated size far exceeds real content.")
 
         # Sync commands
         sync_group.add_argument("--sync", action="store_true", help="Enable remote sync of reports over SSH")

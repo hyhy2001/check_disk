@@ -350,7 +350,6 @@ pub(crate) fn run_scan_core(
     max_workers: Option<usize>,
     debug: bool,
     engine: &str,
-    apparent_size: bool,
 ) -> PyResult<PyObject> {
     let _tmpdir = tempfile::Builder::new()
         .prefix("checkdisk_rust_")
@@ -393,14 +392,10 @@ pub(crate) fn run_scan_core(
              dedup (st_dev is unstable on NFS)"
         );
     }
-    if apparent_size {
-        eprintln!(
-            "[SCAN] Size mode: apparent size (st_size, file content bytes) — \
-             ignoring on-disk slack space"
-        );
-    } else {
-        eprintln!("[SCAN] Size mode: on-disk blocks (st_blocks*512, like du)");
-    }
+    eprintln!(
+        "[SCAN] Size mode: min(st_size, st_blocks*512) — real usage, \
+         dedup applied to every file"
+    );
     let (bind_raw, kernfs_raw, child_mount_raw) = build_mount_skip_sets(&directory);
     if !bind_raw.is_empty() {
         eprintln!(
@@ -683,32 +678,41 @@ pub(crate) fn run_scan_core(
                             }
                         };
 
-                        // --- Hard-link deduplication ---
-                        if meta.nlink() > 1 {
-                            if debug {
-                                state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // (ino, dev) on local FS; (stx_ino, stx_mnt_id) on
-                            // NFS where st_dev is unstable. Counting the same
-                            // inode twice is what inflated total size vs df.
-                            let key = hardlink_key(path, meta.ino(), meta.dev(), use_statx_dedup);
-                            if !hardlinks_shared.insert(key) {
-                                return WalkState::Continue;
-                            }
+                        // --- Deduplication (every regular file) ---
+                        // We dedup ALL files by identity, not just nlink>1.
+                        // Reasons:
+                        //  - NFS can report nlink==1 for files that are in fact
+                        //    reachable via multiple paths (re-export, snapshots),
+                        //    so an nlink>1 gate misses real duplicates.
+                        //  - The same inode reached twice via a duplicate mount /
+                        //    bind / re-export must be counted once.
+                        // Key: (ino, dev) on local FS; (stx_ino, stx_mnt_id) on
+                        // NFS where st_dev is unstable (see hardlink_key).
+                        // Cost: the dedup set holds one entry per unique file —
+                        // ~16 bytes each, so tens of millions of files use
+                        // several GB of RAM. This is the intended trade-off to
+                        // make totals match reality on NFS.
+                        if debug {
+                            state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let dedup_key =
+                            hardlink_key(path, meta.ino(), meta.dev(), use_statx_dedup);
+                        if !hardlinks_shared.insert(dedup_key) {
+                            return WalkState::Continue;
                         }
 
-                        // Size accounting mode:
-                        //  - default: st_blocks * 512 = actual on-disk bytes
-                        //    (allocated blocks, like `du`). On filesystems with
-                        //    large block sizes + many tiny files this includes
-                        //    slack space and can far exceed file contents.
-                        //  - apparent_size: st_size = logical file content bytes
-                        //    (like `du --apparent-size`), ignoring slack.
-                        let size = if apparent_size {
-                            meta.size()
-                        } else {
-                            meta.blocks() * 512
-                        };
+                        // Size = min(apparent, allocated):
+                        //  - st_size      = logical file content (apparent)
+                        //  - st_blocks*512 = on-disk allocated bytes
+                        // Taking the smaller of the two:
+                        //  - sparse files (st_size >> allocated) count only the
+                        //    blocks actually on disk, not the nominal size;
+                        //  - normal files with slack (allocated > st_size) count
+                        //    real content, not rounded-up block allocation that
+                        //    NFS/large-block filesystems inflate.
+                        // This is what `du` effectively reports as real usage and
+                        // keeps the total close to actual data on disk.
+                        let size = std::cmp::min(meta.size(), meta.blocks() * 512);
                         let uid = meta.uid();
                         let is_target = match &state.target_uids {
                             Some(set) => set.contains(&uid),
