@@ -46,6 +46,76 @@ fn is_kernfs_path(path: &std::path::Path) -> bool {
     }
 }
 
+/// NFS superblock magic numbers (`f_type` from statfs). NFSv2/3/4 all report
+/// the same magic. Used to decide whether hardlink dedup must fall back to a
+/// statx-based key, because NFS clients hand out unstable/anonymous `st_dev`
+/// values — the same inode reached via two paths can report different `st_dev`,
+/// so the legacy `(ino, dev)` key fails to collapse hardlinks and the file's
+/// bytes get counted more than once (df-vs-scan size inflation).
+const NFS_SUPER_MAGIC: i64 = 0x6969;
+
+/// True when `path` lives on an NFS mount (statfs f_type == NFS magic).
+/// Determined once at the scan root, not per file.
+fn is_nfs_path(path: &str) -> bool {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    let c_path = match CString::new(path.as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    unsafe {
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        if libc::statfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return false;
+        }
+        let fs = buf.assume_init();
+        (fs.f_type as i64) == NFS_SUPER_MAGIC
+    }
+}
+
+/// Stable hardlink-dedup key for one file, robust on NFS.
+///
+/// On a normal local filesystem `(st_ino, st_dev)` uniquely identifies an
+/// inode, so we use it directly. On NFS, `st_dev` is an anonymous client-side
+/// value that is not guaranteed stable across paths/mounts, which breaks the
+/// dedup set. When `use_statx` is set we instead query `statx()` and key on
+/// `(stx_ino, stx_mnt_id)`: the mount id is stable for the duration of the
+/// scan, giving a reliable identity. If the `statx` syscall is unavailable
+/// (very old kernel) we fall back to `(ino, dev)`.
+fn hardlink_key(path: &std::path::Path, ino: u64, dev: u64, use_statx: bool) -> (u64, u64) {
+    if !use_statx {
+        return (ino, dev);
+    }
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return (ino, dev),
+    };
+    unsafe {
+        let mut stx = MaybeUninit::<libc::statx>::uninit();
+        let rc = libc::statx(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_DONT_SYNC,
+            (libc::STATX_INO | libc::STATX_MNT_ID) as u32,
+            stx.as_mut_ptr(),
+        );
+        if rc != 0 {
+            return (ino, dev); // statx unsupported / failed: keep legacy key
+        }
+        let s = stx.assume_init();
+        // stx_mnt_id is only valid if the kernel set STATX_MNT_ID in the mask.
+        let mnt_id = if (s.stx_mask & libc::STATX_MNT_ID) != 0 {
+            s.stx_mnt_id
+        } else {
+            dev // mnt_id unavailable: degrade to dev, still better than nothing
+        };
+        (s.stx_ino, mnt_id)
+    }
+}
+
 /// True if `mp` is the scan root itself or a descendant path of it.
 /// Scanning "/" treats every mount as a descendant.
 fn mount_is_under_root(mp: &str, root_norm: &str) -> bool {
@@ -189,6 +259,15 @@ mod mount_skip_tests {
         // Scanning "/" makes everything a descendant.
         assert!(mount_is_under_root("/anything", "/"));
     }
+
+    #[test]
+    fn hardlink_key_local_uses_ino_dev() {
+        // On a local FS (use_statx = false) the key must be exactly (ino, dev),
+        // unchanged from legacy behavior — no syscall, deterministic.
+        let p = std::path::Path::new("/tmp/whatever");
+        assert_eq!(hardlink_key(p, 42, 7, false), (42, 7));
+        assert_eq!(hardlink_key(p, 0, 0, false), (0, 0));
+    }
 }
 
 
@@ -240,6 +319,16 @@ pub(crate) fn run_scan_core(
 
     // Determine root device for cross-device check (NFS, snapshots, bind-mounts)
     let root_dev: Option<u64> = fs::metadata(&directory).ok().map(|m| m.dev());
+    // On NFS, st_dev is unstable, so hardlink dedup keyed on (ino, dev) leaks
+    // and inflates total size. Detect NFS once here and switch dedup to a
+    // statx-based key for the whole scan.
+    let use_statx_dedup = is_nfs_path(&directory);
+    if use_statx_dedup {
+        eprintln!(
+            "[SCAN] Scan root is on NFS — using statx(ino, mnt_id) for hardlink \
+             dedup (st_dev is unstable on NFS)"
+        );
+    }
     let (bind_raw, kernfs_raw, child_mount_raw) = build_mount_skip_sets(&directory);
     if !bind_raw.is_empty() {
         eprintln!(
@@ -527,7 +616,10 @@ pub(crate) fn run_scan_core(
                             if debug {
                                 state.prof_hardlink_checks.fetch_add(1, Ordering::Relaxed);
                             }
-                            let key = (meta.ino(), meta.dev());
+                            // (ino, dev) on local FS; (stx_ino, stx_mnt_id) on
+                            // NFS where st_dev is unstable. Counting the same
+                            // inode twice is what inflated total size vs df.
+                            let key = hardlink_key(path, meta.ino(), meta.dev(), use_statx_dedup);
                             if !hardlinks_shared.insert(key) {
                                 return WalkState::Continue;
                             }
