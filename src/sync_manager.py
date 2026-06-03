@@ -309,7 +309,20 @@ class ReportSyncer:
             # Snapshot the file to a temp location so atomic rewrites by other
             # threads (e.g. heartbeat updating scan_status.json every 5s)
             # don't change the file mid-read.
-            snapshot_dir = tempfile.mkdtemp(prefix="checkdisk_sync_")
+            #
+            # Create the snapshot NEXT TO the source file (same filesystem as
+            # the report output dir) rather than in /tmp. On scans of very large
+            # disks, sibling files like permission_issues.db can reach several
+            # GB; copying them into a small /tmp fills it and aborts the sync
+            # with "No space left on device". The output dir is sized for the
+            # reports, so it has room. Fall back to the default temp dir only if
+            # the local dir is not writable.
+            try:
+                snapshot_dir = tempfile.mkdtemp(
+                    prefix=".checkdisk_sync_", dir=os.path.dirname(file_abs)
+                )
+            except OSError:
+                snapshot_dir = tempfile.mkdtemp(prefix="checkdisk_sync_")
             snapshot_path = os.path.join(snapshot_dir, basename)
             try:
                 shutil.copy2(file_abs, snapshot_path)
