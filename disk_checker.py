@@ -296,22 +296,30 @@ def _cleanup_detail_tmpdir(scan_results) -> None:
 
 
 def _cleanup_orphan_tmpdirs() -> None:
-    """Remove leftover ``checkdisk_rust_*`` dirs from previously crashed runs.
+    """Remove leftover ``checkdisk_rust_*`` / ``checkdisk_sync_*`` dirs from
+    previously crashed runs.
 
     The Rust scanner persists its temp directory and relies on Python to
-    delete it. If Python is killed mid-scan, the dir leaks and accumulates.
-    Sweep at the start of each ``--run`` so /tmp doesn't fill up over time.
+    delete it; the sync pipeline also snapshots files into temp dirs before
+    transfer. If Python is killed mid-scan (or a sync snapshot falls back to
+    /tmp and leaks), these dirs accumulate. Sweep at the start of each
+    ``--run`` so /tmp doesn't fill up over time.
     """
     base = tempfile.gettempdir()
-    pattern = os.path.join(base, "checkdisk_rust_*")
-    for path in _glob.glob(pattern):
-        if not os.path.isdir(path):
-            continue
-        try:
-            shutil.rmtree(path)
-        except OSError:
-            # Another live scan may own this dir; skip silently.
-            pass
+    patterns = (
+        os.path.join(base, "checkdisk_rust_*"),
+        os.path.join(base, "checkdisk_sync_*"),
+        os.path.join(base, ".checkdisk_sync_*"),
+    )
+    for pattern in patterns:
+        for path in _glob.glob(pattern):
+            if not os.path.isdir(path):
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                # Another live scan may own this dir; skip silently.
+                pass
 
 
 def cmd_run(args, config_manager: ConfigManager) -> None:
