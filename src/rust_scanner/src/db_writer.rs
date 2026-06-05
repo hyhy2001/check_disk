@@ -104,7 +104,9 @@ CREATE TABLE file_names (
 -- id = dir entity id (same dir shared across users).
 -- uid = file owner who has files inside this dir.
 -- path = pre-computed full path e.g. '/var/log/apache2'.
--- owner_uid = owner of the directory entry itself (from stat).
+-- owner_uid = reserved placeholder, always 0 (not populated; the dashboard
+--             never reads it). The real directory inode owner lives in
+--             treemap.db's dirs.owner_uid.
 -- size = total size of uid's files in this dir.
 -- files = count of uid's files in this dir.
 CREATE TABLE dirs (
