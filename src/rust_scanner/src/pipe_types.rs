@@ -46,6 +46,11 @@ pub struct DirAggEvent {
     pub path: String,
 }
 
+pub struct DirOwnerEvent {
+    pub uid: u32,
+    pub path: String,
+}
+
 /// Parse a scan event line from TSV (F\tuid\tsize\tpath)
 /// Parse a permission issue line from TSV (P\tuid\tkind\terrcode\tpath)
 pub fn parse_permission_line(line: &str) -> Option<PermissionEvent> {

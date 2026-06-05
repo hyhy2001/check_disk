@@ -336,6 +336,8 @@ users       — uid, username, team_id, total_files, total_dirs, total_size, per
 file_names  — id, name (unique file basename dictionary)
 dirs        — id, uid, parent_id, path (pre-computed absolute), owner_uid, size, files
               PRIMARY KEY (id, uid) — one row per (dir entity, user) pair
+              owner_uid — reserved placeholder, currently always 0 (not populated; the
+              dashboard does not read it). Real dir-owner lives in treemap.db.
 files       — dir_id, name_id, ext (inline TEXT), uid, size
               no surrogate id
 ```
@@ -360,6 +362,10 @@ Cursor pagination: files cursor = `{size, dir_id, name_id}`, dirs cursor = `{siz
 | `dirs` | id, parent_id, name_id, total_size, file_count, dir_count, owner_uid, has_files |
 | `owners` | uid → username |
 
+`owner_uid` is the directory's **real inode owner** (`st_uid` from the Phase 1 walk),
+resolved to a username via the `owners` table — not the user who consumes the most space
+inside the directory. Directories that could not be stat'd fall back to the smallest known uid.
+
 ---
 
 ## Architecture
@@ -380,7 +386,7 @@ Python: write summary JSON reports
 Phase 2: Rust detail pipeline (Rayon)
   → compact spill re-encoding (18 bytes/row)
   → path tree assembly
-  → data_detail.db (files, dirs[path pre-computed], top_files, ...)
+  → data_detail.db (files, dirs[path pre-computed], ...)
   → persist treemap aggregates (aggregates.bin.zst)  [only with --tree-map]
          │
          ▼

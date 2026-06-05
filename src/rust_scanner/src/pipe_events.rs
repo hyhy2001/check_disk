@@ -4,8 +4,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use crate::pipe_types::{parse_permission_line, DirAggEvent, PermissionEvent, ScanEvent};
-use crate::scan_constants::{BIN_MAGIC_LEN, DIR_AGG_BIN_MAGIC_V1, SCAN_EVENT_BIN_MAGIC_V1};
+use crate::pipe_types::{parse_permission_line, DirAggEvent, DirOwnerEvent, PermissionEvent, ScanEvent};
+use crate::scan_constants::{BIN_MAGIC_LEN, DIR_AGG_BIN_MAGIC_V1, DIR_OWNER_BIN_MAGIC_V1, SCAN_EVENT_BIN_MAGIC_V1};
 
 fn prepare_bin_reader(
     path: &std::path::Path,
@@ -125,6 +125,50 @@ where
         on_event(DirAggEvent {
             uid,
             size,
+            path: path_str,
+        });
+    }
+    Ok(())
+}
+
+pub fn get_dir_owner_files(tmpdir: &str) -> PyResult<Vec<PathBuf>> {
+    let pattern = format!("{}/dirowner_t*.bin", tmpdir);
+    let mut paths: Vec<PathBuf> = glob::glob(&pattern)
+        .map_err(|e| PyRuntimeError::new_err(format!("glob dirowner: {}", e)))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+pub fn for_each_dir_owner_in_file<F>(path: &std::path::Path, mut on_event: F) -> PyResult<()>
+where
+    F: FnMut(DirOwnerEvent),
+{
+    let mut reader = prepare_bin_reader(path, &DIR_OWNER_BIN_MAGIC_V1)?;
+    // Record format: [uid:u32 LE][path_len:u32 LE][path_bytes]
+    let mut header = [0u8; 8];
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "read dirowner {}: {}",
+                    path.display(),
+                    e
+                )));
+            }
+        }
+        let uid = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let path_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let mut path_bytes = vec![0u8; path_len];
+        reader.read_exact(&mut path_bytes).map_err(|e| {
+            PyRuntimeError::new_err(format!("read dirowner path {}: {}", path.display(), e))
+        })?;
+        let path_str = String::from_utf8_lossy(&path_bytes).to_string();
+        on_event(DirOwnerEvent {
+            uid,
             path: path_str,
         });
     }

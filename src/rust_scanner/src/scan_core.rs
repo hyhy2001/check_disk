@@ -415,6 +415,7 @@ pub(crate) fn run_scan_core(
         uid_sizes: HashMap::new(),
         uid_files: HashMap::new(),
         permission_issues_count: 0,
+        dir_owner_uids: HashSet::new(),
     }));
     let prog_files = Arc::new(AtomicU64::new(0));
     let prog_dirs = Arc::new(AtomicU64::new(0));
@@ -557,6 +558,8 @@ pub(crate) fn run_scan_core(
                     t_uid_sizes: HashMap::with_capacity(256),
                     t_uid_files: HashMap::with_capacity(256),
                     t_dir_sizes: HashMap::with_capacity(50_000),
+                    t_dir_owners: HashMap::with_capacity(50_000),
+                    t_dir_owner_uids: HashSet::new(),
                     t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
                         .map(|_| Vec::with_capacity(1024 * 1024))
                         .collect(),
@@ -585,6 +588,7 @@ pub(crate) fn run_scan_core(
                     prof_max_event_buf_bytes: pmaxb_clone.clone(),
                     perm_writer: None,
                     dir_agg_writer: None,
+                    dir_owner_writer: None,
                 };
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
@@ -710,6 +714,11 @@ pub(crate) fn run_scan_core(
                             if !visited_dirs.insert(dir_dedup_key) {
                                 return WalkState::Skip;
                             }
+                            // Record the directory's own inode owner (st_uid).
+                            // We already paid for entry.metadata() above, so this
+                            // is free. Keyed on the dir's own path, which matches
+                            // the keys PathTree builds from file parent-paths.
+                            state.add_dir_owner(&path.to_string_lossy(), meta.uid());
                         } else if let Some(start) = meta_start {
                             state.prof_metadata_ns.fetch_add(
                                 start.elapsed().as_nanos() as u64,
@@ -940,6 +949,15 @@ pub(crate) fn run_scan_core(
         py_uid_files.set_item(uid, files)?;
     }
     result.set_item("uid_files", py_uid_files)?;
+
+    // Distinct uids that own a directory inode. Python resolves these to
+    // usernames so dir owners that own no files still get a real name in
+    // treemap.db's `owners` table (otherwise they'd fall back to "uid-N").
+    let py_dir_owner_uids = pyo3::types::PyList::empty(py);
+    for uid in &g.dir_owner_uids {
+        py_dir_owner_uids.append(uid)?;
+    }
+    result.set_item("dir_owner_uids", py_dir_owner_uids)?;
 
     result.set_item("permission_issues_count", g.permission_issues_count)?;
     result.set_item("engine", engine)?;

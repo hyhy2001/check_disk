@@ -16,8 +16,8 @@ use crate::db_writer::{
     FILE_INSERT_CHUNK,
 };
 use crate::pipe_events::{
-    for_each_dir_agg_in_file, for_each_scan_event_in_file, get_dir_agg_files, get_scan_event_files,
-    read_permission_events,
+    for_each_dir_agg_in_file, for_each_dir_owner_in_file, for_each_scan_event_in_file,
+    get_dir_agg_files, get_dir_owner_files, get_scan_event_files, read_permission_events,
 };
 use crate::pipe_io::{ensure_dir, recreate_dir};
 use crate::pipe_permission::write_permission_issues_db;
@@ -30,7 +30,7 @@ const ROW_SPILL_THRESHOLD: usize = 200_000;
 /// Production at 64MB still peaked at 9.5GB stage 1; estimate underestimates
 /// real RAM by ~2-3x due to Vec capacity slack and allocator overhead.
 const ROW_SPILL_BYTES: usize = 16 * 1024 * 1024;
-const TREEMAP_AGG_VERSION: u32 = 1;
+const TREEMAP_AGG_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TreemapAggregates {
@@ -38,6 +38,10 @@ pub(crate) struct TreemapAggregates {
     pub(crate) names: Vec<String>,
     pub(crate) dirs_in_order: Vec<SerializableDirRow>,
     pub(crate) owner_weights: Vec<(i64, i64, i64)>,
+    // Real directory inode owner (st_uid) per dir_id, dense 0..n_dirs, interned
+    // to the same uid space as owner_weights. Replaces the old "top user by
+    // size" heuristic. -1 = unknown (dir never stat'd, e.g. permission denied).
+    pub(crate) dir_owner_uid: Vec<i64>,
     pub(crate) subtree_size: Vec<i64>,
     pub(crate) subtree_files: Vec<i64>,
     pub(crate) direct_dir_count: Vec<i64>,
@@ -846,6 +850,36 @@ pub(crate) fn build_detail_db_impl(
         let mut user_dir_count: HashMap<i64, i64> = HashMap::new();
         let mut user_total_size_from_dirs: HashMap<i64, i64> = HashMap::new();
 
+        // Real directory inode owners captured in Phase 1 (dirowner_t*.bin).
+        // Map path -> dir_id (while dir_id_of is still alive), intern the owner
+        // username into the same uid space as owner_weights, and store a dense
+        // per-dir Vec. -1 = unknown (dir was never stat'd successfully).
+        let mut dir_owner_uid: Vec<i64> = vec![-1; n_dirs];
+        {
+            let owner_paths = get_dir_owner_files(&tmpdir).unwrap_or_default();
+            let mut ingested: u64 = 0;
+            for path in &owner_paths {
+                let _ = for_each_dir_owner_in_file(path, |event| {
+                    if let Some(&dir_id) = path_tree.dir_id_of.get(&event.path) {
+                        let username = uids_map
+                            .get(&event.uid)
+                            .cloned()
+                            .unwrap_or_else(|| format!("uid-{}", event.uid));
+                        let uid = intern_user(&username, &mut username_to_uid, &mut uid_to_username);
+                        let idx = dir_id as usize;
+                        if idx < dir_owner_uid.len() {
+                            dir_owner_uid[idx] = uid;
+                            ingested += 1;
+                        }
+                    }
+                });
+            }
+            if debug {
+                println!("[Phase 2] Ingested {} directory owners ({} spill files)",
+                    ingested, owner_paths.len());
+            }
+        }
+
         // Drain dir_sizes_by_user into dir_id-keyed form. The String keys are
         // dropped here (~7 MB demo / ~1.2 GB worst case) — owner aggregates
         // and downstream lookups go through dir_id only.
@@ -1276,6 +1310,7 @@ pub(crate) fn build_detail_db_impl(
                 names: std::mem::take(&mut path_tree.names),
                 dirs_in_order: dirs_serialized,
                 owner_weights: std::mem::take(&mut owner_weights),
+                dir_owner_uid: std::mem::take(&mut dir_owner_uid),
                 subtree_size: std::mem::take(&mut subtree_size),
                 subtree_files: std::mem::take(&mut subtree_files),
                 direct_dir_count: std::mem::take(&mut direct_dir_count),
@@ -1380,6 +1415,11 @@ pub(crate) fn build_treemap_db_impl(
     for &(_, uid, _) in &agg.owner_weights {
         all_uids.insert(uid);
     }
+    for &uid in &agg.dir_owner_uid {
+        if uid >= 0 {
+            all_uids.insert(uid);
+        }
+    }
     let mut owners: Vec<OwnerRow> = all_uids
         .into_iter()
         .filter_map(|uid| {
@@ -1396,25 +1436,16 @@ pub(crate) fn build_treemap_db_impl(
         if idx < v.len() { v[idx] } else { 0 }
     };
 
+    // Owner per dir = the directory's real inode owner (st_uid), captured in
+    // Phase 1 and interned in Phase 2. Unknown dirs (-1, e.g. never stat'd)
+    // fall back to the smallest known uid so the owners reference stays valid.
     let mut owner_uid_by_dir: Vec<i64> = vec![owner_uid_fallback; n_dirs];
-    {
-        let mut i = 0;
-        while i < agg.owner_weights.len() {
-            let dir_id = agg.owner_weights[i].0;
-            let mut best_uid = agg.owner_weights[i].1;
-            let mut best_size = agg.owner_weights[i].2;
-            let mut j = i + 1;
-            while j < agg.owner_weights.len() && agg.owner_weights[j].0 == dir_id {
-                if agg.owner_weights[j].2 > best_size {
-                    best_size = agg.owner_weights[j].2;
-                    best_uid = agg.owner_weights[j].1;
-                }
-                j += 1;
+    for (idx, slot) in owner_uid_by_dir.iter_mut().enumerate() {
+        if idx < agg.dir_owner_uid.len() {
+            let real = agg.dir_owner_uid[idx];
+            if real >= 0 {
+                *slot = real;
             }
-            if (dir_id as usize) < owner_uid_by_dir.len() {
-                owner_uid_by_dir[dir_id as usize] = best_uid;
-            }
-            i = j;
         }
     }
     let t_owners_done = t_owners.elapsed();

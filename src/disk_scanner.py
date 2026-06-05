@@ -187,6 +187,13 @@ class DiskScanner:
             uid = int(uid_str)
             if uid not in uid_cache:
                 uid_cache[uid] = get_username_from_uid(uid)
+        # Directory inode owners may own no files (absent from uid_sizes), yet
+        # the treemap shows them as the dir owner — resolve their names too so
+        # they don't fall back to "uid-N".
+        for uid_val in result.get("dir_owner_uids", []) or []:
+            uid = int(uid_val)
+            if uid not in uid_cache:
+                uid_cache[uid] = get_username_from_uid(uid)
         return uid_cache
 
     def _classify_usage(self, result: Dict[str, Any], uid_cache: Dict[int, str]):

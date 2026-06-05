@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::scan_constants::{DIR_AGG_BIN_MAGIC_V1, SCAN_EVENT_BIN_MAGIC_V1};
+use crate::scan_constants::{DIR_AGG_BIN_MAGIC_V1, DIR_OWNER_BIN_MAGIC_V1, SCAN_EVENT_BIN_MAGIC_V1};
 
 pub(crate) struct GlobalStats {
     pub(crate) total_files: u64,
@@ -16,6 +16,10 @@ pub(crate) struct GlobalStats {
     pub(crate) uid_sizes: HashMap<u32, u64>,
     pub(crate) uid_files: HashMap<u32, u64>,
     pub(crate) permission_issues_count: u64,
+    // Distinct uids that own a directory inode. Small set (one per uid, not per
+    // dir) — returned to Python so dir-owner usernames get resolved even when
+    // the owner owns no files (and thus never appears in uid_sizes).
+    pub(crate) dir_owner_uids: HashSet<u32>,
 }
 
 pub(crate) struct ThreadLocalState {
@@ -26,6 +30,8 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_uid_sizes: HashMap<u32, u64>,
     pub(crate) t_uid_files: HashMap<u32, u64>,
     pub(crate) t_dir_sizes: HashMap<(u32, String), i64>,
+    pub(crate) t_dir_owners: HashMap<String, u32>,
+    pub(crate) t_dir_owner_uids: HashSet<u32>,
     pub(crate) t_event_bin_bufs: Vec<Vec<u8>>,
     pub(crate) t_event_buf_records: Vec<usize>,
     pub(crate) t_event_flush_count: u32,
@@ -52,6 +58,7 @@ pub(crate) struct ThreadLocalState {
     pub(crate) prof_max_event_buf_bytes: Arc<AtomicU64>,
     pub(crate) perm_writer: Option<BufWriter<fs::File>>,
     pub(crate) dir_agg_writer: Option<BufWriter<fs::File>>,
+    pub(crate) dir_owner_writer: Option<BufWriter<fs::File>>,
 }
 
 impl ThreadLocalState {
@@ -118,6 +125,18 @@ impl ThreadLocalState {
         // Flushing at 50K entries keeps per-thread overhead <4 MB.
         if self.t_dir_sizes.len() >= Self::DIR_SIZES_FLUSH_THRESHOLD {
             self.flush_dir_aggregates();
+        }
+    }
+
+    pub(crate) fn add_dir_owner(&mut self, dir_path: &str, owner_uid: u32) {
+        self.t_dir_owners.insert(dir_path.to_string(), owner_uid);
+        self.t_dir_owner_uids.insert(owner_uid);
+
+        // Bound per-thread memory the same way add_dir_size does: one entry
+        // per directory, keyed on the dir's own path (not parent), so flush at
+        // the same threshold.
+        if self.t_dir_owners.len() >= Self::DIR_SIZES_FLUSH_THRESHOLD {
+            self.flush_dir_owners();
         }
     }
 
@@ -221,6 +240,34 @@ impl ThreadLocalState {
             }
         }
     }
+
+    pub(crate) fn flush_dir_owners(&mut self) {
+        if self.t_dir_owners.is_empty() {
+            return;
+        }
+        if self.dir_owner_writer.is_none() {
+            let fp = format!("{}/dirowner_t{}.bin", self.tmpdir, self.thread_id);
+            if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&fp) {
+                let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
+                let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, f);
+                if write_header {
+                    let _ = writer.write_all(&DIR_OWNER_BIN_MAGIC_V1);
+                }
+                self.dir_owner_writer = Some(writer);
+            }
+        }
+        if let Some(writer) = self.dir_owner_writer.as_mut() {
+            // Record format: [uid:u32 LE][path_len:u32 LE][path_bytes]
+            for (path, uid) in self.t_dir_owners.drain() {
+                let path_bytes = path.as_bytes();
+                let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
+                let safe_len = usize::try_from(len).unwrap_or(path_bytes.len());
+                let _ = writer.write_all(&uid.to_le_bytes());
+                let _ = writer.write_all(&len.to_le_bytes());
+                let _ = writer.write_all(&path_bytes[..safe_len.min(path_bytes.len())]);
+            }
+        }
+    }
 }
 
 impl Drop for ThreadLocalState {
@@ -228,6 +275,7 @@ impl Drop for ThreadLocalState {
         self.flush_progress();
         self.flush_events();
         self.flush_dir_aggregates();
+        self.flush_dir_owners();
         for writer in &mut self.event_bin_writers {
             if let Some(w) = writer.as_mut() {
                 let _ = w.flush();
@@ -237,6 +285,9 @@ impl Drop for ThreadLocalState {
             let _ = writer.flush();
         }
         if let Some(writer) = self.dir_agg_writer.as_mut() {
+            let _ = writer.flush();
+        }
+        if let Some(writer) = self.dir_owner_writer.as_mut() {
             let _ = writer.flush();
         }
 
@@ -250,6 +301,9 @@ impl Drop for ThreadLocalState {
             }
             for (uid, files) in &self.t_uid_files {
                 *g.uid_files.entry(*uid).or_insert(0) += files;
+            }
+            for uid in &self.t_dir_owner_uids {
+                g.dir_owner_uids.insert(*uid);
             }
             g.permission_issues_count += self.t_perm_issues;
         }
