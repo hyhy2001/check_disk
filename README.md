@@ -63,6 +63,7 @@ python3 scripts/export_user_reports.py \
 - Skips critical pseudo-mounts (`proc`, `sys`, `dev`, `.snapshot`, `.zfs`, `.nfs`) automatically.
 - Cross-device check prevents descending into bind mounts or NFS sub-mounts.
 - Hard-link dedup (`DashSet<(ino, dev)>`) avoids double-counting cross-linked bytes.
+- Captures each directory's own inode owner (`st_uid`) during the walk — reused for the treemap's per-directory owner (real owner, not the top space consumer).
 - Streams events to per-thread binary `.bin` spill files (uncompressed, 16MB BufWriter) in a temp dir.
 - Panic-safe: `DoneGuard` RAII ensures the progress loop never spins forever.
 
@@ -377,6 +378,7 @@ Phase 1: Rust scan (WalkBuilder, 64 workers)
   → /tmp/checkdisk_rust_*/scan_t*_b*.bin  (uncompressed binary events)
   → /tmp/.../perm_t*.tsv                  (permission errors)
   → /tmp/.../diragg_t*.bin                (dir aggregates)
+  → /tmp/.../dirowner_t*.bin              (dir inode owner: path → st_uid)
          │
          ▼
 Python: write summary JSON reports
