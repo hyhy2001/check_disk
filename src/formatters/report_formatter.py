@@ -64,13 +64,15 @@ class ReportFormatter(BaseFormatter):
             return table_text
         return self._apply_search_highlight(table_text, keyword)
 
-    def display_report_summary(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
+    def display_report_summary(
+        self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None
+    ) -> None:
         """Display a summary of a disk usage report."""
         print("\n" + "=" * 60)
         print("DISK USAGE REPORT SUMMARY")
         print("=" * 60)
         print(f"Directory: {report.get('directory', 'Unknown')}")
-        timestamp = report.get('date', 0)
+        timestamp = report.get("date", 0)
         if timestamp:
             print(f"Date: {format_timestamp(timestamp)}")
 
@@ -78,9 +80,9 @@ class ReportFormatter(BaseFormatter):
         self._display_system_info(report)
 
         # Display appropriate report sections based on report type
-        if 'check_users' in report:
+        if "check_users" in report:
             self._display_checked_users_report(report, report_path, filter_users)
-        elif 'top_user' in report:
+        elif "top_user" in report:
             self._display_top_users_report(report, report_path, filter_users)
         else:
             self._display_standard_report(report, report_path, filter_users)
@@ -89,101 +91,121 @@ class ReportFormatter(BaseFormatter):
 
     def _display_system_info(self, report: Dict[str, Any]) -> None:
         """Display general system information."""
-        system = report.get('general_system', {})
-        system.get('total', 1)
+        system = report.get("general_system", {})
+        system.get("total", 1)
 
         # Create a table for general system info
         headers = ["Metric", "Value", "Percentage"]
         rows = [
-            ["Total Capacity", format_size(system.get('total', 0)), "100%"],
-            ["Used Space", format_size(system.get('used', 0)), f"{system.get('used', 0) * 100 / system.get('total', 1):.1f}%"],
-            ["Available", format_size(system.get('available', 0)), f"{system.get('available', 0) * 100 / system.get('total', 1):.1f}%"]
+            ["Total Capacity", format_size(system.get("total", 0)), "100%"],
+            [
+                "Used Space",
+                format_size(system.get("used", 0)),
+                f"{system.get('used', 0) * 100 / system.get('total', 1):.1f}%",
+            ],
+            [
+                "Available",
+                format_size(system.get("available", 0)),
+                f"{system.get('available', 0) * 100 / system.get('total', 1):.1f}%",
+            ],
         ]
 
-        system_table = self.table_formatter.format_table(headers, rows, title="General System Information")
+        system_table = self.table_formatter.format_table(
+            headers, rows, title="General System Information"
+        )
         print(f"\n{system_table}")
 
-    def _display_checked_users_report(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
+    def _display_checked_users_report(
+        self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None
+    ) -> None:
         """Display checked users report."""
         # Create a table for checked users
         headers = ["Username", "Disk Usage", "Percent"]
         rows = []
 
-        user_usage = report.get('user_usage', [])
-        total_capacity = report.get('general_system', {}).get('total', 1)
+        user_usage = report.get("user_usage", [])
+        total_capacity = report.get("general_system", {}).get("total", 1)
 
         # Apply user filter if provided
         if filter_users:
-            user_usage = [u for u in user_usage if u['name'] in filter_users]
+            user_usage = [u for u in user_usage if u["name"] in filter_users]
 
-        for user in sorted(user_usage, key=lambda x: x.get('used', 0), reverse=True):
-            size = user.get('used', 0)
+        for user in sorted(user_usage, key=lambda x: x.get("used", 0), reverse=True):
+            size = user.get("used", 0)
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
-            rows.append([user['name'], format_size(size), f"{usage_bar} {percent:.1f}%"])
+            rows.append([user["name"], format_size(size), f"{usage_bar} {percent:.1f}%"])
 
         if rows:
             table = self.table_formatter.format_table(headers, rows, title="Checked Users")
             print("\n" + table)
 
-    def _display_top_users_report(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
+    def _display_top_users_report(
+        self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None
+    ) -> None:
         """Display top users report."""
-        total_capacity = report.get('general_system', {}).get('total', 1)
+        total_capacity = report.get("general_system", {}).get("total", 1)
 
         # Display top users
-        top_n   = report.get('top_user', 10)
-        min_use = report.get('min_usage', '')
-        title   = f'Top {top_n} Users' + (f' (min usage: {min_use})' if min_use else '')
+        top_n = report.get("top_user", 10)
+        min_use = report.get("min_usage", "")
+        title = f"Top {top_n} Users" + (f" (min usage: {min_use})" if min_use else "")
         self._display_user_usage_table(
-            report.get('user_usage', []),
-            total_capacity,
-            title,
-            filter_users
+            report.get("user_usage", []), total_capacity, title, filter_users
         )
 
         # Display other users
-        if 'other_usage' in report and report['other_usage']:
+        if "other_usage" in report and report["other_usage"]:
             self._display_user_usage_table(
-                report.get('other_usage', []),
+                report.get("other_usage", []),
                 total_capacity,
                 "Top Other Users (not in config)",
-                filter_users
+                filter_users,
             )
 
         # Display team usage if available
-        if 'team_usage' in report and report['team_usage']:
-            self._display_team_usage_table(report.get('team_usage', []), total_capacity)
+        if "team_usage" in report and report["team_usage"]:
+            self._display_team_usage_table(report.get("team_usage", []), total_capacity)
 
-    def _display_standard_report(self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None) -> None:
+    def _display_standard_report(
+        self, report: Dict[str, Any], report_path: str, filter_users: List[str] = None
+    ) -> None:
         """Display standard report with teams and users."""
-        total_capacity = report.get('general_system', {}).get('total', 1)
+        total_capacity = report.get("general_system", {}).get("total", 1)
 
         # Team usage
-        sorted_teams = sorted(report.get('team_usage', []), key=lambda x: x.get('used', 0), reverse=True)
+        sorted_teams = sorted(
+            report.get("team_usage", []), key=lambda x: x.get("used", 0), reverse=True
+        )
         if sorted_teams:
             self._display_team_usage_table(sorted_teams, total_capacity)
 
         # Top users - filter_users applied inside _display_user_usage_table
         user_usage = sorted(
-            report.get('user_usage', []),
-            key=lambda x: x.get('used', 0), reverse=True
+            report.get("user_usage", []), key=lambda x: x.get("used", 0), reverse=True
         )[:10]
         if user_usage:
             self._display_user_usage_table(user_usage, total_capacity, "Top Users", filter_users)
 
         # Other users - filter_users applied inside _display_user_usage_table
         other_usage = sorted(
-            report.get('other_usage', []),
-            key=lambda x: x.get('used', 0), reverse=True
+            report.get("other_usage", []), key=lambda x: x.get("used", 0), reverse=True
         )[:10]
         if other_usage:
-            self._display_user_usage_table(other_usage, total_capacity, "Top Other Users (not in config)", filter_users)
+            self._display_user_usage_table(
+                other_usage, total_capacity, "Top Other Users (not in config)", filter_users
+            )
 
-    def _display_user_usage_table(self, users: List[Dict[str, Any]], total_capacity: int,
-                                 title: str, filter_users: List[str] = None) -> None:
+    def _display_user_usage_table(
+        self,
+        users: List[Dict[str, Any]],
+        total_capacity: int,
+        title: str,
+        filter_users: List[str] = None,
+    ) -> None:
         """Display a table of user disk usage."""
         if filter_users:
-            users = [u for u in users if u['name'] in filter_users]
+            users = [u for u in users if u["name"] in filter_users]
 
         if not users:
             return
@@ -191,11 +213,11 @@ class ReportFormatter(BaseFormatter):
         headers = ["Username", "Disk Usage", "Percent"]
         rows = []
 
-        for user in sorted(users, key=lambda x: x.get('used', 0), reverse=True):
-            size = user.get('used', 0)
+        for user in sorted(users, key=lambda x: x.get("used", 0), reverse=True):
+            size = user.get("used", 0)
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
-            rows.append([user['name'], format_size(size), f"{usage_bar} {percent:.1f}%"])
+            rows.append([user["name"], format_size(size), f"{usage_bar} {percent:.1f}%"])
 
         table = self.table_formatter.format_table(headers, rows, title=title)
         print("\n" + table)
@@ -205,16 +227,21 @@ class ReportFormatter(BaseFormatter):
         headers = ["Team", "Disk Usage", "Percent"]
         rows = []
 
-        for team in sorted(teams, key=lambda x: x.get('used', 0), reverse=True):
-            size = team.get('used', 0)
+        for team in sorted(teams, key=lambda x: x.get("used", 0), reverse=True):
+            size = team.get("used", 0)
             percent = (size / total_capacity) * 100
             usage_bar = self._create_usage_bar(percent)
-            rows.append([team['name'], format_size(size), f"{usage_bar} {percent:.1f}%"])
+            rows.append([team["name"], format_size(size), f"{usage_bar} {percent:.1f}%"])
 
         table = self.table_formatter.format_table(headers, rows, title="Team Usage")
         print("\n" + table)
 
-    def compare_reports(self, reports: List[Tuple[str, Dict[str, Any]]], filter_users: List[str] = None, compare_by: str = "growth") -> None:
+    def compare_reports(
+        self,
+        reports: List[Tuple[str, Dict[str, Any]]],
+        filter_users: List[str] = None,
+        compare_by: str = "growth",
+    ) -> None:
         """Compare multiple reports and display a comparison table."""
         self.report_comparison.compare_reports(reports, filter_users, compare_by)
 
@@ -250,34 +277,34 @@ class ReportFormatter(BaseFormatter):
 
         # --- Directory breakdown ---
         if dir_report:
-            timestamp = dir_report.get('date', 0)
+            timestamp = dir_report.get("date", 0)
             if timestamp:
                 print(f"Date      : {format_timestamp(timestamp)}")
             print(f"Directory : {dir_report.get('directory', '')}")
             print(f"Total used: {format_size(dir_report.get('total_used', 0))}")
 
-            dirs = dir_report.get('dirs', [])
-            total_dirs = dir_report.get('total_dirs', len(dirs))
+            dirs = dir_report.get("dirs", [])
+            total_dirs = dir_report.get("total_dirs", len(dirs))
             display_dirs = dirs[:top]
             if display_dirs:
                 headers = ["Directory", "Used"]
-                rows = [[d['path'], format_size(d['used'])] for d in display_dirs]
+                rows = [[d["path"], format_size(d["used"])] for d in display_dirs]
                 title = f"Directory Breakdown (top {len(display_dirs)} of {total_dirs:,})"
                 table = self.table_formatter.format_table(headers, rows, title=title)
                 print("\n" + self._colorize_table(table, search))
 
         # --- File breakdown ---
         if file_report:
-            files = file_report.get('files', [])
-            total_files = file_report.get('total_files', len(files))
-            total_used  = file_report.get('total_used', 0)
+            files = file_report.get("files", [])
+            total_files = file_report.get("total_files", len(files))
+            total_used = file_report.get("total_used", 0)
             print(f"\nTotal files: {total_files:,}  |  Total size: {format_size(total_used)}")
 
-            files_sorted = sorted(files, key=lambda f: int(f.get('size', 0) or 0), reverse=True)
+            files_sorted = sorted(files, key=lambda f: int(f.get("size", 0) or 0), reverse=True)
             display = files_sorted[:top]
             if display:
                 headers = ["File", "Size"]
-                rows = [[f['path'], format_size(f['size'])] for f in display]
+                rows = [[f["path"], format_size(f["size"])] for f in display]
                 title = f"Largest Files (top {len(display)} of {total_files:,})"
                 table = self.table_formatter.format_table(headers, rows, title=title)
                 print("\n" + self._colorize_table(table, search))
@@ -318,9 +345,7 @@ class ReportFormatter(BaseFormatter):
                 f"  Run a scan first: disk_checker.py --run --output-dir <dir>"
             )
             for user in users:
-                self.display_user_detail_report(
-                    user, None, None, top, not_found_reason=reason
-                )
+                self.display_user_detail_report(user, None, None, top, not_found_reason=reason)
             return
 
         conn = sqlite3.connect(f"file:{detail_db}?mode=ro", uri=True)
@@ -337,9 +362,7 @@ class ReportFormatter(BaseFormatter):
                         f"Check the username spelling, or rescan if the user "
                         f"only recently created files."
                     )
-                    self.display_user_detail_report(
-                        user, None, None, top, not_found_reason=reason
-                    )
+                    self.display_user_detail_report(user, None, None, top, not_found_reason=reason)
                     continue
 
                 # Route by type_filter
@@ -354,21 +377,27 @@ class ReportFormatter(BaseFormatter):
                     continue
 
                 # report / dirs / files all use detail_user_report rendering
-                dir_data = self._load_user_dirs(conn, user, top, search=search) if type_filter in ("report", "dirs") else None
-                file_data = self._load_user_files(conn, user, top, search=search) if type_filter in ("report", "files") else None
+                dir_data = (
+                    self._load_user_dirs(conn, user, top, search=search)
+                    if type_filter in ("report", "dirs")
+                    else None
+                )
+                file_data = (
+                    self._load_user_files(conn, user, top, search=search)
+                    if type_filter in ("report", "files")
+                    else None
+                )
                 if (
                     dir_data
                     and file_data
-                    and (dir_data.get('total_files') or 0) == 0
-                    and (file_data.get('total_files') or 0) == 0
+                    and (dir_data.get("total_files") or 0) == 0
+                    and (file_data.get("total_files") or 0) == 0
                 ):
                     reason = (
                         f"User '{user}' is registered but has no files in scan.\n"
                         f"  Scanned root: {scan_root}"
                     )
-                    self.display_user_detail_report(
-                        user, None, None, top, not_found_reason=reason
-                    )
+                    self.display_user_detail_report(user, None, None, top, not_found_reason=reason)
                     continue
                 self.display_user_detail_report(user, dir_data, file_data, top, search=search)
         finally:
@@ -438,9 +467,7 @@ class ReportFormatter(BaseFormatter):
     @staticmethod
     def _has_treemap(conn: sqlite3.Connection) -> bool:
         try:
-            row = conn.execute(
-                "SELECT 1 FROM tm.dirs LIMIT 1"
-            ).fetchone()
+            row = conn.execute("SELECT 1 FROM tm.dirs LIMIT 1").fetchone()
             return bool(row)
         except sqlite3.DatabaseError:
             return False
@@ -475,6 +502,60 @@ class ReportFormatter(BaseFormatter):
         # Root segment is "/" so we can get "//foo/bar". Normalize.
         return "/" + joined.lstrip("/").lstrip("/")
 
+    def _accumulate_dirs(
+        self,
+        all_rows: List[tuple],
+        kw: str,
+        top: int,
+        has_tm: bool,
+        conn: sqlite3.Connection,
+        has_path_col: bool = True,
+    ) -> List[Dict[str, Any]]:
+        if not all_rows:
+            return []
+        # Build path→direct_size map.
+        acc: Dict[str, int] = {}
+        if has_path_col:
+            for r in all_rows:
+                acc[r[1]] = r[2]
+            ref = all_rows  # each: (id, path, size)
+        else:
+            path_cache: Dict[int, str] = {}
+            for rid, _pid, sz in all_rows:
+                p = path_cache.get(rid) or self._build_path(conn, rid)
+                path_cache[rid] = p
+                acc[p] = sz
+            ref = [(r[0], path_cache[r[0]], r[2]) for r in all_rows]
+        # Sort deepest-first by path depth.
+        by_depth = sorted(ref, key=lambda r: r[1].count("/"), reverse=True)
+        for _rid, path, _size in by_depth:
+            ct = acc.get(path, 0)
+            if ct <= 0:
+                continue
+            cur = path
+            while True:
+                slash = cur.rfind("/")
+                if slash <= 0:
+                    if cur != "/":
+                        parent = "/"
+                        if parent in acc:
+                            acc[parent] += ct
+                    break
+                parent = cur[:slash]
+                if parent in acc:
+                    acc[parent] += ct
+                    break
+                cur = parent
+        sorted_paths = sorted(acc.keys(), key=lambda p: acc[p], reverse=True)
+        dirs: List[Dict[str, Any]] = []
+        for path in sorted_paths:
+            if len(dirs) >= top and not kw:
+                break
+            if kw and kw not in path.lower():
+                continue
+            dirs.append({"path": path, "used": int(acc[path])})
+        return dirs
+
     def _load_user_dirs(
         self, conn: sqlite3.Connection, user: str, top: int, search: str = ""
     ) -> Optional[Dict[str, Any]]:
@@ -490,28 +571,20 @@ class ReportFormatter(BaseFormatter):
 
         has_tm = self._has_treemap(conn)
         kw = search.lower() if search else ""
-        # When searching, scan all dirs (no LIMIT) to find all matches.
-        # Without search, use top-N for fast lookup.
-        dirs: List[Dict[str, Any]] = []
-        if kw:
-            cursor = conn.execute(
-                "SELECT id, size FROM dirs "
-                "WHERE uid = ? ORDER BY size DESC",
+        # Load all dirs for this user, accumulate subtree sizes bottom-up.
+        col_info = conn.execute("PRAGMA table_info(dirs)").fetchall()
+        has_path_col = any(c[1] == "path" for c in col_info)
+        if has_path_col:
+            all_rows = conn.execute(
+                "SELECT id, path, size FROM dirs WHERE uid = ?",
                 (uid,),
-            )
+            ).fetchall()
         else:
-            cursor = conn.execute(
-                "SELECT id, size FROM dirs "
-                "WHERE uid = ? ORDER BY size DESC LIMIT ?",
-                (uid, top),
-            )
-        for dir_id, size in cursor:
-            path = self._build_path(conn, dir_id) if has_tm else f"<dir id {dir_id}>"
-            if kw and kw not in path.lower():
-                continue
-            dirs.append({"path": path, "used": int(size)})
-            if len(dirs) >= top:
-                break
+            all_rows = conn.execute(
+                "SELECT id, parent_id, size FROM dirs WHERE uid = ?",
+                (uid,),
+            ).fetchall()
+        dirs = self._accumulate_dirs(all_rows, kw, top, has_tm, conn, has_path_col)
         return {
             "date": scan_ts,
             "user": user,
@@ -618,14 +691,12 @@ class ReportFormatter(BaseFormatter):
         dirs: List[Dict[str, Any]] = []
         if kw:
             cursor = conn.execute(
-                "SELECT id, files, size FROM dirs "
-                "WHERE uid = ? ORDER BY files DESC",
+                "SELECT id, files, size FROM dirs WHERE uid = ? ORDER BY files DESC",
                 (uid,),
             )
         else:
             cursor = conn.execute(
-                "SELECT id, files, size FROM dirs "
-                "WHERE uid = ? ORDER BY files DESC LIMIT ?",
+                "SELECT id, files, size FROM dirs WHERE uid = ? ORDER BY files DESC LIMIT ?",
                 (uid, top),
             )
         for dir_id, files, size in cursor:
@@ -702,10 +773,7 @@ class ReportFormatter(BaseFormatter):
         dirs = data.get("dirs", [])
         if dirs:
             headers = ["Directory", "Files", "Size"]
-            rows = [
-                [d["path"], f"{d['files']:,}", format_size(d["size"])]
-                for d in dirs
-            ]
+            rows = [[d["path"], f"{d['files']:,}", format_size(d["size"])] for d in dirs]
             title = f"Directory File Count (top {len(dirs):,} of {data['total_dirs']:,})"
             table = self.table_formatter.format_table(headers, rows, title=title)
             print("\n" + self._colorize_table(table, search))
@@ -739,18 +807,14 @@ class ReportFormatter(BaseFormatter):
     # Tree-map view (ASCII directory tree)                                #
     # ------------------------------------------------------------------ #
 
-    def _find_dir_id_by_path(
-        self, conn: sqlite3.Connection, path: str
-    ) -> Optional[int]:
+    def _find_dir_id_by_path(self, conn: sqlite3.Connection, path: str) -> Optional[int]:
         """Resolve a filesystem path to tm.dirs.id. Returns None if not found.
 
         Empty path / "/" returns the scan root dir_id.
         """
         # Get scan root id
         try:
-            row = conn.execute(
-                "SELECT id FROM tm.dirs WHERE parent_id IS NULL LIMIT 1"
-            ).fetchone()
+            row = conn.execute("SELECT id FROM tm.dirs WHERE parent_id IS NULL LIMIT 1").fetchone()
         except sqlite3.DatabaseError:
             return None
         if not row:
@@ -764,7 +828,7 @@ class ReportFormatter(BaseFormatter):
         scan_root = (self._meta_get(conn, "scan_root") or "").rstrip("/")
         normalized = path
         if scan_root and normalized.startswith(scan_root):
-            normalized = normalized[len(scan_root):]
+            normalized = normalized[len(scan_root) :]
 
         segments = [s for s in normalized.strip("/").split("/") if s]
         if not segments:
@@ -833,11 +897,7 @@ class ReportFormatter(BaseFormatter):
         print("=" * 60)
         print(f"Root path: {start_path_str}")
         if root_user:
-            print(
-                f"User '{user}': "
-                f"{format_size(int(root_user[0]))}, "
-                f"{int(root_user[1]):,} files"
-            )
+            print(f"User '{user}': {format_size(int(root_user[0]))}, {int(root_user[1]):,} files")
         else:
             print(f"User '{user}': no files in this subtree")
         if search:
@@ -849,9 +909,70 @@ class ReportFormatter(BaseFormatter):
             self._render_flat_search_user(conn, uid, search, limit)
             return
 
+        # Pre-compute accumulated subtree sizes for this user.
+        # Uses path string ancestry to handle missing intermediate dirs.
+        col_info = conn.execute("PRAGMA table_info(dirs)").fetchall()
+        has_path_col = any(c[1] == "path" for c in col_info)
+        if has_path_col:
+            all_dir_rows = conn.execute(
+                "SELECT id, path, size FROM dirs WHERE uid = ?",
+                (uid,),
+            ).fetchall()
+        else:
+            all_dir_rows = conn.execute(
+                "SELECT id, parent_id, size FROM dirs WHERE uid = ?",
+                (uid,),
+            ).fetchall()
+        acc_sizes: Dict[int, int] = {}
+        if all_dir_rows:
+            acc: Dict[str, int] = {}
+            if has_path_col:
+                for r in all_dir_rows:
+                    acc[r[1]] = r[2]
+                ref = all_dir_rows
+            else:
+                path_cache: Dict[int, str] = {}
+                for rid, _pid, sz in all_dir_rows:
+                    p = path_cache.get(rid) or self._build_path(conn, rid)
+                    path_cache[rid] = p
+                    acc[p] = sz
+                ref = [(r[0], path_cache[r[0]], r[2]) for r in all_dir_rows]
+            by_depth = sorted(ref, key=lambda r: r[1].count("/"), reverse=True)
+            for _rid, path, _size in by_depth:
+                ct = acc.get(path, 0)
+                if ct <= 0:
+                    continue
+                cur = path
+                while True:
+                    slash = cur.rfind("/")
+                    if slash <= 0:
+                        if cur != "/":
+                            parent = "/"
+                            if parent in acc:
+                                acc[parent] += ct
+                        break
+                    parent = cur[:slash]
+                    if parent in acc:
+                        acc[parent] += ct
+                        break
+                    cur = parent
+            # Build dir_id→acc_size map for tree node lookup.
+            id_to_path = {r[0]: r[1] for r in ref}
+            for rid, path in id_to_path.items():
+                acc_sizes[rid] = acc.get(path, 0)
+
         self._render_tree_node(
-            conn, uid, start_id, "", 0, max_depth, limit, tw,
-            search=search, visible_ids=visible_ids,
+            conn,
+            uid,
+            start_id,
+            "",
+            0,
+            max_depth,
+            limit,
+            tw,
+            search=search,
+            visible_ids=visible_ids,
+            acc_sizes=acc_sizes,
         )
 
     def _render_tree_node(
@@ -866,30 +987,36 @@ class ReportFormatter(BaseFormatter):
         tw: int,
         search: str = "",
         visible_ids: Optional[set] = None,
+        acc_sizes: Optional[Dict[int, int]] = None,
     ) -> None:
         if depth >= max_depth:
             return
 
+        # Fetch all children of this node from treemap.
         children = conn.execute(
             """
-            SELECT d.id, n.name, d.dir_count,
-                   COALESCE(dus.size, 0) AS user_size,
-                   COALESCE(dus.files, 0) AS user_files
+            SELECT d.id, n.name, d.dir_count, d.file_count
               FROM tm.dirs d
               JOIN tm.names n ON d.name_id = n.id
-              LEFT JOIN dirs dus
-                     ON dus.id = d.id AND dus.uid = ?
              WHERE d.parent_id = ?
-               AND COALESCE(dus.size, 0) > 0
-             ORDER BY COALESCE(dus.size, 0) DESC
-             LIMIT ?
+             ORDER BY d.id
             """,
-            (uid, dir_id, limit + 1),
+            (dir_id,),
         ).fetchall()
 
-        # Filter by visible_ids when search is active.
         if visible_ids is not None:
             children = [c for c in children if c[0] in visible_ids]
+
+        # Add accumulated subtree size from the pre-loaded dict.
+        acc = acc_sizes or {}
+        children = [
+            (cid, name, dir_count, file_count, acc.get(cid, 0))
+            for cid, name, dir_count, file_count in children
+        ]
+        # Filter out dirs with no usage for this user.
+        children = [c for c in children if c[4] > 0]
+        # Sort by accumulated size descending.
+        children.sort(key=lambda c: c[4], reverse=True)
 
         has_more = len(children) > limit
         if has_more:
@@ -897,14 +1024,14 @@ class ReportFormatter(BaseFormatter):
 
         kw_lower = search.lower() if search else ""
         n = len(children)
-        for i, (cid, name, dir_count, user_size, user_files) in enumerate(children):
+        for i, (cid, name, dir_count, file_count, user_size) in enumerate(children):
             is_last = (i == n - 1) and not has_more
             connector = "\\-- " if is_last else "|-- "
             child_prefix = prefix + ("    " if is_last else "|   ")
 
             is_match = bool(kw_lower) and kw_lower in name.lower()
             size_str = format_size(int(user_size))
-            info = f"  [{size_str}, {int(user_files):,} files]"
+            info = f"  [{size_str}, {int(file_count):,} files]"
 
             avail = tw - len(prefix) - len(connector) - len(info) - 1
             if avail < 4:
@@ -917,9 +1044,17 @@ class ReportFormatter(BaseFormatter):
 
             if dir_count > 0 and depth + 1 < max_depth:
                 self._render_tree_node(
-                    conn, uid, cid, child_prefix,
-                    depth + 1, max_depth, limit, tw,
-                    search=search, visible_ids=visible_ids,
+                    conn,
+                    uid,
+                    cid,
+                    child_prefix,
+                    depth + 1,
+                    max_depth,
+                    limit,
+                    tw,
+                    search=search,
+                    visible_ids=visible_ids,
+                    acc_sizes=acc_sizes,
                 )
 
         if has_more:
@@ -929,9 +1064,7 @@ class ReportFormatter(BaseFormatter):
     # Standalone --tree-show entry point                                   #
     # ------------------------------------------------------------------ #
 
-    def _find_matching_dir_ids(
-        self, conn: sqlite3.Connection, keyword: str
-    ) -> set:
+    def _find_matching_dir_ids(self, conn: sqlite3.Connection, keyword: str) -> set:
         """Return set of dir_ids whose name contains keyword (case-insensitive)."""
         if not keyword:
             return set()
@@ -946,9 +1079,7 @@ class ReportFormatter(BaseFormatter):
             return set()
         return {r[0] for r in rows}
 
-    def _collect_ancestors(
-        self, conn: sqlite3.Connection, dir_ids: set
-    ) -> set:
+    def _collect_ancestors(self, conn: sqlite3.Connection, dir_ids: set) -> set:
         """Walk parent chain for each dir_id, return set of all ancestor dir_ids."""
         visible = set(dir_ids)
         queue = list(dir_ids)
@@ -1013,8 +1144,7 @@ class ReportFormatter(BaseFormatter):
                 except sqlite3.DatabaseError:
                     pass
                 try:
-                    conn.execute("ATTACH DATABASE ? AS tm",
-                                  (f"file:{treemap_db}?mode=ro",))
+                    conn.execute("ATTACH DATABASE ? AS tm", (f"file:{treemap_db}?mode=ro",))
                 except sqlite3.DatabaseError:
                     # Already opened on the same file; ignore.
                     pass
@@ -1039,9 +1169,13 @@ class ReportFormatter(BaseFormatter):
                     print(f"\n  User '{user}' not found in scan results.")
                     continue
                 self.display_user_tree(
-                    conn, user, start_path=path,
-                    max_depth=level, limit=limit,
-                    search=search, visible_ids=visible_ids,
+                    conn,
+                    user,
+                    start_path=path,
+                    max_depth=level,
+                    limit=limit,
+                    search=search,
+                    visible_ids=visible_ids,
                 )
         finally:
             if owns_conn:
@@ -1082,8 +1216,15 @@ class ReportFormatter(BaseFormatter):
             return
 
         self._render_total_tree_node(
-            conn, start_id, "", 0, level, limit, tw,
-            search, visible_ids,
+            conn,
+            start_id,
+            "",
+            0,
+            level,
+            limit,
+            tw,
+            search,
+            visible_ids,
         )
 
     def _render_flat_search(
@@ -1246,9 +1387,15 @@ class ReportFormatter(BaseFormatter):
 
             if dir_count > 0 and depth + 1 < max_depth:
                 self._render_total_tree_node(
-                    conn, cid, child_prefix,
-                    depth + 1, max_depth, limit, tw,
-                    search, visible_ids,
+                    conn,
+                    cid,
+                    child_prefix,
+                    depth + 1,
+                    max_depth,
+                    limit,
+                    tw,
+                    search,
+                    visible_ids,
                 )
 
         if has_more:

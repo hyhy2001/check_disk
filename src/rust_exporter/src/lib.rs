@@ -165,25 +165,92 @@ fn process_internal(
     if kind == "dir" {
         let mut stmt = conn
             .prepare(
-                "SELECT id, size FROM dirs \
-                 WHERE uid = ? ORDER BY size DESC",
+                "SELECT id, path, size FROM dirs \
+                 WHERE uid = ?",
             )
             .map_err(|e| format!("prepare dir query: {}", e))?;
         let rows = stmt
             .query_map(params![uid], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })
             .map_err(|e| format!("query dir: {}", e))?;
+        let mut entries: Vec<(i64, String, i64)> = Vec::new();
         for row in rows {
-            let (dir_id, size) = row.map_err(|e| format!("row: {}", e))?;
-            let path = dir_paths.get(dir_id);
+            entries.push(row.map_err(|e| format!("row: {}", e))?);
+        }
+
+        if entries.is_empty() {
+            let _ = std::fs::remove_file(out_path);
+            return Ok(String::new());
+        }
+
+        let n = entries.len();
+        // Precompute path depth once.
+        let depth: Vec<usize> = entries.iter().map(|e| e.1.as_bytes().iter().filter(|&&b| b == b'/').count()).collect();
+
+        // Accumulate: use path strings for ancestry (bypasses missing
+        // intermediate dirs that have no entry in detail.db).
+        let mut acc: HashMap<&str, i64> = HashMap::with_capacity(n);
+        for (_, ref path, size) in &entries {
+            acc.insert(path.as_str(), *size);
+        }
+
+        // Process deepest first via index sort (avoids moving entries).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| depth[b].cmp(&depth[a]));
+        for &idx in &order {
+            let path = &entries[idx].1;
+            let child_total = match acc.get(path.as_str()) {
+                Some(&v) => v,
+                None => continue,
+            };
+            if child_total <= 0 {
+                continue;
+            }
+            let mut cur: &str = path.as_str();
+            loop {
+                match cur.rfind('/') {
+                    Some(0) => {
+                        if cur != "/" {
+                            if let Some(pa) = acc.get_mut("/") {
+                                *pa += child_total;
+                            }
+                        }
+                        break;
+                    }
+                    Some(pos) => {
+                        let parent = &cur[..pos];
+                        if let Some(pa) = acc.get_mut(parent) {
+                            *pa += child_total;
+                            break;
+                        }
+                        cur = parent;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // Sort indices by accumulated size (no path cloning).
+        order.sort_unstable_by(|&a, &b| {
+            let sa = acc.get(entries[a].1.as_str()).copied().unwrap_or(0);
+            let sb = acc.get(entries[b].1.as_str()).copied().unwrap_or(0);
+            sb.cmp(&sa)
+        });
+
+        for &idx in &order {
+            let size = acc.get(entries[idx].1.as_str()).copied().unwrap_or(0);
             writeln!(
                 w,
                 "{:<4}  {:<20}  {:>12}  {}",
                 "dir ",
                 user,
                 format_size(size as f64),
-                path
+                entries[idx].1
             )
             .map_err(|e| e.to_string())?;
             row_count += 1;
