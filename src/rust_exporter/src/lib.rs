@@ -24,10 +24,10 @@ const IO_BUF_SIZE: usize = 8 * 1024 * 1024;
 
 fn format_size(size_bytes: f64) -> String {
     let n = if size_bytes.is_sign_negative() { 0.0 } else { size_bytes };
-    const KB: f64 = 1_000.0;
-    const MB: f64 = 1_000_000.0;
-    const GB: f64 = 1_000_000_000.0;
-    const TB: f64 = 1_000_000_000_000.0;
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
     if n >= TB {
         format!("{:.2} TB", n / TB)

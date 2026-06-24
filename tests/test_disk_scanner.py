@@ -176,10 +176,10 @@ class TestFormatSize:
     @pytest.mark.parametrize("size,expected", [
         (0, "0 B"),
         (500, "500 B"),
-        (1_000, "1 KB"),
-        (1_500_000, "2 MB"),
-        (2_000_000_000, "2.0 GB"),
-        (3_000_000_000_000, "3.00 TB"),
+        (1_000, "1000 B"),
+        (1_500_000, "1 MB"),
+        (2_000_000_000, "1.9 GB"),
+        (3_000_000_000_000, "2.73 TB"),
         (-1, "0 B"),
     ])
     def test_format_size_units(self, size, expected):
